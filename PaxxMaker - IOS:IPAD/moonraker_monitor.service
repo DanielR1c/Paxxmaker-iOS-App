@@ -1,0 +1,70 @@
+# moonraker_monitor.service
+# -------------------------
+# Systemd USER service — runs as the 'pi' user, no root required.
+#
+# INSTALL (no root needed):
+#   mkdir -p ~/.config/systemd/user
+#   cp moonraker_monitor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now moonraker_monitor
+#
+# VIEW LOGS:
+#   journalctl --user -u moonraker_monitor -f
+#
+# The ExecStart line uses the Moonraker venv Python so the script shares
+# the same interpreter that Moonraker itself already has in memory — zero
+# extra pip installs are required.  If you prefer the system Python, change
+# ExecStart to /usr/bin/python3.
+
+[Unit]
+Description=Moonraker Print Event Monitor
+# Start after the network and Moonraker are both ready
+After=network-online.target moonraker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ---- Use the Moonraker virtual-environment Python ----
+# Typical locations on a Pi running KIAUH or MainsailOS:
+#   /home/pi/moonraker-env/bin/python3  (most common)
+#   /home/pi/klippy-env/bin/python3     (older setups share Klipper venv)
+# Change the path below to match your installation.
+ExecStart=/home/pi/moonraker-env/bin/python3 /home/pi/moonraker_monitor.py
+
+# ---- Configuration via environment variables ----
+# These override the defaults baked into the script.
+Environment=MOONRAKER_URL=http://localhost:7125
+Environment=WORKER_URL=https://your-worker.your-subdomain.workers.dev/events
+Environment=WORKER_SECRET=change-me-secret
+Environment=PRINTER_ID=snapmaker-u1
+
+# ---- Restart policy ----
+Restart=on-failure
+RestartSec=10s
+# Give up restarting only after 5 failures within 60 s (prevents a tight loop
+# that would spin the disk and drain the Pi's SD card)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# ---- Resource limits — keep it tiny ----
+# 32 MB hard memory ceiling; if the process exceeds this the OOM killer
+# reclaims it and systemd restarts it cleanly.
+MemoryMax=32M
+# Cap CPU to 5% of one core so it never fights Klipper/Moonraker
+CPUQuota=5%
+# Low I/O priority (ionice class 3 = idle)
+IOSchedulingClass=idle
+
+# ---- Safety / hardening ----
+# Prevent writing anywhere except the home directory
+PrivateTmp=true
+NoNewPrivileges=true
+# Restrict which system calls are allowed (broad set; safe for Python)
+SystemCallFilter=@system-service
+# Read-only filesystem view except /home/pi and /tmp
+ProtectSystem=strict
+ReadWritePaths=/home/pi
+
+[Install]
+WantedBy=default.target

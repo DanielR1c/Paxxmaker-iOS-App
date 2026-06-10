@@ -1,0 +1,935 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		652CEF5B2FD5D704009E0447 /* TuyaLocalService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 652CEF5A2FD5D703009E0447 /* TuyaLocalService.swift */; };
+		652CEF5C2FD5D704009E0447 /* TuyaLocalService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 652CEF5A2FD5D703009E0447 /* TuyaLocalService.swift */; };
+		6557BF7D2FB4657B0092A28E /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6557BF7C2FB4657A0092A28E /* WidgetKit.framework */; };
+		6557BF7F2FB4657B0092A28E /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6557BF7E2FB4657B0092A28E /* SwiftUI.framework */; };
+		655F06172FBA19A700D61B0C /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 655F06162FBA19A700D61B0C /* StoreKit.framework */; };
+		655F061A2FBA290F00D61B0C /* Storekit.storekit in Resources */ = {isa = PBXBuildFile; fileRef = 655F06192FBA290F00D61B0C /* Storekit.storekit */; };
+		655F061B2FBA290F00D61B0C /* Storekit.storekit in Resources */ = {isa = PBXBuildFile; fileRef = 655F06192FBA290F00D61B0C /* Storekit.storekit */; };
+		656006262FB756140063A8C5 /* PaxxMakerWatch Watch App.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 6560061C2FB756130063A8C5 /* PaxxMakerWatch Watch App.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		656006342FB7693B0063A8C5 /* PaxxMakerWidgetExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 6557BF7A2FB4657A0092A28E /* PaxxMakerWidgetExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		656006462FB7A2820063A8C5 /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6557BF7C2FB4657A0092A28E /* WidgetKit.framework */; };
+		656006472FB7A2820063A8C5 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6557BF7E2FB4657B0092A28E /* SwiftUI.framework */; };
+		656006552FB7A2850063A8C5 /* PaxxMakerWatchWidgetExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 656006452FB7A2820063A8C5 /* PaxxMakerWatchWidgetExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		656006352FB7693B0063A8C5 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6527FE1F2FA535F9007B1D14 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 6557BF792FB4657A0092A28E;
+			remoteInfo = PaxxMakerWidgetExtension;
+		};
+		6560063E2FB76F510063A8C5 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6527FE1F2FA535F9007B1D14 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 6560061B2FB756130063A8C5;
+			remoteInfo = "PaxxMakerWatch Watch App";
+		};
+		656006522FB7A2850063A8C5 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6527FE1F2FA535F9007B1D14 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 656006442FB7A2820063A8C5;
+			remoteInfo = PaxxMakerWatchWidgetExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		6560062A2FB756140063A8C5 /* Embed Watch Content */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
+			dstSubfolderSpec = 16;
+			files = (
+				656006262FB756140063A8C5 /* PaxxMakerWatch Watch App.app in Embed Watch Content */,
+			);
+			name = "Embed Watch Content";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		656006372FB7693B0063A8C5 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				656006342FB7693B0063A8C5 /* PaxxMakerWidgetExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		656006542FB7A2850063A8C5 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				656006552FB7A2850063A8C5 /* PaxxMakerWatchWidgetExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		6527FE272FA535F9007B1D14 /* Paxxmaker U1.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Paxxmaker U1.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		652CEF582FCF6D72009E0447 /* worker.ts */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.typescript; path = worker.ts; sourceTree = "<group>"; };
+		652CEF592FCF6D79009E0447 /* wrangler.toml */ = {isa = PBXFileReference; lastKnownFileType = text; path = wrangler.toml; sourceTree = "<group>"; };
+		652CEF5A2FD5D703009E0447 /* TuyaLocalService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TuyaLocalService.swift; sourceTree = "<group>"; };
+		6557BF7A2FB4657A0092A28E /* PaxxMakerWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = PaxxMakerWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		6557BF7C2FB4657A0092A28E /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
+		6557BF7E2FB4657B0092A28E /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
+		655F06162FBA19A700D61B0C /* StoreKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = StoreKit.framework; path = System/Library/Frameworks/StoreKit.framework; sourceTree = SDKROOT; };
+		655F06192FBA290F00D61B0C /* Storekit.storekit */ = {isa = PBXFileReference; lastKnownFileType = text; path = Storekit.storekit; sourceTree = "<group>"; };
+		656005B22FB5EE000063A8C5 /* PaxxMakerWidgetExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PaxxMakerWidgetExtension.entitlements; sourceTree = "<group>"; };
+		6560061C2FB756130063A8C5 /* PaxxMakerWatch Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "PaxxMakerWatch Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		656006452FB7A2820063A8C5 /* PaxxMakerWatchWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = PaxxMakerWatchWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		6560065B2FB7A3810063A8C5 /* PaxxMakerWatchWidgetExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PaxxMakerWatchWidgetExtension.entitlements; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		652CEF542FCA1D5E009E0447 /* Exceptions for "PaxxMakerWatch Watch App" folder in "PaxxMakerWatch Watch App" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 6560061B2FB756130063A8C5 /* PaxxMakerWatch Watch App */;
+		};
+		6557BF8F2FB4657D0092A28E /* Exceptions for "PaxxMakerWidget" folder in "PaxxMakerWidgetExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 6557BF792FB4657A0092A28E /* PaxxMakerWidgetExtension */;
+		};
+		656006562FB7A2850063A8C5 /* Exceptions for "PaxxMakerWatchWidget" folder in "PaxxMakerWatchWidgetExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 656006442FB7A2820063A8C5 /* PaxxMakerWatchWidgetExtension */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		6527FE292FA535F9007B1D14 /* Paxxmaker U1 */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "Paxxmaker U1";
+			sourceTree = "<group>";
+		};
+		6557BF802FB4657B0092A28E /* PaxxMakerWidget */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				6557BF8F2FB4657D0092A28E /* Exceptions for "PaxxMakerWidget" folder in "PaxxMakerWidgetExtension" target */,
+			);
+			path = PaxxMakerWidget;
+			sourceTree = "<group>";
+		};
+		6560061D2FB756130063A8C5 /* PaxxMakerWatch Watch App */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				652CEF542FCA1D5E009E0447 /* Exceptions for "PaxxMakerWatch Watch App" folder in "PaxxMakerWatch Watch App" target */,
+			);
+			path = "PaxxMakerWatch Watch App";
+			sourceTree = "<group>";
+		};
+		656006482FB7A2820063A8C5 /* PaxxMakerWatchWidget */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				656006562FB7A2850063A8C5 /* Exceptions for "PaxxMakerWatchWidget" folder in "PaxxMakerWatchWidgetExtension" target */,
+			);
+			path = PaxxMakerWatchWidget;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		6527FE242FA535F9007B1D14 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				655F06172FBA19A700D61B0C /* StoreKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6557BF772FB4657A0092A28E /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6557BF7F2FB4657B0092A28E /* SwiftUI.framework in Frameworks */,
+				6557BF7D2FB4657B0092A28E /* WidgetKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		656006192FB756130063A8C5 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		656006422FB7A2820063A8C5 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				656006472FB7A2820063A8C5 /* SwiftUI.framework in Frameworks */,
+				656006462FB7A2820063A8C5 /* WidgetKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		6527FE1E2FA535F9007B1D14 = {
+			isa = PBXGroup;
+			children = (
+				655F06192FBA290F00D61B0C /* Storekit.storekit */,
+				6560065B2FB7A3810063A8C5 /* PaxxMakerWatchWidgetExtension.entitlements */,
+				656005B22FB5EE000063A8C5 /* PaxxMakerWidgetExtension.entitlements */,
+				6527FE292FA535F9007B1D14 /* Paxxmaker U1 */,
+				6557BF802FB4657B0092A28E /* PaxxMakerWidget */,
+				6560061D2FB756130063A8C5 /* PaxxMakerWatch Watch App */,
+				656006482FB7A2820063A8C5 /* PaxxMakerWatchWidget */,
+				6557BF7B2FB4657A0092A28E /* Frameworks */,
+				6527FE282FA535F9007B1D14 /* Products */,
+				652CEF572FCF6D4B009E0447 /* CloudflareWorker */,
+				652CEF5A2FD5D703009E0447 /* TuyaLocalService.swift */,
+			);
+			sourceTree = "<group>";
+		};
+		6527FE282FA535F9007B1D14 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				6527FE272FA535F9007B1D14 /* Paxxmaker U1.app */,
+				6557BF7A2FB4657A0092A28E /* PaxxMakerWidgetExtension.appex */,
+				6560061C2FB756130063A8C5 /* PaxxMakerWatch Watch App.app */,
+				656006452FB7A2820063A8C5 /* PaxxMakerWatchWidgetExtension.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		652CEF572FCF6D4B009E0447 /* CloudflareWorker */ = {
+			isa = PBXGroup;
+			children = (
+				652CEF582FCF6D72009E0447 /* worker.ts */,
+				652CEF592FCF6D79009E0447 /* wrangler.toml */,
+			);
+			path = CloudflareWorker;
+			sourceTree = "<group>";
+		};
+		6557BF7B2FB4657A0092A28E /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				655F06162FBA19A700D61B0C /* StoreKit.framework */,
+				6557BF7C2FB4657A0092A28E /* WidgetKit.framework */,
+				6557BF7E2FB4657B0092A28E /* SwiftUI.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		6527FE262FA535F9007B1D14 /* Paxxmaker U1 */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6527FE322FA535FC007B1D14 /* Build configuration list for PBXNativeTarget "Paxxmaker U1" */;
+			buildPhases = (
+				6527FE232FA535F9007B1D14 /* Sources */,
+				6527FE242FA535F9007B1D14 /* Frameworks */,
+				6527FE252FA535F9007B1D14 /* Resources */,
+				6560062A2FB756140063A8C5 /* Embed Watch Content */,
+				656006372FB7693B0063A8C5 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				6560063F2FB76F510063A8C5 /* PBXTargetDependency */,
+				656006362FB7693B0063A8C5 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				6527FE292FA535F9007B1D14 /* Paxxmaker U1 */,
+			);
+			name = "Paxxmaker U1";
+			packageProductDependencies = (
+			);
+			productName = "Snapmaker U1";
+			productReference = 6527FE272FA535F9007B1D14 /* Paxxmaker U1.app */;
+			productType = "com.apple.product-type.application";
+		};
+		6557BF792FB4657A0092A28E /* PaxxMakerWidgetExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6557BF902FB4657D0092A28E /* Build configuration list for PBXNativeTarget "PaxxMakerWidgetExtension" */;
+			buildPhases = (
+				6557BF762FB4657A0092A28E /* Sources */,
+				6557BF772FB4657A0092A28E /* Frameworks */,
+				6557BF782FB4657A0092A28E /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				6557BF802FB4657B0092A28E /* PaxxMakerWidget */,
+			);
+			name = PaxxMakerWidgetExtension;
+			packageProductDependencies = (
+			);
+			productName = PaxxMakerWidgetExtension;
+			productReference = 6557BF7A2FB4657A0092A28E /* PaxxMakerWidgetExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		6560061B2FB756130063A8C5 /* PaxxMakerWatch Watch App */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 656006272FB756140063A8C5 /* Build configuration list for PBXNativeTarget "PaxxMakerWatch Watch App" */;
+			buildPhases = (
+				656006182FB756130063A8C5 /* Sources */,
+				656006192FB756130063A8C5 /* Frameworks */,
+				6560061A2FB756130063A8C5 /* Resources */,
+				656006542FB7A2850063A8C5 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				656006532FB7A2850063A8C5 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				6560061D2FB756130063A8C5 /* PaxxMakerWatch Watch App */,
+			);
+			name = "PaxxMakerWatch Watch App";
+			packageProductDependencies = (
+			);
+			productName = "PaxxMakerWatch Watch App";
+			productReference = 6560061C2FB756130063A8C5 /* PaxxMakerWatch Watch App.app */;
+			productType = "com.apple.product-type.application";
+		};
+		656006442FB7A2820063A8C5 /* PaxxMakerWatchWidgetExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 656006572FB7A2850063A8C5 /* Build configuration list for PBXNativeTarget "PaxxMakerWatchWidgetExtension" */;
+			buildPhases = (
+				656006412FB7A2820063A8C5 /* Sources */,
+				656006422FB7A2820063A8C5 /* Frameworks */,
+				656006432FB7A2820063A8C5 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				656006482FB7A2820063A8C5 /* PaxxMakerWatchWidget */,
+			);
+			name = PaxxMakerWatchWidgetExtension;
+			packageProductDependencies = (
+			);
+			productName = PaxxMakerWatchWidgetExtension;
+			productReference = 656006452FB7A2820063A8C5 /* PaxxMakerWatchWidgetExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		6527FE1F2FA535F9007B1D14 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2640;
+				LastUpgradeCheck = 2640;
+				TargetAttributes = {
+					6527FE262FA535F9007B1D14 = {
+						CreatedOnToolsVersion = 26.4.1;
+					};
+					6557BF792FB4657A0092A28E = {
+						CreatedOnToolsVersion = 26.4.1;
+					};
+					6560061B2FB756130063A8C5 = {
+						CreatedOnToolsVersion = 26.4.1;
+					};
+					656006442FB7A2820063A8C5 = {
+						CreatedOnToolsVersion = 26.4.1;
+					};
+				};
+			};
+			buildConfigurationList = 6527FE222FA535F9007B1D14 /* Build configuration list for PBXProject "Paxxmaker U1" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				de,
+				es,
+				fr,
+			);
+			mainGroup = 6527FE1E2FA535F9007B1D14;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 6527FE282FA535F9007B1D14 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				6527FE262FA535F9007B1D14 /* Paxxmaker U1 */,
+				6557BF792FB4657A0092A28E /* PaxxMakerWidgetExtension */,
+				6560061B2FB756130063A8C5 /* PaxxMakerWatch Watch App */,
+				656006442FB7A2820063A8C5 /* PaxxMakerWatchWidgetExtension */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		6527FE252FA535F9007B1D14 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				655F061B2FBA290F00D61B0C /* Storekit.storekit in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6557BF782FB4657A0092A28E /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6560061A2FB756130063A8C5 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				655F061A2FBA290F00D61B0C /* Storekit.storekit in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		656006432FB7A2820063A8C5 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		6527FE232FA535F9007B1D14 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				652CEF5C2FD5D704009E0447 /* TuyaLocalService.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6557BF762FB4657A0092A28E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		656006182FB756130063A8C5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				652CEF5B2FD5D704009E0447 /* TuyaLocalService.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		656006412FB7A2820063A8C5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		656006362FB7693B0063A8C5 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 6557BF792FB4657A0092A28E /* PaxxMakerWidgetExtension */;
+			targetProxy = 656006352FB7693B0063A8C5 /* PBXContainerItemProxy */;
+		};
+		6560063F2FB76F510063A8C5 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 6560061B2FB756130063A8C5 /* PaxxMakerWatch Watch App */;
+			targetProxy = 6560063E2FB76F510063A8C5 /* PBXContainerItemProxy */;
+		};
+		656006532FB7A2850063A8C5 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 656006442FB7A2820063A8C5 /* PaxxMakerWatchWidgetExtension */;
+			targetProxy = 656006522FB7A2850063A8C5 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		6527FE302FA535FC007B1D14 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.4;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		6527FE312FA535FC007B1D14 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.4;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		6527FE332FA535FC007B1D14 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
+				CODE_SIGN_ENTITLEMENTS = "Paxxmaker U1/Paxxmaker U1.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Snapmaker-U1-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = PaxxMaker;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_NFCReaderUsageDescription = "PaxxMaker liest und beschreibt NFC-Tags auf Filamentspulen.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UILaunchStoryboardName = "";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortrait";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.4;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		6527FE342FA535FC007B1D14 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
+				CODE_SIGN_ENTITLEMENTS = "Paxxmaker U1/Paxxmaker U1.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Snapmaker-U1-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = PaxxMaker;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_NFCReaderUsageDescription = "PaxxMaker liest und beschreibt NFC-Tags auf Filamentspulen.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UILaunchStoryboardName = "";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortrait";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.4;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		6557BF912FB4657D0092A28E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
+				CODE_SIGN_ENTITLEMENTS = PaxxMakerWidgetExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PaxxMakerWidget/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWidget;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.4;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.PaxxMakerWidget";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		6557BF922FB4657D0092A28E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
+				CODE_SIGN_ENTITLEMENTS = PaxxMakerWidgetExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PaxxMakerWidget/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWidget;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.4;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.PaxxMakerWidget";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		656006282FB756140063A8C5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "PaxxMakerWatch Watch App/PaxxMakerWatch Watch App.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "PaxxMakerWatch Watch App/Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWatch;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = "HandyApp.Paxxmaker-U1";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.watchkitapp";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 11.4;
+			};
+			name = Debug;
+		};
+		656006292FB756140063A8C5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "PaxxMakerWatch Watch App/PaxxMakerWatch Watch App.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "PaxxMakerWatch Watch App/Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWatch;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = "HandyApp.Paxxmaker-U1";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.watchkitapp";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 11.4;
+			};
+			name = Release;
+		};
+		656006582FB7A2850063A8C5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
+				CODE_SIGN_ENTITLEMENTS = PaxxMakerWatchWidgetExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PaxxMakerWatchWidget/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWatchWidget;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.watchkitapp.PaxxMakerWatchWidget";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 11.4;
+			};
+			name = Debug;
+		};
+		656006592FB7A2850063A8C5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
+				CODE_SIGN_ENTITLEMENTS = PaxxMakerWatchWidgetExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = PaxxMakerWatchWidget/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWatchWidget;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.8;
+				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.watchkitapp.PaxxMakerWatchWidget";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 11.4;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		6527FE222FA535F9007B1D14 /* Build configuration list for PBXProject "Paxxmaker U1" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6527FE302FA535FC007B1D14 /* Debug */,
+				6527FE312FA535FC007B1D14 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		6527FE322FA535FC007B1D14 /* Build configuration list for PBXNativeTarget "Paxxmaker U1" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6527FE332FA535FC007B1D14 /* Debug */,
+				6527FE342FA535FC007B1D14 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		6557BF902FB4657D0092A28E /* Build configuration list for PBXNativeTarget "PaxxMakerWidgetExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6557BF912FB4657D0092A28E /* Debug */,
+				6557BF922FB4657D0092A28E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		656006272FB756140063A8C5 /* Build configuration list for PBXNativeTarget "PaxxMakerWatch Watch App" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				656006282FB756140063A8C5 /* Debug */,
+				656006292FB756140063A8C5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		656006572FB7A2850063A8C5 /* Build configuration list for PBXNativeTarget "PaxxMakerWatchWidgetExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				656006582FB7A2850063A8C5 /* Debug */,
+				656006592FB7A2850063A8C5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 6527FE1F2FA535F9007B1D14 /* Project object */;
+}

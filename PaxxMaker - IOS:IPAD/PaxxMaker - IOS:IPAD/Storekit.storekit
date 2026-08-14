@@ -1,0 +1,140 @@
+{
+  "appPolicies" : {
+    "eula" : "",
+    "policies" : [
+      {
+        "locale" : "en_US",
+        "policyText" : "",
+        "policyURL" : ""
+      }
+    ]
+  },
+  "identifier" : "D7133661",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "1.99",
+      "familyShareable" : false,
+      "internalID" : "6770259597",
+      "localizations" : [
+        {
+          "description" : "if you like the App, please Support",
+          "displayName" : "Support the App",
+          "locale" : "de"
+        }
+      ],
+      "productID" : "onetimesupport1.99",
+      "referenceName" : "Support 1.99",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "4.99",
+      "familyShareable" : false,
+      "internalID" : "6770259598",
+      "localizations" : [
+        {
+          "description" : "A larger one-time donation to support the app",
+          "displayName" : "Support 4.99",
+          "locale" : "de"
+        }
+      ],
+      "productID" : "onetimesupport4.99",
+      "referenceName" : "Support 4.99",
+      "type" : "Consumable"
+    }
+  ],
+  "settings" : {
+    "_applicationInternalID" : "6770208998",
+    "_askToBuyEnabled" : false,
+    "_billingGracePeriodEnabled" : false,
+    "_billingIssuesEnabled" : false,
+    "_developerTeamID" : "92F7TDYGQR",
+    "_disableDialogs" : false,
+    "_failTransactionsEnabled" : false,
+    "_lastSynchronizedDate" : 800729364.57370198,
+    "_locale" : "en_US",
+    "_renewalBillingIssuesEnabled" : false,
+    "_storefront" : "USA",
+    "_storeKitErrors" : [
+
+    ],
+    "_timeRate" : 0
+  },
+  "subscriptionGroups" : [
+    {
+      "id" : "22095886",
+      "localizations" : [
+
+      ],
+      "name" : "Hardcore-Support",
+      "subscriptions" : [
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "1.99",
+          "familyShareable" : false,
+          "groupNumber" : 1,
+          "internalID" : "6770287542",
+          "introductoryOffers" : [
+
+          ],
+          "localizations" : [
+            {
+              "description" : "Help me with a monthly donation",
+              "displayName" : "Monthly Supporter",
+              "locale" : "de"
+            }
+          ],
+          "productID" : "Support1.99monthly",
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "Monthly Supporter",
+          "subscriptionGroupID" : "22095886",
+          "type" : "RecurringSubscription",
+          "winbackOffers" : [
+
+          ]
+        },
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "9.99",
+          "familyShareable" : false,
+          "groupNumber" : 2,
+          "internalID" : "6770287544",
+          "introductoryOffers" : [
+
+          ],
+          "localizations" : [
+            {
+              "description" : "Help me with an annual donation",
+              "displayName" : "Annual Supporter",
+              "locale" : "de"
+            }
+          ],
+          "productID" : "Support9.99annual",
+          "recurringSubscriptionPeriod" : "P1Y",
+          "referenceName" : "Annual Supporter",
+          "subscriptionGroupID" : "22095886",
+          "type" : "RecurringSubscription",
+          "winbackOffers" : [
+
+          ]
+        }
+      ]
+    }
+  ],
+  "version" : {
+    "major" : 5,
+    "minor" : 0
+  }
+}

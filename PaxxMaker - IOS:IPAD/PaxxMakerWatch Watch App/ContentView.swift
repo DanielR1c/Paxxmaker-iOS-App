@@ -5,9 +5,36 @@ import WidgetKit
 import CoreGraphics
 import ImageIO
 
-private func lz(en: String, de: String, fr: String, es: String) -> String {
-    let code = Locale.preferredLanguages.first.map { String($0.prefix(2)) } ?? "en"
-    switch code { case "de": return de; case "fr": return fr; case "es": return es; default: return en }
+private func lz(en: String, de: String, fr: String, es: String, pt: String = "", it: String = "", zh: String = "") -> String {
+    // Language chosen in the iPhone app (synced over WatchConnectivity) wins;
+    // only fall back to the system language before the first sync.
+    let code = UserDefaults.standard.string(forKey: "app_language")
+        ?? UserDefaults(suiteName: "group.paxxmaker.u1")?.string(forKey: "app_language")
+        ?? Locale.preferredLanguages.first.map { String($0.prefix(2)) } ?? "en"
+    switch code {
+    case "de": return de
+    case "fr": return fr
+    case "es": return es
+    case "pt": return pt.isEmpty ? en : pt
+    case "it": return it.isEmpty ? en : it
+    case "zh": return zh.isEmpty ? en : zh
+    default: return en
+    }
+}
+
+// URLError.localizedDescription follows the SYSTEM language, which disagrees
+// with the app's own language setting — translate the common cases ourselves.
+private func lzTransport(_ error: Error) -> String {
+    if let e = error as? URLError {
+        switch e.code {
+        case .timedOut:
+            return lz(en: "Connection timed out.", de: "Zeitüberschreitung der Verbindung.", fr: "Délai de connexion dépassé.", es: "Tiempo de conexión agotado.", pt: "Tempo de conexão esgotado.", it: "Timeout della connessione.", zh: "连接超时。")
+        case .notConnectedToInternet:
+            return lz(en: "No internet connection.", de: "Keine Internetverbindung.", fr: "Aucune connexion internet.", es: "Sin conexión a internet.", pt: "Sem conexão com a internet.", it: "Nessuna connessione internet.", zh: "无网络连接。")
+        default: break
+        }
+    }
+    return lz(en: "Could not connect to the server.", de: "Verbindung zum Server konnte nicht hergestellt werden.", fr: "Impossible de se connecter au serveur.", es: "No se pudo conectar al servidor.", pt: "Não foi possível conectar ao servidor.", it: "Impossibile connettersi al server.", zh: "无法连接到服务器。")
 }
 
 // MARK: - Printer Data Model
@@ -34,11 +61,11 @@ struct WatchPrinterData: Identifiable, Codable {
 
     var stateLabel: String {
         switch printState {
-        case "printing": return lz(en: "Printing",   de: "Druckt",     fr: "Impression",  es: "Imprimiendo")
-        case "paused":   return lz(en: "Paused",     de: "Pause",      fr: "Pause",       es: "Pausado")
-        case "error":    return lz(en: "Error",      de: "Fehler",     fr: "Erreur",      es: "Error")
-        case "complete": return lz(en: "Done",       de: "Fertig",     fr: "Terminé",     es: "Listo")
-        case "standby":  return lz(en: "Ready",      de: "Bereit",     fr: "Prêt",        es: "Listo")
+        case "printing": return lz(en: "Printing",   de: "Druckt",     fr: "Impression",  es: "Imprimiendo", pt: "Imprimindo", it: "Stampa in corso", zh: "打印中")
+        case "paused":   return lz(en: "Paused",     de: "Pause",      fr: "Pause",       es: "Pausado", pt: "Pausado", it: "In pausa", zh: "已暂停")
+        case "error":    return lz(en: "Error",      de: "Fehler",     fr: "Erreur",      es: "Error", pt: "Erro", it: "Errore", zh: "错误")
+        case "complete": return lz(en: "Done",       de: "Fertig",     fr: "Terminé",     es: "Listo", pt: "Concluído", it: "Fatto", zh: "完成")
+        case "standby":  return lz(en: "Ready",      de: "Bereit",     fr: "Prêt",        es: "Listo", pt: "Pronto", it: "Pronto", zh: "就绪")
         default:         return "–"
         }
     }
@@ -68,6 +95,12 @@ struct WatchPrinterData: Identifiable, Codable {
 // MARK: - Config Model (written by iPhone into App Group)
 fileprivate struct WatchPrinterDirectConfig: Codable {
     var id: String; var name: String; var baseURL: String; var apiKey: String; var themeHex: String
+    // Kept for forward-compat with the iPhone payload. The Watch never contacts
+    // the Cloudflare Worker itself — it gets data from the iPhone (WatchConnectivity),
+    // the local printer LAN when home, and the iPhone's Live Activity which
+    // watchOS mirrors onto the watch. Non-cellular watches always have the phone.
+    var cfSecret: String?
+    var pushMode: String?
 }
 
 // MARK: - File Model
@@ -92,6 +125,10 @@ struct WatchFileItem: Identifiable {
 
 // MARK: - Watch Connectivity Manager
 class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
+    // Singleton, damit App und Background-Refresh-Task dieselbe Instanz (und
+    // damit denselben WCSession-Delegate) verwenden.
+    static let shared = WatchConnectivityManager()
+
     @Published var printers: [WatchPrinterData] = []
     @Published var isLoading = true
     fileprivate private(set) var configs: [WatchPrinterDirectConfig] = []
@@ -99,6 +136,13 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
     private var directPollTimer: Timer?
     private var lastWCUpdate: Date?
     private var phoneFallbackTask: Task<Void, Never>?
+    // The recursive 30 s direct-poll chain — MUST be single-instance. Every
+    // wrist-raise / app-activation used to start a brand new never-cancelled
+    // chain on top of any already running ones (each self-rescheduling
+    // forever), so a day of intermittent use could stack up many concurrent
+    // pollers — multiplying Cloudflare Worker requests whenever the LAN fetch
+    // fell back to the remote status endpoint.
+    private var directPollChain: Task<Void, Never>?
 
     override init() {
         super.init()
@@ -107,13 +151,15 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
             WCSession.default.activate()
         }
         startDirectPolling()
-        Task {
+        // Track the initial poll chain too, so a later startDirectPollChain()
+        // cancels it instead of leaving a second chain running forever.
+        directPollChain = Task {
             await fetchDirect()
             await MainActor.run { isLoading = false }
         }
     }
 
-    deinit { directPollTimer?.invalidate() }
+    deinit { directPollTimer?.invalidate(); directPollChain?.cancel() }
 
     func session(_ session: WCSession,
                  activationDidCompleteWith activationState: WCSessionActivationState,
@@ -132,21 +178,50 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any]) { parse(userInfo) }
 
     private func parse(_ dict: [String: Any]) {
+        // Keep the Watch's language in step with the iPhone app's setting.
+        if let lang = dict["lang"] as? String, !lang.isEmpty,
+           UserDefaults.standard.string(forKey: "app_language") != lang {
+            UserDefaults.standard.set(lang, forKey: "app_language")
+            // The watch complications run in their own process — they can only
+            // read the shared app group.
+            UserDefaults(suiteName: "group.paxxmaker.u1")?.set(lang, forKey: "app_language")
+            WidgetCenter.shared.reloadAllTimelines()
+        }
+        // Store connection configs shipped by the iPhone in OUR app group —
+        // iPhone and Watch app groups are separate containers, so this is the
+        // only way the Watch ever gets them (needed for direct printer polling
+        // while the iOS app isn't running).
+        if let cfgData = dict["configs"] as? Data,
+           let loaded = try? JSONDecoder().decode([WatchPrinterDirectConfig].self, from: cfgData) {
+            configs = loaded
+            UserDefaults(suiteName: "group.paxxmaker.u1")?
+                .set(cfgData, forKey: "watch_printer_configs")
+        }
         guard let raw = dict["printers"] as? Data,
               let decoded = try? JSONDecoder().decode([WatchPrinterData].self, from: raw)
         else { return }
-        // Load configs from app group whenever they're missing (WCSession path doesn't set them)
+        // Load configs from app group whenever they're missing (older iOS builds
+        // don't ship them in the payload)
         if configs.isEmpty,
            let defaults = UserDefaults(suiteName: "group.paxxmaker.u1"),
            let data = defaults.data(forKey: "watch_printer_configs"),
            let loaded = try? JSONDecoder().decode([WatchPrinterDirectConfig].self, from: data) {
             configs = loaded
         }
+        // Stale cache (e.g. the iPhone app was woken in background and replied
+        // with old data) must NOT count as a fresh update — otherwise direct
+        // polling stays suppressed and the Watch freezes on old values.
+        let sentAt = dict["at"] as? Double
+        let isFresh = sentAt.map { Date().timeIntervalSince1970 - $0 < 90 } ?? false
         DispatchQueue.main.async {
-            self.lastWCUpdate = Date()
+            if isFresh { self.lastWCUpdate = Date() }
             self.printers = decoded
             self.writeComplicationData(decoded)
         }
+        // Route through the single-instance chain — spawning a bare
+        // Task { fetchDirect() } here would leak a new eternal 30 s poller on
+        // every stale WC update, stacking into a Cloudflare request storm.
+        if !isFresh { DispatchQueue.main.async { self.startDirectPollChain() } }
     }
 
     // MARK: - Direct API polling
@@ -159,8 +234,19 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     func refresh() {
+        // Ask the iPhone first. It replies from its cache (with an age stamp);
+        // requestStatusFromPhone() itself falls back to a direct printer/Worker
+        // poll only if the phone is unreachable or doesn't answer in time.
+        // (Previously this ALSO kicked off a direct poll unconditionally, so the
+        // Worker got hit even when the phone had fresh data right there.)
         requestStatusFromPhone()
-        Task { await fetchDirect() }
+    }
+
+    // Cancels any previous recursive poll chain before starting a new one —
+    // there must only ever be ONE running at a time.
+    private func startDirectPollChain() {
+        directPollChain?.cancel()
+        directPollChain = Task { await fetchDirect() }
     }
 
     private func requestStatusFromPhone() {
@@ -168,12 +254,12 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
         phoneFallbackTask?.cancel()
 
         guard WCSession.default.activationState == .activated else {
-            Task { await fetchDirect() }
+            startDirectPollChain()
             return
         }
         guard WCSession.default.isReachable else {
             // iPhone definitively unreachable — go straight to printer
-            Task { await fetchDirect() }
+            startDirectPollChain()
             return
         }
 
@@ -181,7 +267,7 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
         let fallback = Task { [weak self] in
             try? await Task.sleep(for: .seconds(10))
             guard !Task.isCancelled else { return }
-            await self?.fetchDirect()
+            self?.startDirectPollChain()
         }
         phoneFallbackTask = fallback
 
@@ -191,16 +277,53 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
             DispatchQueue.main.async { self?.isLoading = false }
         } errorHandler: { [weak self] _ in
             fallback.cancel()
-            Task { await self?.fetchDirect() }
+            self?.startDirectPollChain()
         }
     }
 
+    // True if any known printer is mid-print — the only time auto-polling runs.
+    private var anyPrinterActive: Bool {
+        printers.contains { $0.printState == "printing" || $0.printState == "paused" }
+    }
+
     private func fetchDirectIfNeeded() async {
+        guard !Task.isCancelled else { return }
         if let last = lastWCUpdate, -last.timeIntervalSinceNow < 90 { return }
+        // Maximally sparse: don't auto-poll while nothing is printing. A print
+        // that starts while idle is picked up the next time the Watch app is
+        // opened (refresh() always does one check regardless of this gate).
+        guard await MainActor.run(body: { anyPrinterActive }) else { return }
         await fetchDirect()
     }
 
     private func fetchDirect() async {
+        guard !Task.isCancelled else { return }
+        await fetchDirectOnce()
+        // Continue the 30 s loop only while a print is active; otherwise stop and
+        // wait for the next manual refresh (opening the app). Zero idle load.
+        guard await MainActor.run(body: { anyPrinterActive }) else { return }
+        try? await Task.sleep(for: .seconds(30))
+        guard !Task.isCancelled else { return }
+        await fetchDirectIfNeeded()
+    }
+
+    // Background complication refresh entry point. Only reaches out to the
+    // Worker while a print is active (per the last persisted complication
+    // state) — idle needs ZERO requests. A print that starts while idle is
+    // picked up when the Watch app is next opened (which calls refresh()).
+    func fetchDirectOnceIfActive() async {
+        struct StatePeek: Decodable { let printState: String }
+        guard let defaults = UserDefaults(suiteName: "group.paxxmaker.u1"),
+              let data = defaults.data(forKey: "watch_all_printers"),
+              let peek = try? JSONDecoder().decode([StatePeek].self, from: data),
+              peek.contains(where: { $0.printState == "printing" || $0.printState == "paused" })
+        else { return }
+        await fetchDirectOnce()
+    }
+
+    // Single-shot direct poll — also used by the background refresh task (which
+    // must not start the endless polling loop above).
+    func fetchDirectOnce() async {
         guard let defaults = UserDefaults(suiteName: "group.paxxmaker.u1"),
               let data = defaults.data(forKey: "watch_printer_configs"),
               let loadedConfigs = try? JSONDecoder().decode([WatchPrinterDirectConfig].self, from: data),
@@ -209,14 +332,20 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
 
         self.configs = loadedConfigs
 
-        var updated: [WatchPrinterData] = await withTaskGroup(of: WatchPrinterData?.self) { group in
+        // Keyed by config id so a printer that's currently unreachable (away
+        // from its WiFi, no push configured) keeps showing its last known
+        // status instead of vanishing from the list entirely.
+        let fresh: [String: WatchPrinterData] = await withTaskGroup(of: (String, WatchPrinterData?).self) { group in
             for config in loadedConfigs {
-                group.addTask { await self.fetchPrinterStatus(config) }
+                group.addTask { (config.id, await self.fetchPrinterStatus(config)) }
             }
-            var results: [WatchPrinterData] = []
-            for await result in group { if let r = result { results.append(r) } }
+            var results: [String: WatchPrinterData] = [:]
+            for await (id, data) in group { if let data { results[id] = data } }
             return results
         }
+
+        let stale = await MainActor.run { Dictionary(uniqueKeysWithValues: printers.map { ($0.id, $0) }) }
+        var updated: [WatchPrinterData] = loadedConfigs.compactMap { fresh[$0.id] ?? stale[$0.id] }
 
         // Only update if we actually got results — don't overwrite WC data with an empty list
         guard !updated.isEmpty else { return }
@@ -231,16 +360,14 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
             self.printers = updated
             self.writeComplicationData(updated)
         }
-
-        // Keep polling every 30 s as long as no WC update arrived
-        try? await Task.sleep(for: .seconds(30))
-        await fetchDirectIfNeeded()
     }
 
     private func fetchPrinterStatus(_ config: WatchPrinterDirectConfig) async -> WatchPrinterData? {
         let query = "print_stats&display_status&extruder&heater_bed"
-        guard let url = URL(string: "\(config.baseURL)/printer/objects/query?\(query)") else { return nil }
-        var request = URLRequest(url: url, timeoutInterval: 7)
+        guard let url = URL(string: "\(config.baseURL)/printer/objects/query?\(query)") else {
+            return nil
+        }
+        var request = URLRequest(url: url, timeoutInterval: 4)
         if !config.apiKey.isEmpty { request.setValue(config.apiKey, forHTTPHeaderField: "X-Api-Key") }
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
@@ -261,7 +388,12 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
                 timeElapsed:  Int(ps["print_duration"] as? Double ?? 0),
                 themeHex:     config.themeHex
             )
-        } catch { return nil }
+        } catch {
+            // Printer's LAN IP is unreachable — typical when away from home
+            // WiFi. If Server Push is on, the Cloudflare Worker has a recent
+            // status snapshot reachable from anywhere (cellular included).
+            return nil
+        }
     }
 
     private var lastWidgetHash: Int = 0
@@ -309,7 +441,7 @@ struct ContentView: View {
         if wc.isLoading && wc.printers.isEmpty {
             VStack(spacing: 8) {
                 ProgressView()
-                Text(lz(en: "Connecting…", de: "Verbinde…", fr: "Connexion…", es: "Conectando…"))
+                Text(lz(en: "Connecting…", de: "Verbinde…", fr: "Connexion…", es: "Conectando…", pt: "Conectando…", it: "Connessione…", zh: "连接中…"))
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
         } else if wc.printers.isEmpty {
@@ -317,7 +449,8 @@ struct ContentView: View {
                 Image(systemName: "printer.slash")
                     .font(.system(size: 28, weight: .light)).foregroundStyle(.secondary)
                 Text(lz(en: "No printer\nreachable", de: "Kein Drucker\nerreichbar",
-                        fr: "Imprimante\nindisponible", es: "Sin impresora"))
+                        fr: "Imprimante\nindisponible", es: "Sin impresora",
+                        pt: "Impressora\ninacessível", it: "Stampante\nnon raggiungibile", zh: "无法连接\n打印机"))
                     .multilineTextAlignment(.center)
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
             }
@@ -454,7 +587,7 @@ struct FilesView: View {
             if isLoading {
                 VStack(spacing: 8) {
                     ProgressView()
-                    Text(lz(en: "Loading…", de: "Lade…", fr: "Chargement…", es: "Cargando…"))
+                    Text(lz(en: "Loading…", de: "Lade…", fr: "Chargement…", es: "Cargando…", pt: "Carregando…", it: "Caricamento…", zh: "加载中…"))
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             } else if let err = loadError {
@@ -464,7 +597,7 @@ struct FilesView: View {
                     Text(err)
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
-                    Button(lz(en: "Retry", de: "Erneut", fr: "Réessayer", es: "Reintentar")) {
+                    Button(lz(en: "Retry", de: "Erneut", fr: "Réessayer", es: "Reintentar", pt: "Repetir", it: "Riprova", zh: "重试")) {
                         Task { loadError = nil; isLoading = true; await fetchFiles() }
                     }
                     .font(.system(size: 11, weight: .semibold))
@@ -475,10 +608,10 @@ struct FilesView: View {
                 VStack(spacing: 10) {
                     Image(systemName: "doc.badge.plus")
                         .font(.system(size: 28, weight: .light)).foregroundStyle(.secondary)
-                    Text(lz(en: "No G-Code files", de: "Keine G-Code Dateien", fr: "Pas de fichiers G-Code", es: "Sin archivos G-Code"))
+                    Text(lz(en: "No G-Code files", de: "Keine G-Code Dateien", fr: "Pas de fichiers G-Code", es: "Sin archivos G-Code", pt: "Nenhum arquivo G-Code", it: "Nessun file G-Code", zh: "没有 G-Code 文件"))
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
-                    Button(lz(en: "Refresh", de: "Aktualisieren", fr: "Actualiser", es: "Actualizar")) {
+                    Button(lz(en: "Refresh", de: "Aktualisieren", fr: "Actualiser", es: "Actualizar", pt: "Atualizar", it: "Aggiorna", zh: "刷新")) {
                         Task { isLoading = true; await fetchFiles() }
                     }
                     .font(.system(size: 11))
@@ -554,12 +687,12 @@ struct FilesView: View {
             await fetchFiles()
         }
         .alert(confirmFile.map { $0.displayName } ?? "", isPresented: $showConfirm) {
-            Button(lz(en: "Yes", de: "Ja", fr: "Oui", es: "Sí")) {
+            Button(lz(en: "Yes", de: "Ja", fr: "Oui", es: "Sí", pt: "Sim", it: "Sì", zh: "是")) {
                 if let f = confirmFile { startPrint(f) }
             }
-            Button(lz(en: "No", de: "Nein", fr: "Non", es: "No"), role: .cancel) {}
+            Button(lz(en: "No", de: "Nein", fr: "Non", es: "No", pt: "Não", it: "No", zh: "否"), role: .cancel) {}
         } message: {
-            Text(lz(en: "Start print?", de: "Druck starten?", fr: "Lancer l'impression?", es: "¿Iniciar impresión?"))
+            Text(lz(en: "Start print?", de: "Druck starten?", fr: "Lancer l'impression?", es: "¿Iniciar impresión?", pt: "Iniciar impressão?", it: "Avviare la stampa?", zh: "开始打印？"))
         }
     }
 
@@ -605,7 +738,10 @@ struct FilesView: View {
                 loadError = lz(en: "No printer configured.\nOpen the iPhone app first.",
                                de: "Kein Drucker konfiguriert.\nBitte erst iPhone App öffnen.",
                                fr: "Aucune imprimante configurée.",
-                               es: "Sin impresora configurada.")
+                               es: "Sin impresora configurada.",
+                               pt: "Nenhuma impressora configurada.\nAbra primeiro o app do iPhone.",
+                               it: "Nessuna stampante configurata.\nApri prima l'app iPhone.",
+                               zh: "未配置打印机。\n请先打开 iPhone 应用。")
             }
             return
         }
@@ -621,7 +757,8 @@ struct FilesView: View {
                 await MainActor.run {
                     isLoading = false
                     loadError = lz(en: "Invalid server response", de: "Ungültige Serverantwort",
-                                   fr: "Réponse invalide", es: "Respuesta inválida")
+                                   fr: "Réponse invalide", es: "Respuesta inválida",
+                                   pt: "Resposta inválida do servidor", it: "Risposta del server non valida", zh: "服务器响应无效")
                 }
                 return
             }
@@ -633,7 +770,7 @@ struct FilesView: View {
             }.sorted { $0.modified > $1.modified }
             await MainActor.run { files = Array(items.prefix(50)); isLoading = false }
         } catch {
-            await MainActor.run { isLoading = false; loadError = error.localizedDescription }
+            await MainActor.run { isLoading = false; loadError = lzTransport(error) }
         }
     }
 
@@ -728,7 +865,7 @@ struct FileCardView: View {
                     HStack(spacing: 4) {
                         Image(systemName: "play.fill")
                             .font(.system(size: 10, weight: .semibold))
-                        Text(lz(en: "Start", de: "Starten", fr: "Démarrer", es: "Iniciar"))
+                        Text(lz(en: "Start", de: "Starten", fr: "Démarrer", es: "Iniciar", pt: "Iniciar", it: "Avvia", zh: "开始"))
                             .font(.system(size: 12, weight: .semibold))
                     }
                     .foregroundStyle(.black)

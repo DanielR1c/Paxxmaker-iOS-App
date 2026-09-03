@@ -9,7 +9,7 @@ final class CloudflarePushService {
     static let shared = CloudflarePushService()
     private init() {}
 
-    static let workerURL = "https://paxxmaker-push.........workers.dev"
+    static let workerURL = "https://paxxmaker-push.jhf7t8vy2g.workers.dev"
 
     private let tokenKey = "apns_device_token"
 
@@ -47,6 +47,17 @@ final class CloudflarePushService {
     // MARK: - Worker Endpoints
 
     func registerDeviceToken(workerURL: String, printerID: String, deviceToken: String, secret: String) async throws {
+        // Dedup: skip the network POST (and its KV writes) when nothing changed.
+        // Callers fire this on every app launch/foreground → without this it was
+        // dozens of redundant registrations (and KV writes) per print. Re-register
+        // only when the token, language, or APNs environment actually changes.
+        // The language chosen IN THE APP — not the system language — decides the
+        // push wording, so an English app never sends German notifications.
+        let locale = UserDefaults.standard.string(forKey: "app_language") ?? "en"
+        let signature = "\(deviceToken)|\(locale)|\(Self.isSandbox)"
+        let dedupKey = "reg_dev_\(printerID)"
+        if UserDefaults.standard.string(forKey: dedupKey) == signature { return }
+
         let url = try endpoint(base: workerURL, path: "/register-device")
         var req = URLRequest(url: url, timeoutInterval: 15)
         req.httpMethod = "POST"
@@ -55,15 +66,23 @@ final class CloudflarePushService {
             "printer_id":   printerID,
             "device_token": deviceToken,
             "secret":       secret,
-            "locale":       Locale.preferredLanguages.first ?? "de",
+            "locale":       locale,
             "sandbox":      Self.isSandbox
         ])
         let (_, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard code == 200 || code == 201 else { throw PushError.workerError(code) }
+        UserDefaults.standard.set(signature, forKey: dedupKey)
     }
 
     func registerActivityToken(workerURL: String, printerID: String, activityToken: String, secret: String) async throws {
+        // Dedup: ActivityKit emits the same push token repeatedly during a print
+        // (measured ~13 registrations in one 15-min print). Only POST when the
+        // token actually changes — a new Live Activity (= new print) gets a new
+        // token, so genuine registrations still happen once per print.
+        let dedupKey = "reg_act_\(printerID)"
+        if UserDefaults.standard.string(forKey: dedupKey) == activityToken { return }
+
         let url = try endpoint(base: workerURL, path: "/register-activity")
         var req = URLRequest(url: url, timeoutInterval: 15)
         req.httpMethod = "POST"
@@ -76,10 +95,15 @@ final class CloudflarePushService {
         let (_, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard code == 200 || code == 201 else { throw PushError.workerError(code) }
+        UserDefaults.standard.set(activityToken, forKey: dedupKey)
     }
 
     /// Removes all KV entries for a printer — call when user deletes a printer or disables push.
     func cleanupPrinter(workerURL: String, printerID: String, secret: String) async {
+        // Forget the dedup markers so a later re-enable registers fresh (the
+        // Worker's KV for this printer is being wiped here).
+        UserDefaults.standard.removeObject(forKey: "reg_dev_\(printerID)")
+        UserDefaults.standard.removeObject(forKey: "reg_act_\(printerID)")
         guard let url = try? endpoint(base: workerURL, path: "/cleanup") else { return }
         var req = URLRequest(url: url, timeoutInterval: 10)
         req.httpMethod = "POST"
@@ -91,6 +115,9 @@ final class CloudflarePushService {
     }
 
     func unregisterDeviceToken(workerURL: String, printerID: String, secret: String, deviceToken: String) async {
+        // Switching to Local removes push — clear the dedup marker so re-enabling
+        // registers again (otherwise the dedup would skip it and no push arrives).
+        UserDefaults.standard.removeObject(forKey: "reg_dev_\(printerID)")
         guard let url = try? endpoint(base: workerURL, path: "/unregister-device") else { return }
         var req = URLRequest(url: url, timeoutInterval: 10)
         req.httpMethod = "POST"

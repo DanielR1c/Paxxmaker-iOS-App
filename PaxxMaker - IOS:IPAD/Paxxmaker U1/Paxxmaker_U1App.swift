@@ -80,9 +80,48 @@ class PhoneConnectivityManager: NSObject, WCSessionDelegate {
         guard !cfg.baseURL.isEmpty, cfg.baseURL != "__demo__" else { replyHandler([:]); return }
 
         if message["requestStatus"] as? Bool == true {
-            // Watch requested current printer status — reply with the latest cached data
-            if let data = defaults.data(forKey: "w_all_printers") {
-                replyHandler(["printers": data])
+            // Watch requested current printer status — reply with the latest
+            // cached data plus its age ("at") and the connection configs, so the
+            // Watch can (a) detect stale cache and poll directly instead and
+            // (b) store the configs it needs for that (app groups aren't shared
+            // between iPhone and Watch).
+            if var data = defaults.data(forKey: "w_all_printers") {
+                var at = defaults.double(forKey: "w_all_printers_at")
+                // Freshen from the Live Activities (push-updated even in the
+                // background) so the Watch gets the CURRENT progress instead of a
+                // cache from the last time the app was foregrounded on the LAN.
+                // Zero network cost — reads the LA the phone already holds.
+                if #available(iOS 16.2, *),
+                   var entries = try? JSONDecoder().decode([PrinterWidgetEntryData].self, from: data) {
+                    var changed = false
+                    for i in entries.indices {
+                        guard let act = Activity<PaxxMakerWidgetAttributes>.activities
+                                .first(where: { $0.attributes.printerName == entries[i].id }) else { continue }
+                        let s = act.content.state
+                        guard s.printState == "printing" || s.printState == "paused" else { continue }
+                        entries[i].printState  = s.printState
+                        entries[i].progress    = s.progress
+                        entries[i].bedTemp     = s.bedTemp
+                        entries[i].timeElapsed = s.timeElapsed
+                        entries[i].extruderTemp = s.extruderTemp
+                        if var temps = entries[i].extruderTemps, !temps.isEmpty {
+                            temps[0] = s.extruderTemp; entries[i].extruderTemps = temps
+                        }
+                        changed = true
+                    }
+                    if changed, let re = try? JSONEncoder().encode(entries) {
+                        data = re
+                        at = Date().timeIntervalSince1970   // mark fresh
+                    }
+                }
+                var reply: [String: Any] = ["printers": data, "at": at]
+                // The Watch has no access to the phone's app group, so ship the
+                // chosen app language along — otherwise it uses the system one.
+                reply["lang"] = UserDefaults.standard.string(forKey: "app_language") ?? "en"
+                if let cfgData = defaults.data(forKey: "watch_printer_configs") {
+                    reply["configs"] = cfgData
+                }
+                replyHandler(reply)
             } else {
                 replyHandler([:])
             }
@@ -390,20 +429,25 @@ struct Paxxmaker_U1App: App {
                 }
             }
 
-            if prevState == "printing" && newState == "complete" {
-                let content = UNMutableNotificationContent()
-                content.title = "Druck fertig!"
-                content.body = config.name
-                content.sound = .default
-                try? await UNUserNotificationCenter.current().add(
-                    UNNotificationRequest(identifier: "print-done-\(config.name)", content: content, trigger: nil))
-            } else if prevState == "printing" && newState == "error" {
-                let content = UNMutableNotificationContent()
-                content.title = "Druckfehler"
-                content.body = config.name
-                content.sound = .default
-                try? await UNUserNotificationCenter.current().add(
-                    UNNotificationRequest(identifier: "print-err-\(config.name)", content: content, trigger: nil))
+            // Only send the app's own local end-notification for printers WITHOUT
+            // Server Push — otherwise the Cloudflare Worker's push and this would
+            // both arrive ("done" twice).
+            if !config.isCloudPushEnabled {
+                if prevState == "printing" && newState == "complete" {
+                    let content = UNMutableNotificationContent()
+                    content.title = lz(en: "Print done!", de: "Druck fertig!", fr: "Impression terminée !", es: "¡Impresión lista!", pt: "Impressão concluída!", it: "Stampa completata!", zh: "打印完成！")
+                    content.body = config.name
+                    content.sound = .default
+                    try? await UNUserNotificationCenter.current().add(
+                        UNNotificationRequest(identifier: "print-done-\(config.name)", content: content, trigger: nil))
+                } else if prevState == "printing" && newState == "error" {
+                    let content = UNMutableNotificationContent()
+                    content.title = lz(en: "Print error", de: "Druckfehler", fr: "Erreur d'impression", es: "Error de impresión", pt: "Erro de impressão", it: "Errore di stampa", zh: "打印错误")
+                    content.body = config.name
+                    content.sound = .default
+                    try? await UNUserNotificationCenter.current().add(
+                        UNNotificationRequest(identifier: "print-err-\(config.name)", content: content, trigger: nil))
+                }
             }
 
             if newState == "printing" || newState == "paused" {

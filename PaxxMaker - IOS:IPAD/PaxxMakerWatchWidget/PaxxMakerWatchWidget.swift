@@ -2,9 +2,20 @@ import WidgetKit
 import SwiftUI
 import AppIntents
 
-private func lz(en: String, de: String, fr: String, es: String) -> String {
-    let code = Locale.current.language.languageCode?.identifier ?? "en"
-    switch code { case "de": return de; case "fr": return fr; case "es": return es; default: return en }
+private func lz(en: String, de: String, fr: String, es: String, pt: String = "", it: String = "", zh: String = "") -> String {
+    // Follow the language chosen in the iPhone app (synced to the watch and
+    // mirrored into the shared app group); system language is only a fallback.
+    let code = UserDefaults(suiteName: "group.paxxmaker.u1")?.string(forKey: "app_language")
+        ?? Locale.current.language.languageCode?.identifier ?? "en"
+    switch code {
+    case "de": return de
+    case "fr": return fr
+    case "es": return es
+    case "pt": return pt.isEmpty ? en : pt
+    case "it": return it.isEmpty ? en : it
+    case "zh": return zh.isEmpty ? en : zh
+    default: return en
+    }
 }
 
 // MARK: - Data Model
@@ -19,11 +30,11 @@ struct WatchComplicationData: Codable {
 
     var stateLabel: String {
         switch printState {
-        case "printing": return lz(en: "Printing", de: "Druckt", fr: "Impression", es: "Imprimiendo")
-        case "paused":   return lz(en: "Paused", de: "Pause", fr: "Pause", es: "Pausado")
-        case "error":    return lz(en: "Error", de: "Fehler", fr: "Erreur", es: "Error")
-        case "complete": return lz(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo")
-        case "standby":  return lz(en: "Ready", de: "Bereit", fr: "Prêt", es: "Listo")
+        case "printing": return lz(en: "Printing", de: "Druckt", fr: "Impression", es: "Imprimiendo", pt: "Imprimindo", it: "Stampa in corso", zh: "打印中")
+        case "paused":   return lz(en: "Paused", de: "Pause", fr: "Pause", es: "Pausado", pt: "Pausado", it: "In pausa", zh: "已暂停")
+        case "error":    return lz(en: "Error", de: "Fehler", fr: "Erreur", es: "Error", pt: "Erro", it: "Errore", zh: "错误")
+        case "complete": return lz(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo", pt: "Concluído", it: "Fatto", zh: "完成")
+        case "standby":  return lz(en: "Ready", de: "Bereit", fr: "Prêt", es: "Listo", pt: "Pronto", it: "Pronto", zh: "就绪")
         default:         return "–"
         }
     }
@@ -109,7 +120,7 @@ struct WatchPrinterEntityQuery: EntityQuery {
         let entities = WatchComplicationData.loadAll()
             .map { WatchPrinterEntity(id: $0.id, name: $0.printerName) }
         guard !entities.isEmpty else {
-            return [WatchPrinterEntity(id: "__none__", name: lz(en: "No printer – open app", de: "Kein Drucker – App öffnen", fr: "Aucune imprimante – ouvrir l'app", es: "Sin impresora – abrir app"))]
+            return [WatchPrinterEntity(id: "__none__", name: lz(en: "No printer – open app", de: "Kein Drucker – App öffnen", fr: "Aucune imprimante – ouvrir l'app", es: "Sin impresora – abrir app", pt: "Sem impressora – abrir app", it: "Nessuna stampante – apri l'app", zh: "无打印机——请打开应用"))]
         }
         return entities
     }
@@ -356,7 +367,7 @@ struct PaxxMakerWatchWidget: Widget {
                 .containerBackground(entry.data.themeColor.gradient, for: .widget)
         }
         .configurationDisplayName("PaxxMaker")
-        .description(lz(en: "Your 3D print progress", de: "Fortschritt deines 3D-Drucks", fr: "Progression de votre impression 3D", es: "Progreso de tu impresión 3D"))
+        .description(lz(en: "Your 3D print progress", de: "Fortschritt deines 3D-Drucks", fr: "Progression de votre impression 3D", es: "Progreso de tu impresión 3D", pt: "Progresso da sua impressão 3D", it: "Avanzamento della tua stampa 3D", zh: "您的 3D 打印进度"))
         .supportedFamilies([
             .accessoryCircular,
             .accessoryRectangular,

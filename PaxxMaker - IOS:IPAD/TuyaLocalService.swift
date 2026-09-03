@@ -58,6 +58,12 @@ private let VERSION_35_HEADER = Data("3.5".utf8) + Data(repeating: 0, count: 12)
 // v3.3 command codes
 private let CMD_CONTROL:  UInt32 = 7   // set DPS
 private let CMD_DP_QUERY: UInt32 = 10  // query DPS (0x0A)
+// 0x12 — asks the plug to re-measure specific DPs right now. Power-monitoring
+// DPs (18 current / 19 power / 20 voltage) are otherwise only refreshed
+// lazily by the plug itself (~every 30 s); DP_QUERY just returns that cached
+// value, no matter how often we poll. (Packed WITHOUT the "3.3" version
+// header, exactly like DP_QUERY — tinytuya does the same.)
+private let CMD_UPDATEDPS: UInt32 = 18
 
 // v3.5 session negotiation command codes
 private let CMD_SESS_NEG_START:  UInt32 = 3
@@ -131,7 +137,22 @@ private final class TuyaSession {
         )
     }
 
-    func connect() async throws {
+    func connect(timeout: TimeInterval = 4) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await self.startConnection() }
+            group.addTask { [connection] in
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                connection.cancel()   // unblocks startConnection (→ .cancelled)
+                throw TuyaError.connectionFailed
+            }
+            defer { group.cancelAll() }
+            // Whichever finishes first wins; a thrown error propagates.
+            try await group.next()
+        }
+        scheduleReceive()
+    }
+
+    private func startConnection() async throws {
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             let once = _OnceFlag()
             connection.stateUpdateHandler = { [weak self] state in
@@ -141,6 +162,13 @@ private final class TuyaSession {
                     self?.connection.stateUpdateHandler = nil; c.resume()
                 case .failed(let e):
                     guard once.fire() else { return }; c.resume(throwing: e)
+                case .waiting:
+                    // The plug refused the connection (it allows only one at a
+                    // time). NWConnection would otherwise retry forever and hang
+                    // connect() — treat it as a failure so the caller moves on.
+                    guard once.fire() else { return }
+                    self?.connection.cancel()
+                    c.resume(throwing: TuyaError.connectionFailed)
                 case .cancelled:
                     guard once.fire() else { return }
                     c.resume(throwing: TuyaError.connectionFailed)
@@ -149,7 +177,6 @@ private final class TuyaSession {
             }
             connection.start(queue: queue)
         }
-        scheduleReceive()
     }
 
     func disconnect() { connection.cancel() }
@@ -219,6 +246,31 @@ private final class TuyaSession {
     }
 }
 
+// MARK: - Per-host serializer
+// Tuya plugs accept only ONE TCP connection at a time. If a status poll and a
+// power toggle (or two polls) overlap, the second connection corrupts the
+// other's session negotiation → "Session negotiation failed". This actor makes
+// every getStatus/setPower for a given host run strictly one after another.
+private actor HostSerializer {
+    static let shared = HostSerializer()
+    private var active = Set<String>()
+    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func acquire(_ host: String) async {
+        if !active.contains(host) { active.insert(host); return }
+        await withCheckedContinuation { c in waiters[host, default: []].append(c) }
+    }
+    func release(_ host: String) {
+        if var q = waiters[host], !q.isEmpty {
+            let c = q.removeFirst()
+            waiters[host] = q
+            c.resume()
+        } else {
+            active.remove(host)
+        }
+    }
+}
+
 // MARK: - TuyaLocalService
 enum TuyaLocalService {
 
@@ -228,51 +280,153 @@ enum TuyaLocalService {
         let localKeyData: Data
     }
 
-    // Per-host protocol version cache (in-memory, resets on app restart)
-    private enum Proto { case v33, v34, v35 }
+    // Per-host protocol version cache. Kept in memory AND persisted to
+    // UserDefaults, so after the very first successful detection the app
+    // jumps straight to the right protocol on every later launch — no more
+    // flaky multi-probe at startup.
+    private enum Proto: String { case v33, v34, v35 }
     private static var protoCache = [String: Proto]()
+    private static let protoDefaultsPrefix = "tuyaProto."
+
+    // Tuya plugs accept only ONE TCP connection at a time and need a brief
+    // moment to free the socket after we disconnect. This pause between probe
+    // attempts stops the next connection from racing the previous teardown,
+    // which is what makes the v3.5 session negotiation fail on a cold start.
+    private static let probeSettle: UInt64 = 500_000_000  // 0.5 s
+
+    private static func cachedProto(_ host: String) -> Proto? {
+        if let p = protoCache[host] { return p }
+        if let raw = UserDefaults.standard.string(forKey: protoDefaultsPrefix + host),
+           let p = Proto(rawValue: raw) { protoCache[host] = p; return p }
+        return nil
+    }
+    private static func rememberProto(_ proto: Proto, _ host: String) {
+        protoCache[host] = proto
+        UserDefaults.standard.set(proto.rawValue, forKey: protoDefaultsPrefix + host)
+    }
+    private static func forgetProto(_ host: String) {
+        protoCache[host] = nil
+        UserDefaults.standard.removeObject(forKey: protoDefaultsPrefix + host)
+    }
+
+    // True when we never managed a working encrypted session. `.noStatus` is the
+    // one error that means "session was fine, the plug just didn't return a
+    // readable status" — in that case the protocol is correct and we must NOT
+    // re-probe other protocols (which fails to negotiate on the plug's single
+    // connection and surfaces a misleading "Session negotiation failed").
+    private static func isNegotiationFailure(_ error: Error) -> Bool {
+        if let e = error as? TuyaError, case .noStatus = e { return false }
+        return true
+    }
 
     // MARK: - Public API
     // Detection order: v3.3 (no handshake) → v3.5 (6699) → v3.4 (55AA+session)
-    static func getStatus(config: Config) async throws -> PlugStatus {
-        switch protoCache[config.host] {
-        case .v33: return try await getStatus_v33(config: config)
+    static func getStatus(config: Config, refreshEnergy: Bool = false) async throws -> PlugStatus {
+        await HostSerializer.shared.acquire(config.host)
+        defer { let h = config.host; Task { await HostSerializer.shared.release(h) } }
+        // Try the remembered protocol first. Keep it (and surface the read
+        // error) if only the status query failed; re-detect only when the
+        // session negotiation itself failed.
+        //
+        // A single transient hiccup (brief WiFi congestion, plug momentarily
+        // busy) on an otherwise-correct cached protocol used to immediately
+        // trigger the full v3.3 -> v3.5 -> v3.4 re-probe cascade below, which
+        // can take 20+ seconds — turning a one-off blip into a long visible
+        // stall in the wattage readout. Retry the cached protocol once before
+        // giving up on it.
+        if let proto = cachedProto(config.host) {
+            do { return try await getStatus(proto: proto, config: config, refreshEnergy: refreshEnergy) }
+            catch {
+                if !isNegotiationFailure(error) { throw error }
+                do { return try await getStatus(proto: proto, config: config, refreshEnergy: refreshEnergy) }
+                catch { if !isNegotiationFailure(error) { throw error } }
+                forgetProto(config.host)
+            }
+        }
+        if let r = try? await getStatus_v33(config: config) { rememberProto(.v33, config.host); return r }
+        try? await Task.sleep(nanoseconds: probeSettle)
+        do {
+            let r = try await getStatus_v35(config: config)
+            rememberProto(.v35, config.host); return r
+        } catch {
+            // Negotiation worked but the query didn't → it IS a v3.5 device.
+            // Remember it and report the read error rather than trying v3.4.
+            if !isNegotiationFailure(error) { rememberProto(.v35, config.host); throw error }
+        }
+        try? await Task.sleep(nanoseconds: probeSettle)
+        let r = try await getStatus_v34(config: config)
+        rememberProto(.v34, config.host); return r
+    }
+
+    private static func getStatus(proto: Proto, config: Config, refreshEnergy: Bool = false) async throws -> PlugStatus {
+        switch proto {
+        case .v33: return try await getStatus_v33(config: config, refreshEnergy: refreshEnergy)
+        // v3.4/v3.5 devices push fresh DP values within their session — no
+        // UPDATEDPS implemented there (yet); the lazy-cache issue is a v3.3 trait.
         case .v34: return try await getStatus_v34(config: config)
         case .v35: return try await getStatus_v35(config: config)
-        case nil:
-            if let r = try? await getStatus_v33(config: config) { protoCache[config.host] = .v33; return r }
-            if let r = try? await getStatus_v35(config: config) { protoCache[config.host] = .v35; return r }
-            let r = try await getStatus_v34(config: config)
-            protoCache[config.host] = .v34; return r
         }
     }
 
     static func setPower(_ on: Bool, config: Config) async throws {
-        switch protoCache[config.host] {
+        await HostSerializer.shared.acquire(config.host)
+        defer { let h = config.host; Task { await HostSerializer.shared.release(h) } }
+        if let proto = cachedProto(config.host) {
+            if (try? await setPower(on, proto: proto, config: config)) != nil { return }
+            forgetProto(config.host)
+        }
+        if (try? await setPower_v33(on, config: config)) != nil { rememberProto(.v33, config.host); return }
+        try? await Task.sleep(nanoseconds: probeSettle)
+        if (try? await setPower_v35(on, config: config)) != nil { rememberProto(.v35, config.host); return }
+        try? await Task.sleep(nanoseconds: probeSettle)
+        try await setPower_v34(on, config: config)
+        rememberProto(.v34, config.host)
+    }
+
+    private static func setPower(_ on: Bool, proto: Proto, config: Config) async throws {
+        switch proto {
         case .v33: try await setPower_v33(on, config: config)
         case .v34: try await setPower_v34(on, config: config)
         case .v35: try await setPower_v35(on, config: config)
-        case nil:
-            if (try? await setPower_v33(on, config: config)) != nil { protoCache[config.host] = .v33; return }
-            if (try? await setPower_v35(on, config: config)) != nil { protoCache[config.host] = .v35; return }
-            try await setPower_v34(on, config: config)
-            protoCache[config.host] = .v34
         }
     }
 
     // MARK: - v3.3 implementation
-    private static func getStatus_v33(config: Config) async throws -> PlugStatus {
+    private static func getStatus_v33(config: Config, refreshEnergy: Bool = false) async throws -> PlugStatus {
         let session = TuyaSession(host: config.host)
         try await session.connect()
         defer { session.disconnect() }
+        // Force a fresh measurement of the energy DPs first — without this the
+        // plug serves a cached wattage that it only re-measures every ~30 s,
+        // making a 1-second poll pointless. Only sent once we KNOW the plug is
+        // a power-monitoring model (a wattage was seen before); other devices
+        // may react badly to the unknown command.
+        if refreshEnergy {
+            // Fire-and-forget: just nudge the plug to re-measure. We do NOT wait
+            // for its reply here (that could add seconds of timeouts) — the
+            // DP_QUERY below then returns the freshened value.
+            let upd = try JSONSerialization.data(withJSONObject: ["dpId": [18, 19, 20]])
+            try? await session.send(try pack33(seqno: 1, cmd: CMD_UPDATEDPS, json: upd, key: config.localKeyData))
+            try? await Task.sleep(nanoseconds: 150_000_000)  // let it measure
+        }
         let ts = Int(Date().timeIntervalSince1970)
         let json = try JSONSerialization.data(withJSONObject: [
             "gwId": config.deviceID, "devId": config.deviceID,
             "uid": config.deviceID, "t": "\(ts)"
         ])
-        try await session.send(try pack33(seqno: 1, cmd: CMD_DP_QUERY, json: json, key: config.localKeyData))
-        let resp = try await session.receivePacket(timeout: 4)
-        return try parseDPS(try unpack33(resp, key: config.localKeyData))
+        try await session.send(try pack33(seqno: 2, cmd: CMD_DP_QUERY, json: json, key: config.localKeyData))
+        // The plug may send ack/echo/DP-push packets before the real status
+        // (UPDATEDPS can trigger an extra push), so read a few and return the
+        // first that decodes. On a non-v3.3 device nothing parseable arrives →
+        // we throw and the caller falls through to the v3.5/v3.4 paths.
+        for _ in 0..<3 {
+            guard let resp = try? await session.receivePacket(timeout: 1.5) else { break }
+            if let plain = try? unpack33(resp, key: config.localKeyData),
+               let status = try? parseDPS(stripToJSON(plain)) {
+                return status
+            }
+        }
+        throw TuyaError.noStatus
     }
 
     private static func setPower_v33(_ on: Bool, config: Config) async throws {
@@ -289,7 +443,11 @@ enum TuyaLocalService {
     }
 
     private static func pack33(seqno: UInt32, cmd: UInt32, json: Data, key: Data) throws -> Data {
-        let payload = VERSION_33_HEADER + (try aesECBEncrypt(json, key: key))
+        let enc = try aesECBEncrypt(json, key: key)
+        // v3.3 prepends the "3.3" version header ONLY for CONTROL-type commands.
+        // DP_QUERY (and other passthrough commands) must NOT have it, otherwise
+        // the device can't parse the request and replies "parse data error".
+        let payload = (cmd == CMD_CONTROL) ? (VERSION_33_HEADER + enc) : enc
         let msgLen = UInt32(payload.count + 8)  // CRC32(4) + suffix(4)
         var d = PREFIX_55AA + seqno.be + cmd.be + msgLen.be + payload
         d += crc32(d).be + SUFFIX_55AA
@@ -301,13 +459,25 @@ enum TuyaLocalService {
         let msgLen = data[12..<16].withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
         let end = min(16 + Int(msgLen) - 8, data.count)   // strip CRC(4) + suffix(4)
         guard end > 16 else { throw TuyaError.invalidResponse }
-        var payload = Data(data[16..<end])
-        // Strip 15-byte version header if present
-        if payload.count >= 15 && payload.prefix(3) == Data("3.3".utf8) {
-            payload = Data(payload.dropFirst(15))
+        let body = Data(data[16..<end])
+
+        // The body before the AES-ECB ciphertext may carry, in any combination:
+        //   • a 4-byte return code (present in responses, absent in requests)
+        //   • a 15-byte "3.3" version header
+        // The original code only handled the version header, so command responses
+        // (which DO include a return code) failed to decrypt — the plug toggled
+        // fine but its status could never be read. Try every plausible offset and
+        // accept the one that decrypts to JSON.
+        for skip in [0, 4, 15, 19] {
+            guard body.count > skip else { continue }
+            let candidate = Data(body.dropFirst(skip))
+            guard candidate.count >= 16, candidate.count % 16 == 0 else { continue }
+            if let plain = try? aesECBDecrypt(candidate, key: key),
+               plain.firstIndex(of: UInt8(ascii: "{")) != nil {
+                return plain
+            }
         }
-        guard !payload.isEmpty else { throw TuyaError.invalidResponse }
-        return try aesECBDecrypt(payload, key: key)
+        throw TuyaError.invalidResponse
     }
 
     // MARK: - v3.4 implementation
@@ -317,15 +487,21 @@ enum TuyaLocalService {
     //   end     = HMAC-SHA256(session_key, header+payload) + suffix  (36 bytes)
     private static func getStatus_v34(config: Config) async throws -> PlugStatus {
         try await withSessionKey(config: config) { session, sessionKey, nextSeq in
-            let ts = Int(Date().timeIntervalSince1970)
-            let json = try JSONSerialization.data(withJSONObject: [
-                "devId": config.deviceID, "uid": config.deviceID, "t": "\(ts)"
-            ])
-            let pkt = try pack34(seqno: nextSeq(), cmd: CMD_DP_QUERY_NEW,
-                                 json: json, sessionKey: sessionKey)
-            try await session.send(pkt)
-            let resp = try await session.receivePacket()
-            return try parseDPS(try unpack34(resp, sessionKey: sessionKey))
+            // Try both query commands on the live session (see getStatus_v35).
+            for cmd in [CMD_DP_QUERY_NEW, CMD_DP_QUERY] {
+                let ts = Int(Date().timeIntervalSince1970)
+                let json = try JSONSerialization.data(withJSONObject: [
+                    "devId": config.deviceID, "uid": config.deviceID, "t": "\(ts)"
+                ])
+                let pkt = try pack34(seqno: nextSeq(), cmd: cmd,
+                                     json: json, sessionKey: sessionKey)
+                try await session.send(pkt)
+                if let resp = try? await session.receivePacket(timeout: 1.5),
+                   let status = try? parseDPS(try unpack34(resp, sessionKey: sessionKey)) {
+                    return status
+                }
+            }
+            throw TuyaError.noStatus
         }
     }
 
@@ -379,16 +555,25 @@ enum TuyaLocalService {
     // MARK: - v3.5 implementation
     private static func getStatus_v35(config: Config) async throws -> PlugStatus {
         try await withSessionKey(config: config) { session, sessionKey, nextSeq in
-            let ts = Int(Date().timeIntervalSince1970)
-            let json = try JSONSerialization.data(withJSONObject: [
-                "devId": config.deviceID, "uid": config.deviceID, "t": "\(ts)"
-            ])
-            let pkt = try encode6699(cmd: CMD_DP_QUERY_NEW, payload: json,
-                                     sessionKey: sessionKey, seqno: nextSeq())
-            try await session.send(pkt)
-            let resp = try await session.receivePacket()
-            let plain = try decode6699(resp, sessionKey: sessionKey)
-            return try parseDPS(stripToJSON(plain))
+            // Some plugs answer DP_QUERY_NEW (0x10), others only the legacy
+            // DP_QUERY (0x0a). The session is already up, so try both on it
+            // before giving up — this is the difference between a plug that
+            // toggles but "can't read status" and one that works fully.
+            for cmd in [CMD_DP_QUERY_NEW, CMD_DP_QUERY] {
+                let ts = Int(Date().timeIntervalSince1970)
+                let json = try JSONSerialization.data(withJSONObject: [
+                    "devId": config.deviceID, "uid": config.deviceID, "t": "\(ts)"
+                ])
+                let pkt = try encode6699(cmd: cmd, payload: json,
+                                         sessionKey: sessionKey, seqno: nextSeq())
+                try await session.send(pkt)
+                if let resp = try? await session.receivePacket(timeout: 1.5),
+                   let plain = try? decode6699(resp, sessionKey: sessionKey),
+                   let status = try? parseDPS(stripToJSON(plain)) {
+                    return status
+                }
+            }
+            throw TuyaError.noStatus
         }
     }
 
@@ -407,24 +592,52 @@ enum TuyaLocalService {
     }
 
     // MARK: - v3.5 session key negotiation
+    // The negotiation can return an empty/short response when the plug isn't
+    // ready (busy, just woke up, previous connection not fully closed). A single
+    // attempt then fails with "Session negotiation failed" even though the plug
+    // is fine a moment later — which is exactly why a manual tap "works" but the
+    // background poll didn't. So we retry the whole connect+negotiate a few times.
     @discardableResult
     private static func withSessionKey<T>(
         config: Config,
         work: (TuyaSession, Data, () -> UInt32) async throws -> T
     ) async throws -> T {
-        let session = TuyaSession(host: config.host)
+        var lastError: Error = TuyaError.sessionNegotiationFailed
+        for attempt in 1...2 {
+            let session = TuyaSession(host: config.host)
+            do {
+                let result = try await negotiateAndRun(session: session, config: config, work: work)
+                session.disconnect()
+                return result
+            } catch {
+                session.disconnect()
+                lastError = error
+                // A query failure (noStatus) means the session itself was fine —
+                // don't retry the negotiation, let it propagate.
+                if !isNegotiationFailure(error) { throw error }
+                if attempt < 2 { try? await Task.sleep(nanoseconds: 400_000_000) }  // 0.4 s
+            }
+        }
+        throw lastError
+    }
+
+    private static func negotiateAndRun<T>(
+        session: TuyaSession,
+        config: Config,
+        work: (TuyaSession, Data, () -> UInt32) async throws -> T
+    ) async throws -> T {
         try await session.connect()
-        defer { session.disconnect() }
 
         var seqno: UInt32 = 1
         func nextSeq() -> UInt32 { let s = seqno; seqno += 1; return s }
 
-        let localNonce = Data("0123456789abcdef".utf8)   // 16 bytes
+        // Fresh random 16-byte nonce per session (matches the reference clients).
+        let localNonce = SymmetricKey(size: .bits128).withUnsafeBytes { Data($0) }
         let step1 = pack55_v35(seqno: nextSeq(), cmd: CMD_SESS_NEG_START,
                                payload: localNonce, key: config.localKeyData)
         try await session.send(step1)
 
-        let resp = try await session.receivePacket()
+        let resp = try await session.receivePacket(timeout: 3)
         let rPayload = unpack55_payload_v35(resp)
         guard rPayload.count >= 48 else { throw TuyaError.sessionNegotiationFailed }
         let remoteNonce  = rPayload.prefix(16)

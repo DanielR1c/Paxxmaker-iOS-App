@@ -1,9 +1,20 @@
 import ActivityKit
 import SwiftUI
 
-func lzShared(en: String, de: String, fr: String, es: String) -> String {
-    let code = Locale.preferredLanguages.first?.components(separatedBy: "-").first ?? "en"
-    switch code { case "de": return de; case "fr": return fr; case "es": return es; default: return en }
+func lzShared(en: String, de: String, fr: String, es: String, pt: String = "", it: String = "", zh: String = "") -> String {
+    // Follow the language chosen in the app (mirrored into the shared app
+    // group); only fall back to the system language if it was never set.
+    let code = UserDefaults(suiteName: "group.paxxmaker.u1")?.string(forKey: "app_language")
+        ?? Locale.current.language.languageCode?.identifier ?? "en"
+    switch code {
+    case "de": return de
+    case "fr": return fr
+    case "es": return es
+    case "pt": return pt.isEmpty ? en : pt
+    case "it": return it.isEmpty ? en : it
+    case "zh": return zh.isEmpty ? en : zh
+    default: return en
+    }
 }
 
 // Shared between main app target AND widget extension target.
@@ -63,6 +74,7 @@ struct PrinterWidgetEntry: Codable, Identifiable {
     }
 }
 
+
 // MARK: - Widget display data
 struct PrinterWidgetData {
     let name: String
@@ -86,6 +98,15 @@ struct PrinterWidgetData {
         return all.first?.asWidgetData ?? .placeholder
     }
 
+    // Cloudflare-free: the widget shows the local app-group cache written by the
+    // app. It makes ZERO Worker requests. Live status away from home is covered
+    // by the Live Activity (pushed to the phone) — a widget can't read a Live
+    // Activity anyway, and doesn't need to. Because nothing reads /status, the
+    // Worker no longer keeps a per-print KV snapshot (that was the KV-write hog).
+    static func loadFresh(id: String? = nil) async -> PrinterWidgetData {
+        return load(id: id)
+    }
+
     static var placeholder: PrinterWidgetData {
         PrinterWidgetData(name: "PaxxMaker", printState: "standby", filename: "",
                           progress: 0, extruderTemp: 0, bedTemp: 0, timeElapsed: 0,
@@ -104,11 +125,11 @@ struct PrinterWidgetData {
 
     var stateLabel: String {
         switch printState {
-        case "printing": return lzShared(en: "Printing", de: "Druckt", fr: "Impression", es: "Imprimiendo")
-        case "paused":   return lzShared(en: "Paused", de: "Pause", fr: "Pause", es: "Pausado")
-        case "error":    return lzShared(en: "Error", de: "Fehler", fr: "Erreur", es: "Error")
-        case "complete": return lzShared(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo")
-        case "standby":  return lzShared(en: "Ready", de: "Bereit", fr: "Prêt", es: "Listo")
+        case "printing": return lzShared(en: "Printing", de: "Druckt", fr: "Impression", es: "Imprimiendo", pt: "Imprimindo", it: "Stampa in corso", zh: "打印中")
+        case "paused":   return lzShared(en: "Paused", de: "Pause", fr: "Pause", es: "Pausado", pt: "Pausado", it: "In pausa", zh: "已暂停")
+        case "error":    return lzShared(en: "Error", de: "Fehler", fr: "Erreur", es: "Error", pt: "Erro", it: "Errore", zh: "错误")
+        case "complete": return lzShared(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo", pt: "Concluído", it: "Fatto", zh: "完成")
+        case "standby":  return lzShared(en: "Ready", de: "Bereit", fr: "Prêt", es: "Listo", pt: "Pronto", it: "Pronto", zh: "就绪")
         default:         return "–"
         }
     }

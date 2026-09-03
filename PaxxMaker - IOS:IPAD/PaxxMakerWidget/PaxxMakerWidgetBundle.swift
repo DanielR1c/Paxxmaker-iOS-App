@@ -13,9 +13,9 @@ struct PaxxMakerWidgetBundle: WidgetBundle {
     var body: some Widget {
         PaxxMakerWidget()
         SpoolWidget()
-        if #available(iOS 18.0, *) {
-            PaxxMakerWidgetControl()
-        }
+        // (PaxxMakerWidgetControl is Xcode's template "Timer" control — it does
+        // nothing and showed placeholder text in the Controls gallery, so it is
+        // not part of the shipped bundle.)
         PaxxMakerWidgetLiveActivity()
     }
 }

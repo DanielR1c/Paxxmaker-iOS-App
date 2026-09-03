@@ -1,9 +1,20 @@
 import WidgetKit
 import SwiftUI
 
-private func lz(en: String, de: String, fr: String, es: String) -> String {
-    let code = Locale.current.language.languageCode?.identifier ?? "en"
-    switch code { case "de": return de; case "fr": return fr; case "es": return es; default: return en }
+private func lz(en: String, de: String, fr: String, es: String, pt: String = "", it: String = "", zh: String = "") -> String {
+    // Follow the language chosen in the app (mirrored into the shared app
+    // group); only fall back to the system language if it was never set.
+    let code = UserDefaults(suiteName: "group.paxxmaker.u1")?.string(forKey: "app_language")
+        ?? Locale.current.language.languageCode?.identifier ?? "en"
+    switch code {
+    case "de": return de
+    case "fr": return fr
+    case "es": return es
+    case "pt": return pt.isEmpty ? en : pt
+    case "it": return it.isEmpty ? en : it
+    case "zh": return zh.isEmpty ? en : zh
+    default: return en
+    }
 }
 
 // MARK: - Timeline Entry
@@ -23,7 +34,13 @@ struct PrinterTimelineProvider: AppIntentTimelineProvider {
                      data: PrinterWidgetData.load(id: configuration.printer?.id))
     }
     func timeline(for configuration: SelectPrinterIntent, in context: Context) async -> Timeline<PrinterEntry> {
-        let data = PrinterWidgetData.load(id: configuration.printer?.id)
+        // For Server-Push printers this pulls the latest known status from the
+        // Cloudflare Worker — reachable over any network, unlike the printer's
+        // own LAN IP — so the widget stays current while away from home WiFi.
+        // Local-only printers fall back to the plain cached value untouched.
+        let data = await PrinterWidgetData.loadFresh(id: configuration.printer?.id)
+        // 5 min while active, 30 min idle — frequent enough to feel "live"
+        // without hammering the Cloudflare quota on every timeline reload.
         let refresh = Date().addingTimeInterval(data.isActive ? 300 : 1800)
         return Timeline(entries: [PrinterEntry(date: .now, configuration: configuration, data: data)],
                         policy: .after(refresh))
@@ -444,8 +461,8 @@ struct PaxxMakerWidget: Widget {
                                provider: PrinterTimelineProvider()) { entry in
             PaxxMakerWidgetEntryView(entry: entry)
         }
-        .configurationDisplayName(lz(en: "PaxxMaker Progress", de: "PaxxMaker Fortschritt", fr: "Progression PaxxMaker", es: "Progreso PaxxMaker"))
-        .description(lz(en: "Printer status & progress.", de: "Druckerstatus & Fortschritt.", fr: "État & progression de l'imprimante.", es: "Estado y progreso de la impresora."))
+        .configurationDisplayName(lz(en: "PaxxMaker Progress", de: "PaxxMaker Fortschritt", fr: "Progression PaxxMaker", es: "Progreso PaxxMaker", pt: "Progresso PaxxMaker", it: "Avanzamento PaxxMaker", zh: "PaxxMaker 进度"))
+        .description(lz(en: "Printer status & progress.", de: "Druckerstatus & Fortschritt.", fr: "État & progression de l'imprimante.", es: "Estado y progreso de la impresora.", pt: "Status e progresso da impressora.", it: "Stato e avanzamento della stampante.", zh: "打印机状态与进度。"))
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
 }
@@ -469,8 +486,8 @@ struct SpoolWidget: Widget {
                                provider: PrinterTimelineProvider()) { entry in
             SpoolWidgetEntryView(entry: entry)
         }
-        .configurationDisplayName(lz(en: "PaxxMaker Spools", de: "PaxxMaker Spulen", fr: "Bobines PaxxMaker", es: "Carretes PaxxMaker"))
-        .description(lz(en: "Filament spools overview.", de: "Filament-Spulen Übersicht.", fr: "Aperçu des bobines de filament.", es: "Vista general de carretes de filamento."))
+        .configurationDisplayName(lz(en: "PaxxMaker Spools", de: "PaxxMaker Spulen", fr: "Bobines PaxxMaker", es: "Carretes PaxxMaker", pt: "Bobinas PaxxMaker", it: "Bobine PaxxMaker", zh: "PaxxMaker 料盘"))
+        .description(lz(en: "Filament spools overview.", de: "Filament-Spulen Übersicht.", fr: "Aperçu des bobines de filament.", es: "Vista general de carretes de filamento.", pt: "Visão geral das bobinas de filamento.", it: "Panoramica delle bobine di filamento.", zh: "耗材料盘概览。"))
         .supportedFamilies([.systemSmall, .systemMedium])
     }
 }

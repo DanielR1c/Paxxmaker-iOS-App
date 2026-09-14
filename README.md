@@ -1,6 +1,5 @@
-New: SpoolLink support (Snapmaker U1)
-• When firmware v1.5.2-paxx12-21 with SpoolLink is detected, support switches on automatically – there is nothing to configure. The "Spools" tile then turns into a SpoolLink tile.
-• Single-nozzle printers: the extruder tile shows the active Spoolman spool; tapping it opens the spool picker directly.
-• Bug fixes.
-
-At the moment, firmware v1.5.2-paxx12-21 is still a pre-release. Things may still change before it is released, and features may briefly stop working. I'd be glad to hear your feedback.
+ What's new in version 2.3 (smart plug required for the first two)
+• Cost per print: power (measured at the smart plug) plus filament, priced via Spoolman or the slicer profile. New “Last Print Cost” tile with history.
+ • Auto Shutdown: the smart plug switches off after a print – with a delay, optionally after a cancel too. 
+• Push notifications now tell a pause from an empty spool – on the U1 with the nozzle.
+ • Bug fixes and improvements.

@@ -212,6 +212,7 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 MOONRAKER_URL = os.getenv("PAXX_MOONRAKER", "http://localhost:7125")
@@ -272,7 +273,7 @@ def post_update(payload):
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         WORKER_URL.rstrip("/") + "/update", data=body, method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": "paxxmaker-bridge/2.0"})
+        headers={"Content-Type": "application/json", "User-Agent": "paxxmaker-bridge/${BRIDGE_VERSION}"})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S, context=_SSL_CTX) as r:
             raw = r.read()
@@ -319,6 +320,65 @@ def check_worker():
     else:
         log.error("Worker-Verbindungstest FEHLGESCHLAGEN — siehe Meldung oben.")
 
+
+# gcode_start_byte / gcode_end_byte per file — fetched once per print.
+_GCODE_RANGE_CACHE = {}
+
+def gcode_range(filename):
+    if not filename:
+        return None
+    if filename in _GCODE_RANGE_CACHE:
+        return _GCODE_RANGE_CACHE[filename]
+    r = http_get_json(MOONRAKER_URL.rstrip("/") + "/server/files/metadata?filename=" +
+                      urllib.parse.quote(filename))
+    rng = None
+    if r:
+        res = r.get("result", {}) or {}
+        a, b = res.get("gcode_start_byte"), res.get("gcode_end_byte")
+        if a is not None and b is not None:
+            rng = (float(a), float(b))
+    _GCODE_RANGE_CACHE[filename] = rng
+    if len(_GCODE_RANGE_CACHE) > 20:
+        _GCODE_RANGE_CACHE.clear()
+    return rng
+def task_config():
+    """print_task_config as its own small query — folding it into the main
+    status query risks the U1 truncating the response. Retried: the U1
+    answers with an empty body every so often."""
+    for attempt in range(3):
+        if attempt:
+            time.sleep(0.4)
+        r = http_get_json(MOONRAKER_URL.rstrip("/") + "/printer/objects/query?print_task_config")
+        if r:
+            return ((r.get("result", {}) or {}).get("status", {}) or {}).get("print_task_config", {}) or {}
+    return None
+
+_EVER_OCCUPIED = [False, False, False, False]
+
+def note_occupancy(c):
+    """Remember channels that hold filament, for the whole print."""
+    for i, present in enumerate(c.get("filament_exist") or []):
+        if present and i < len(_EVER_OCCUPIED):
+            _EVER_OCCUPIED[i] = True
+
+def pause_reason(multi_nozzle=False):
+    """Why did Klipper pause? Returns e.g. "runout:2", or None when the cause is
+    something else (M600, manual pause). A runout wipes EVERYTHING about that
+    channel (type, vendor, spool id all go to NONE/0 — measured), so a single
+    sample cannot tell it from a channel that was never loaded. What works is
+    history: a channel seen holding filament earlier in this print and empty
+    now. Accumulating also survives the sensor blip while loading, which made a
+    snapshot taken at print start useless. extruders_used is not dependable
+    either — it read [False]*4 throughout one measured print."""
+    c = task_config()
+    if not c:
+        return None
+    exist = c.get("filament_exist") or []
+    for i, present in enumerate(exist):
+        if not present and i < len(_EVER_OCCUPIED) and _EVER_OCCUPIED[i]:
+            return ("runout:%d" % (i + 1)) if multi_nozzle else "runout"
+    return None
+
 def get_status():
     r = http_get_json(MOONRAKER_URL.rstrip("/") +
                       "/printer/objects/query?print_stats&display_status&virtual_sdcard&toolhead&extruder&extruder1&extruder2&extruder3&heater_bed")
@@ -329,10 +389,22 @@ def get_status():
     ds = s.get("display_status", {}) or {}
     vs = s.get("virtual_sdcard", {}) or {}
     hb = s.get("heater_bed", {}) or {}
-    # Match the app: prefer display_status.progress (honors M73 slicer
-    # commands, what Mainsail/Klipper show), fall back to virtual_sdcard.
+    # Two definitions, both correct; the app lets the user pick, so send BOTH.
+    # display_status.progress honours the slicer's M73 commands (what
+    # Mainsail/Klipper show); virtual_sdcard.progress is the position in the
+    # file (what the printer's own display shows).
     dispProg = ds.get("progress")
     progress = float(dispProg) if dispProg is not None else float(vs.get("progress") or 0.0)
+    # The printer's own display measures progress across the PRINT gcode only,
+    # between gcode_start_byte and gcode_end_byte — start gcode (heating,
+    # levelling) and end gcode sit outside that range. Fall back to the plain
+    # file position when the metadata is unavailable.
+    progress_file = float(vs.get("progress") or 0.0)
+    fname = ps.get("filename") or ""
+    rng = gcode_range(fname)
+    pos = vs.get("file_position")
+    if rng and pos is not None and rng[1] > rng[0]:
+        progress_file = max(0.0, min(1.0, (float(pos) - rng[0]) / (rng[1] - rng[0])))
     # Report the ACTIVE nozzle's temperature (toolhead.extruder) instead of
     # always extruder0 — matches the nozzle the app/widget highlight as in use.
     # If the active nozzle can't be determined, use the hottest one (same
@@ -347,9 +419,11 @@ def get_status():
                  if (s.get(k) or {}).get("temperature") is not None]
         active_temp = max(temps) if temps else 0.0
     return {
+        "multi_nozzle":   s.get("extruder1") is not None,
         "state":          ps.get("state", "standby"),
         "filename":       ps.get("filename", "") or "",
         "progress":       round(progress, 4),
+        "progress_file":  round(progress_file, 4),
         "print_duration": ps.get("print_duration", 0) or 0,
         "hotend_temp":    round(float(active_temp), 1),
         "bed_temp":       round(float(hb.get("temperature") or 0.0), 1),
@@ -465,6 +539,9 @@ def main():
                 if state == "printing":
                     event = "resumed" if last_state == "paused" else "started"
                     last_progress = prog
+                    if event == "started":
+                        for k in range(4):
+                            _EVER_OCCUPIED[k] = False
                 elif state == "paused" and last_state == "printing":
                     event = "paused"
                 elif state in END_EVENTS:
@@ -476,10 +553,25 @@ def main():
                 log.info("Statuswechsel: %s -> %s", last_state, state)
                 if event:
                     last_sent_at = now
-                    send(event, s, important=event in END_EVENTS or event == "started")
+                    if event == "paused":
+                        reason = pause_reason(s.get("multi_nozzle", False))
+                        if reason:
+                            s = dict(s, pause_reason=reason)
+                    send(event, s, important=event in END_EVENTS or event in ("started", "paused"))
                 last_state = state
+                # Record occupancy on the very first printing poll too. Starting
+                # the bridge mid-print resets the history one line above, and
+                # without this it stayed empty until the next tick — a runout in
+                # that window could not be recognised.
+                if state == "printing":
+                    c0 = task_config()
+                    if c0:
+                        note_occupancy(c0)
 
             elif state == "printing":
+                c = task_config()
+                if c:
+                    note_occupancy(c)
                 changed = abs(prog - last_progress) >= PROG_THRESHOLD
                 stale   = (now - last_sent_at) >= MAX_SILENT_S
                 if (changed or stale) and fail_streak < 8:
@@ -506,6 +598,11 @@ if __name__ == "__main__":
 `;
 }
 
+// One place that defines which bridge version the Worker ships. It goes into
+// the notifier config so the app can spot an outdated install, and into the
+// bridge's User-Agent so it is visible in the logs too.
+const BRIDGE_VERSION = "2.2";
+
 // Progress delta (fraction) at which the bridge sends a new /update. It is
 // returned to the bridge in every /update response, so changing it here + a
 // Worker deploy retunes push/KV load for ALL printers on their next tick —
@@ -531,11 +628,31 @@ const PUSH_TITLES: Record<string, Record<string, string>> = {
     es: "Impresión cancelada", pt: "Impressão cancelada", it: "Stampa annullata",
     zh: "打印已取消",
   },
+  // Sent when the bridge could name the cause: a nozzle this print uses
+  // reports no filament.
+  runout: {
+    en: "Filament runout", de: "Filament leer", fr: "Filament épuisé",
+    es: "Filamento agotado", pt: "Filamento esgotado", it: "Filamento esaurito",
+    zh: "耗材用尽",
+  },
+  // Same, with the nozzle named right after the material — %d is the 1-based
+  // nozzle. Only used on multi-nozzle printers.
+  runout_nozzle: {
+    en: "Filament Nozzle %d empty", de: "Filament Nozzle %d leer",
+    fr: "Filament buse %d épuisé", es: "Filamento boquilla %d agotado",
+    pt: "Filamento bico %d esgotado", it: "Filamento ugello %d esaurito",
+    zh: "喷嘴 %d 耗材用尽",
+  },
+  // Fallback when the cause is unknown (M600, manual pause) — no guessing.
+  paused: {
+    en: "Print paused", de: "Druck pausiert", fr: "Impression en pause",
+    es: "Impresión en pausa", pt: "Impressão pausada", it: "Stampa in pausa",
+    zh: "打印已暂停",
+  },
 };
 
 function pushTitle(event: string, lang: string): string {
-  const key = event === "complete" ? "complete" : event === "error" ? "error" : "cancelled";
-  const row = PUSH_TITLES[key];
+  const row = PUSH_TITLES[event] ?? PUSH_TITLES.cancelled;
   return row[lang] ?? row.en;
 }
 
@@ -591,6 +708,10 @@ export default {
       const event     = (body.event as string) ?? "progress";
       const state     = (body.state as string) ?? "standby";
       const progress  = (body.progress as number) ?? 0;
+      // Sent by bridge v2.1+; older bridges omit it and the app falls back.
+      const progressFile = body.progress_file as number | undefined;
+      // e.g. "runout:2" — only present when the bridge could name the cause.
+      const pauseReason = (body.pause_reason as string) ?? "";
       const hotend    = (body.hotend_temp as number) ?? 0;
       const bed       = (body.bed_temp as number) ?? 0;
       const duration  = (body.print_duration as number) ?? 0;
@@ -600,15 +721,28 @@ export default {
 
       const sandbox = (await env.TOKENS_KV.get(`sandbox:${secret}`)) === "true";
 
+      // Klipper holds print_duration at 0 through levelling/calibration, while
+      // the file pointer has already read the start gcode. Report 0 for that
+      // phase so the Live Activity agrees with the app and the printer display.
+      // Klipper KEEPS display_status.progress after a print ends, so a fresh
+      // job reports the previous one's last M73 value until its own first M73
+      // (which only arrives after calibration). A file position still at the
+      // very start proves nothing has been printed yet.
+      const inPreamble = duration <= 0 || (progressFile !== undefined && progressFile <= 0);
       const contentState = {
         printState:   state,
-        progress,
+        progress:     inPreamble ? 0 : progress,
+        progressFile: progressFile === undefined ? undefined : (inPreamble ? 0 : progressFile),
         extruderTemp: hotend,
         bedTemp:      bed,
         timeElapsed:  Math.floor(duration),
       };
 
       const isEnd = event === "complete" || event === "error" || event === "cancelled";
+      // A pause deserves a notification (filament runout, M600, manual stop),
+      // but the print is still live: the Live Activity stays up, only the
+      // alert push is sent.
+      const isAlert = isEnd || event === "paused";
 
       // ── Send Live Activity push to all registered activity tokens ──────────
       const actKey = `activity:${secret}`;
@@ -641,20 +775,31 @@ export default {
         }
       }
 
-      // ── For completion/error: send alert push to device tokens ─────────────
+      // ── For completion/error/pause: send alert push to device tokens ───────
       // Dedup against the Moonraker-notifier path (/apprise) — whichever
       // arrives first sends the alert, the other is skipped.
       let alertSent = 0;
       let alertDuplicate = false;
-      if (isEnd) {
-        const dedupKey = `dedup:${secret}:${event}`;
+      // A runout and a manual pause both arrive as "paused". Keyed on the event
+      // alone, the runout's entry swallowed any hand-made pause for the next two
+      // minutes — so the cause is part of the key, and pauses expire sooner
+      // (pausing twice in a row is normal; a print finishes only once).
+      // pauseReason carries the nozzle ("runout:2"), so two nozzles running dry
+      // shortly after one another are announced separately.
+      const isRunout = event === "paused" && pauseReason.startsWith("runout");
+      if (isAlert) {
+        const kind = event === "paused" ? (pauseReason || "manual") : "";
+        const dedupKey = `dedup:${secret}:${event}${kind ? ":" + kind : ""}`;
         if (await env.TOKENS_KV.get(dedupKey)) {
           alertDuplicate = true;
         } else {
-          await env.TOKENS_KV.put(dedupKey, "1", { expirationTtl: 120 });
+          // 60 s is Cloudflare's MINIMUM expirationTtl — anything lower makes
+          // the PUT fail with 400 and takes the whole request down with it.
+          await env.TOKENS_KV.put(dedupKey, "1",
+                                  { expirationTtl: event === "paused" ? 60 : 120 });
         }
       }
-      if (isEnd && !alertDuplicate) {
+      if (isAlert && !alertDuplicate) {
         const devKey = `device:${secret}`;
         const devTokens: string[] = JSON.parse((await env.TOKENS_KV.get(devKey)) ?? "[]");
 
@@ -662,9 +807,16 @@ export default {
           const cleanName = filename.replace(/\.(gcode|gco|g)$/i, "").split("/").pop() ?? filename;
           const locale = (await env.TOKENS_KV.get(`locale:${secret}`)) ?? "en";
           const lang = locale.substring(0, 2).toLowerCase();
-          const title = pushTitle(event, lang);
+          // A pause with a known cause gets the precise wording; otherwise the
+          // neutral one. The nozzle only matters on multi-nozzle printers.
+          // The bridge sends an index only on multi-nozzle printers; naming
+          // "Nozzle 1" on a single-nozzle machine would be noise.
+          const nozzle = isRunout ? Number(pauseReason.split(":")[1] ?? 0) : 0;
+          const titleKey = isRunout ? (nozzle > 0 ? "runout_nozzle" : "runout") : event;
+          const title = pushTitle(titleKey, lang).replace("%d", String(nozzle));
+          const body2 = cleanName;
           const alertResults = await Promise.all(
-            devTokens.map((t) => sendAlertPush(env, t, title, cleanName, sandbox, printerId, event))
+            devTokens.map((t) => sendAlertPush(env, t, title, body2, sandbox, printerId, event))
           );
           alertSent = alertResults.filter((r) => r.ok).length;
         }
@@ -693,7 +845,11 @@ export default {
       // main consumer of the free 1000-writes/day KV quota) so the Worker scales
       // to a published app on the free tier.
 
-      console.log(`update event=${event} act=${actTokens.length}/sent=${activitySent} alert=${alertSent} dev=${devCount} stop=${stop}`);
+      // reason= shows whether the bridge could name the pause cause. Without it
+      // a missing "filament empty" is indistinguishable from a suppressed one.
+      console.log(`update event=${event}${event === "paused" ? ` reason=${pauseReason || "-"}` : ""}` +
+                  ` act=${actTokens.length}/sent=${activitySent} alert=${alertSent}` +
+                  `${alertDuplicate ? " (dup)" : ""} dev=${devCount} stop=${stop}`);
       return json({ ok: true, activitySent, alertSent, stop, prog_threshold: BRIDGE_PROG_THRESHOLD });
     }
 
@@ -987,6 +1143,8 @@ fi
 if [ -n "$NOTIF" ]; then
   cat > "$NOTIF" << NOTIFEOF
 # PaxxMaker: Push bei Druckende — von Moonraker selbst gesendet.
+# paxxmaker-version: ${BRIDGE_VERSION}
+#  Dateischnittstelle, um eine veraltete Installation zu erkennen.
 [notifier paxxmaker_complete]
 url: jsons://${wHost}/apprise/${secret}/complete
 events: complete
@@ -1008,6 +1166,10 @@ NOTIFEOF
      && ! grep -q "paxxmaker-moonraker" "$BASE/config/moonraker.conf"; then
     printf '\\n[include paxxmaker-moonraker.conf]\\n' >> "$BASE/config/moonraker.conf"
   fi
+  # Sofort auf die Karte schreiben: ext4 haelt Aenderungen bis zu 30 s im
+  # Cache, und ein Stromabriss in diesem Fenster laesst moonraker.conf mit
+  # Nullbytes zurueck — dann startet Moonraker gar nicht mehr.
+  sync
   MRC=""
   command -v curl >/dev/null 2>&1 && MRC=curl
   [ -z "$MRC" ] && [ -x /usr/local/bin/curl ] && MRC=/usr/local/bin/curl

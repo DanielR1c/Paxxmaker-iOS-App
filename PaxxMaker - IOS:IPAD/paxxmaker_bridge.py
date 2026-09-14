@@ -28,6 +28,7 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ── Konfiguration (wird vom Installer ersetzt bzw. per Env ueberschrieben) ──
@@ -96,7 +97,7 @@ def post_update(payload):
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         WORKER_URL.rstrip("/") + "/update", data=body, method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": "paxxmaker-bridge/2.0"})
+        headers={"Content-Type": "application/json", "User-Agent": "paxxmaker-bridge/2.1"})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S, context=_SSL_CTX) as r:
             raw = r.read()
@@ -146,6 +147,65 @@ def check_worker():
         log.error("Worker-Verbindungstest FEHLGESCHLAGEN — siehe Meldung oben.")
 
 # ── Moonraker-Status ────────────────────────────────────────────────────────
+
+# gcode_start_byte / gcode_end_byte per file — fetched once per print.
+_GCODE_RANGE_CACHE = {}
+
+def gcode_range(filename):
+    if not filename:
+        return None
+    if filename in _GCODE_RANGE_CACHE:
+        return _GCODE_RANGE_CACHE[filename]
+    r = http_get_json(MOONRAKER_URL.rstrip("/") + "/server/files/metadata?filename=" +
+                      urllib.parse.quote(filename))
+    rng = None
+    if r:
+        res = r.get("result", {}) or {}
+        a, b = res.get("gcode_start_byte"), res.get("gcode_end_byte")
+        if a is not None and b is not None:
+            rng = (float(a), float(b))
+    _GCODE_RANGE_CACHE[filename] = rng
+    if len(_GCODE_RANGE_CACHE) > 20:
+        _GCODE_RANGE_CACHE.clear()
+    return rng
+def task_config():
+    """print_task_config as its own small query — folding it into the main
+    status query risks the U1 truncating the response. Retried: the U1
+    answers with an empty body every so often."""
+    for attempt in range(3):
+        if attempt:
+            time.sleep(0.4)
+        r = http_get_json(MOONRAKER_URL.rstrip("/") + "/printer/objects/query?print_task_config")
+        if r:
+            return ((r.get("result", {}) or {}).get("status", {}) or {}).get("print_task_config", {}) or {}
+    return None
+
+_EVER_OCCUPIED = [False, False, False, False]
+
+def note_occupancy(c):
+    """Remember channels that hold filament, for the whole print."""
+    for i, present in enumerate(c.get("filament_exist") or []):
+        if present and i < len(_EVER_OCCUPIED):
+            _EVER_OCCUPIED[i] = True
+
+def pause_reason(multi_nozzle=False):
+    """Why did Klipper pause? Returns e.g. "runout:2", or None when the cause is
+    something else (M600, manual pause). A runout wipes EVERYTHING about that
+    channel (type, vendor, spool id all go to NONE/0 — measured), so a single
+    sample cannot tell it from a channel that was never loaded. What works is
+    history: a channel seen holding filament earlier in this print and empty
+    now. Accumulating also survives the sensor blip while loading, which made a
+    snapshot taken at print start useless. extruders_used is not dependable
+    either — it read [False]*4 throughout one measured print."""
+    c = task_config()
+    if not c:
+        return None
+    exist = c.get("filament_exist") or []
+    for i, present in enumerate(exist):
+        if not present and i < len(_EVER_OCCUPIED) and _EVER_OCCUPIED[i]:
+            return ("runout:%d" % (i + 1)) if multi_nozzle else "runout"
+    return None
+
 def get_status():
     r = http_get_json(MOONRAKER_URL.rstrip("/") +
                       "/printer/objects/query?print_stats&display_status&virtual_sdcard&toolhead&extruder&extruder1&extruder2&extruder3&heater_bed")
@@ -156,10 +216,22 @@ def get_status():
     ds = s.get("display_status", {}) or {}
     vs = s.get("virtual_sdcard", {}) or {}
     hb = s.get("heater_bed", {}) or {}
-    # Match the app: prefer display_status.progress (honors M73 slicer
-    # commands, what Mainsail/Klipper show), fall back to virtual_sdcard.
+    # Two definitions, both correct; the app lets the user pick, so send BOTH.
+    # display_status.progress honours the slicer's M73 commands (what
+    # Mainsail/Klipper show); virtual_sdcard.progress is the position in the
+    # file (what the printer's own display shows).
     dispProg = ds.get("progress")
     progress = float(dispProg) if dispProg is not None else float(vs.get("progress") or 0.0)
+    # The printer's own display measures progress across the PRINT gcode only,
+    # between gcode_start_byte and gcode_end_byte — start gcode (heating,
+    # levelling) and end gcode sit outside that range. Fall back to the plain
+    # file position when the metadata is unavailable.
+    progress_file = float(vs.get("progress") or 0.0)
+    fname = ps.get("filename") or ""
+    rng = gcode_range(fname)
+    pos = vs.get("file_position")
+    if rng and pos is not None and rng[1] > rng[0]:
+        progress_file = max(0.0, min(1.0, (float(pos) - rng[0]) / (rng[1] - rng[0])))
     # Report the ACTIVE nozzle's temperature (toolhead.extruder) instead of
     # always extruder0 — matches the nozzle the app/widget highlight as in use.
     # If the active nozzle can't be determined, use the hottest one (same
@@ -174,9 +246,11 @@ def get_status():
                  if (s.get(k) or {}).get("temperature") is not None]
         active_temp = max(temps) if temps else 0.0
     return {
+        "multi_nozzle":   s.get("extruder1") is not None,
         "state":          ps.get("state", "standby"),
         "filename":       ps.get("filename", "") or "",
         "progress":       round(progress, 4),
+        "progress_file":  round(progress_file, 4),
         "print_duration": ps.get("print_duration", 0) or 0,
         "hotend_temp":    round(float(active_temp), 1),
         "bed_temp":       round(float(hb.get("temperature") or 0.0), 1),
@@ -302,6 +376,9 @@ def main():
                 if state == "printing":
                     event = "resumed" if last_state == "paused" else "started"
                     last_progress = prog
+                    if event == "started":
+                        for k in range(4):
+                            _EVER_OCCUPIED[k] = False
                 elif state == "paused" and last_state == "printing":
                     event = "paused"
                 elif state in END_EVENTS:
@@ -313,10 +390,25 @@ def main():
                 log.info("Statuswechsel: %s -> %s", last_state, state)
                 if event:
                     last_sent_at = now
-                    send(event, s, important=event in END_EVENTS or event == "started")
+                    if event == "paused":
+                        reason = pause_reason(s.get("multi_nozzle", False))
+                        if reason:
+                            s = dict(s, pause_reason=reason)
+                    send(event, s, important=event in END_EVENTS or event in ("started", "paused"))
                 last_state = state
+                # Record occupancy on the very first printing poll too. Starting
+                # the bridge mid-print resets the history one line above, and
+                # without this it stayed empty until the next tick — a runout in
+                # that window could not be recognised.
+                if state == "printing":
+                    c0 = task_config()
+                    if c0:
+                        note_occupancy(c0)
 
             elif state == "printing":
+                c = task_config()
+                if c:
+                    note_occupancy(c)
                 changed = abs(prog - last_progress) >= PROG_THRESHOLD
                 stale   = (now - last_sent_at) >= MAX_SILENT_S
                 if (changed or stale) and fail_streak < 8:

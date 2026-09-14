@@ -177,6 +177,18 @@ struct PaxxMakerWidgetAttributes: ActivityAttributes {
         var extruderTemp: Double
         var bedTemp: Double
         var timeElapsed: Int
+        /// Position in the file, sent alongside the slicer estimate by the
+        /// printer bridge. Optional: pushes from an older bridge still decode.
+        var progressFile: Double? = nil
+
+        /// What to display. Follows the user's choice in Settings → Extra
+        /// Features; falls back to the slicer value when an older bridge
+        /// doesn't send the file position.
+        var shownProgress: Double {
+            let useFile = UserDefaults(suiteName: "group.paxxmaker.u1")?
+                .bool(forKey: "progress_use_file") ?? false
+            return useFile ? (progressFile ?? progress) : progress
+        }
     }
     var printerName: String
     var filename: String

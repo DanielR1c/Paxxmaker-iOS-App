@@ -19,21 +19,30 @@ final class CloudflarePushService {
 
     func storeDeviceToken(_ token: String) {
         UserDefaults.standard.set(token, forKey: tokenKey)
-        // Re-register for all printers that have push enabled
-        if let data = UserDefaults.standard.data(forKey: "printers_config"),
-           let configs = try? JSONDecoder().decode([PrinterConfigLite].self, from: data) {
-            for cfg in configs {
-                guard cfg.pushMode == "cloudflare",
-                      let secret = cfg.cloudflareNotifySecret, !secret.isEmpty else { continue }
-                let s = secret; let n = cfg.name
-                Task {
-                    try? await self.registerDeviceToken(
-                        workerURL: Self.workerURL,
-                        printerID: n,
-                        deviceToken: token,
-                        secret: s
-                    )
-                }
+        refreshRegistrations()
+    }
+
+    /// Re-register every push-enabled printer with the Worker. The registration
+    /// carries the app's language, and the Worker stores it per device — so the
+    /// language must be pushed again whenever the user changes it, otherwise the
+    /// server keeps sending notifications in the old one. Cheap to call: the
+    /// dedup signature includes the language, so nothing goes out unless it
+    /// actually changed.
+    func refreshRegistrations() {
+        guard let token = storedDeviceToken else { return }
+        guard let data = UserDefaults.standard.data(forKey: "printers_config"),
+              let configs = try? JSONDecoder().decode([PrinterConfigLite].self, from: data) else { return }
+        for cfg in configs {
+            guard cfg.pushMode == "cloudflare",
+                  let secret = cfg.cloudflareNotifySecret, !secret.isEmpty else { continue }
+            let s = secret; let n = cfg.name
+            Task {
+                try? await self.registerDeviceToken(
+                    workerURL: Self.workerURL,
+                    printerID: n,
+                    deviceToken: token,
+                    secret: s
+                )
             }
         }
     }

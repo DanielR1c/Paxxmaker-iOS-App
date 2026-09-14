@@ -201,6 +201,9 @@ struct SpoolmanService {
     }
 
     // ── Spools ───────────────────────────────────────────────────────────────
+    func spool(_ id: Int) async throws -> SpoolmanSpool {
+        try await run(request("spool/\(id)"), as: SpoolmanSpool.self)
+    }
     func spools(includeArchived: Bool = false) async throws -> [SpoolmanSpool] {
         try await run(request("spool?allow_archived=\(includeArchived ? "true" : "false")"), as: [SpoolmanSpool].self)
     }

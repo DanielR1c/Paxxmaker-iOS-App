@@ -131,6 +131,14 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
 
     @Published var printers: [WatchPrinterData] = []
     @Published var isLoading = true
+    /// Bumped when the language arrives from the phone. lz() reads UserDefaults,
+    /// which SwiftUI does not observe — without this the screen keeps the old
+    /// language until the app is relaunched.
+    @Published var langTick = 0
+    /// gcode_start_byte / gcode_end_byte per filename. The printer measures
+    /// progress across that range only, so we need it to match. One fetch per
+    /// print, then cached.
+    private var gcodeRanges: [String: (Double, Double)] = [:]
     fileprivate private(set) var configs: [WatchPrinterDirectConfig] = []
 
     private var directPollTimer: Timer?
@@ -186,6 +194,12 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
             // read the shared app group.
             UserDefaults(suiteName: "group.paxxmaker.u1")?.set(lang, forKey: "app_language")
             WidgetCenter.shared.reloadAllTimelines()
+            DispatchQueue.main.async { self.langTick += 1 }
+        }
+        // The progress source is chosen on the phone; the Watch has its own
+        // container and would otherwise fall back to a different definition.
+        if let useFile = dict["progressUseFile"] as? Bool {
+            UserDefaults.standard.set(useFile, forKey: "progress_use_file")
         }
         // Store connection configs shipped by the iPhone in OUR app group —
         // iPhone and Watch app groups are separate containers, so this is the
@@ -362,8 +376,27 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
+    /// Byte range of the actual print gcode, fetched once per file.
+    private func gcodeRange(for filename: String, config: WatchPrinterDirectConfig) async -> (Double, Double)? {
+        if let hit = gcodeRanges[filename] { return hit }
+        guard let enc = filename.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(config.baseURL)/server/files/metadata?filename=\(enc)") else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 4)
+        if !config.apiKey.isEmpty { req.setValue(config.apiKey, forHTTPHeaderField: "X-Api-Key") }
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let r = json["result"] as? [String: Any],
+              let a = r["gcode_start_byte"] as? Double,
+              let b = r["gcode_end_byte"] as? Double else { return nil }
+        gcodeRanges[filename] = (a, b)
+        return (a, b)
+    }
+
     private func fetchPrinterStatus(_ config: WatchPrinterDirectConfig) async -> WatchPrinterData? {
-        let query = "print_stats&display_status&extruder&heater_bed"
+        // toolhead.extruder names the ACTIVE extruder ("extruder2" on a U1
+        // printing from head 3); all four are queried so the Watch shows that
+        // one's temperature, like the phone app does, instead of always head 1.
+        let query = "print_stats&display_status&virtual_sdcard&toolhead&extruder&extruder1&extruder2&extruder3&heater_bed"
         guard let url = URL(string: "\(config.baseURL)/printer/objects/query?\(query)") else {
             return nil
         }
@@ -376,16 +409,36 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
             else { return nil }
             let ps  = status["print_stats"]    as? [String: Any] ?? [:]
             let ds  = status["display_status"] as? [String: Any] ?? [:]
-            let ext = status["extruder"]       as? [String: Any] ?? [:]
+            let vsd = status["virtual_sdcard"] as? [String: Any] ?? [:]
+            let activeName = (status["toolhead"] as? [String: Any])?["extruder"] as? String ?? "extruder"
+            let ext = (status[activeName] as? [String: Any]) ?? (status["extruder"] as? [String: Any] ?? [:])
             let bed = status["heater_bed"]     as? [String: Any] ?? [:]
+            // Same rules as the phone app, so the Watch does not disagree with it
+            // when it has to poll the printer on its own: honour the user's
+            // choice of progress source, and report 0 for the whole preamble
+            // (Klipper holds print_duration at 0 until the first extrusion).
+            let elapsed = ps["print_duration"] as? Double ?? 0
+            let useFile = UserDefaults.standard.bool(forKey: "progress_use_file")
+            let vsdProg = vsd["progress"] as? Double ?? 0
+            let dispProg = ds["progress"] as? Double
+            // "Printer" mode measures across the print gcode only — start gcode
+            // (heating, levelling) and end gcode sit outside that range.
+            var fileProg = vsdProg
+            let fn = ps["filename"] as? String ?? ""
+            if useFile, !fn.isEmpty, let pos = vsd["file_position"] as? Double,
+               let range = await gcodeRange(for: fn, config: config), range.1 > range.0 {
+                fileProg = min(1, max(0, (pos - range.0) / (range.1 - range.0)))
+            }
+            var prog = useFile ? fileProg : (dispProg ?? vsdProg)
+            if elapsed <= 0 { prog = 0 }
             return WatchPrinterData(
                 id: config.id, name: config.name,
                 printState:   ps["state"]           as? String ?? "standby",
                 filename:     ps["filename"]         as? String ?? "",
-                progress:     ds["progress"]         as? Double ?? 0,
+                progress:     prog,
                 extruderTemp: ext["temperature"]     as? Double ?? 0,
                 bedTemp:      bed["temperature"]     as? Double ?? 0,
-                timeElapsed:  Int(ps["print_duration"] as? Double ?? 0),
+                timeElapsed:  Int(elapsed),
                 themeHex:     config.themeHex
             )
         } catch {

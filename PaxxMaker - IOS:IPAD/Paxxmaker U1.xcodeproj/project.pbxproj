@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		652CEF5B2FD5D704009E0447 /* TuyaLocalService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 652CEF5A2FD5D703009E0447 /* TuyaLocalService.swift */; };
 		652CEF5C2FD5D704009E0447 /* TuyaLocalService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 652CEF5A2FD5D703009E0447 /* TuyaLocalService.swift */; };
+		6544A9CE2FFFCA43001D11B6 /* CSSH in Frameworks */ = {isa = PBXBuildFile; productRef = 6544A9CD2FFFCA43001D11B6 /* CSSH */; };
 		6557BF7D2FB4657B0092A28E /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6557BF7C2FB4657A0092A28E /* WidgetKit.framework */; };
 		6557BF7F2FB4657B0092A28E /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6557BF7E2FB4657B0092A28E /* SwiftUI.framework */; };
 		655F06172FBA19A700D61B0C /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 655F06162FBA19A700D61B0C /* StoreKit.framework */; };
@@ -159,6 +160,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				655F06172FBA19A700D61B0C /* StoreKit.framework in Frameworks */,
+				6544A9CE2FFFCA43001D11B6 /* CSSH in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -261,6 +263,7 @@
 			);
 			name = "Paxxmaker U1";
 			packageProductDependencies = (
+				6544A9CD2FFFCA43001D11B6 /* CSSH */,
 			);
 			productName = "Snapmaker U1";
 			productReference = 6527FE272FA535F9007B1D14 /* Paxxmaker U1.app */;
@@ -342,7 +345,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2640;
-				LastUpgradeCheck = 2640;
+				LastUpgradeCheck = 2660;
 				TargetAttributes = {
 					6527FE262FA535F9007B1D14 = {
 						CreatedOnToolsVersion = 26.4.1;
@@ -359,17 +362,24 @@
 				};
 			};
 			buildConfigurationList = 6527FE222FA535F9007B1D14 /* Build configuration list for PBXProject "Paxxmaker U1" */;
-			developmentRegion = en;
+			developmentRegion = de;
 			hasScannedForEncodings = 0;
 			knownRegions = (
-				en,
-				Base,
 				de,
+				en,
 				es,
 				fr,
+				"zh-Hans",
+				it,
+				"pt-BR",
+				"pt-PT",
+				Base,
 			);
 			mainGroup = 6527FE1E2FA535F9007B1D14;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				6544A9CC2FFFCA43001D11B6 /* XCRemoteSwiftPackageReference "Libssh2Prebuild" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 6527FE282FA535F9007B1D14 /* Products */;
 			projectDirPath = "";
@@ -473,6 +483,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -503,6 +514,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -526,6 +538,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -536,6 +549,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -566,6 +580,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -582,6 +597,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
 			};
@@ -596,13 +612,15 @@
 				CODE_SIGN_ENTITLEMENTS = "Paxxmaker U1/Paxxmaker U1.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Snapmaker-U1-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = PaxxMaker;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NFCReaderUsageDescription = "PaxxMaker liest und beschreibt NFC-Tags auf Filamentspulen.";
+				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
+				INFOPLIST_KEY_NSSupportsLiveActivitiesFrequentUpdates = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -614,7 +632,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -639,13 +657,15 @@
 				CODE_SIGN_ENTITLEMENTS = "Paxxmaker U1/Paxxmaker U1.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Snapmaker-U1-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = PaxxMaker;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NFCReaderUsageDescription = "PaxxMaker liest und beschreibt NFC-Tags auf Filamentspulen.";
+				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
+				INFOPLIST_KEY_NSSupportsLiveActivitiesFrequentUpdates = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -657,7 +677,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -681,7 +701,6 @@
 				CODE_SIGN_ENTITLEMENTS = PaxxMakerWidgetExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = PaxxMakerWidget/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWidget;
@@ -692,7 +711,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.PaxxMakerWidget";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -716,7 +735,6 @@
 				CODE_SIGN_ENTITLEMENTS = PaxxMakerWidgetExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = PaxxMakerWidget/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWidget;
@@ -727,7 +745,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.PaxxMakerWidget";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -751,7 +769,6 @@
 				CODE_SIGN_ENTITLEMENTS = "PaxxMakerWatch Watch App/PaxxMakerWatch Watch App.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "PaxxMakerWatch Watch App/Info.plist";
@@ -762,7 +779,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.watchkitapp";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = watchos;
@@ -786,7 +803,6 @@
 				CODE_SIGN_ENTITLEMENTS = "PaxxMakerWatch Watch App/PaxxMakerWatch Watch App.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "PaxxMakerWatch Watch App/Info.plist";
@@ -797,7 +813,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.watchkitapp";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = watchos;
@@ -821,7 +837,6 @@
 				CODE_SIGN_ENTITLEMENTS = PaxxMakerWatchWidgetExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = PaxxMakerWatchWidget/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWatchWidget;
@@ -832,7 +847,7 @@
 					"@executable_path/../../Frameworks",
 					"@executable_path/../../../../Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.watchkitapp.PaxxMakerWatchWidget";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = watchos;
@@ -855,7 +870,6 @@
 				CODE_SIGN_ENTITLEMENTS = PaxxMakerWatchWidgetExtension.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 92F7TDYGQR;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = PaxxMakerWatchWidget/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = PaxxMakerWatchWidget;
@@ -866,7 +880,7 @@
 					"@executable_path/../../Frameworks",
 					"@executable_path/../../../../Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "HandyApp.Paxxmaker-U1.watchkitapp.PaxxMakerWatchWidget";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = watchos;
@@ -930,6 +944,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		6544A9CC2FFFCA43001D11B6 /* XCRemoteSwiftPackageReference "Libssh2Prebuild" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/migueldeicaza/Libssh2Prebuild.git";
+			requirement = {
+				branch = master;
+				kind = branch;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		6544A9CD2FFFCA43001D11B6 /* CSSH */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 6544A9CC2FFFCA43001D11B6 /* XCRemoteSwiftPackageReference "Libssh2Prebuild" */;
+			productName = CSSH;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 6527FE1F2FA535F9007B1D14 /* Project object */;
 }

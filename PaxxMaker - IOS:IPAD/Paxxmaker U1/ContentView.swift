@@ -208,7 +208,9 @@ enum SSHInstaller {
     }
 
     // libssh2 calls are blocking, so run them off the cooperative pool.
-    private static func exec(host: String, user: String, password: String, command: String) async throws -> String {
+    // Not private: AutoShutdownInstaller runs its short commands through the
+    // same, already-proven path instead of carrying a second SSH implementation.
+    static func exec(host: String, user: String, password: String, command: String) async throws -> String {
         #if canImport(CSSH)
         return try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -318,10 +320,62 @@ struct PrinterConfig: Identifiable, Codable {
     var smartPlugIP: String = ""
     var smartPlugDeviceID: String = ""
     var smartPlugLocalKey: String = ""
+    // Auto-shutdown: a small script on the printer switches the plug off after a
+    // print. Everything runs locally; the app only installs and configures it.
+    var autoShutdownEnabled: Bool = false
+    var autoShutdownDelayMin: Int = 5
+    var autoShutdownOnComplete: Bool = true
+    var autoShutdownOnCancelled: Bool = false
+    /// Energy tracking shares the auto-shutdown daemon on the printer.
+    var energyTrackingEnabled: Bool = false
+    var energyPricePerKWh: Double = 0.30
+    var energyCurrency: String = "EUR"
+    /// Prints kept in the printer-side log; 0 = unlimited.
+    var energyKeepCount: Int = 100
 
     enum SmartPlugType: String, Codable {
         case tuya = "tuya"
         case shelly = "shelly"
+    }
+
+    // Decode every field tolerantly. Swift's synthesised decoder demands that
+    // EVERY non-optional key exists, so adding one property made all stored
+    // printers undecodable — and the `try?` at the call site turned that into
+    // silent data loss (printers, colours, plug settings, push state all gone).
+    // With decodeIfPresent an older file simply keeps its defaults, and any
+    // field added later can never break existing installs again.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Only these two make an entry meaningful; a record without them is
+        // skipped rather than resurrected as an empty printer.
+        name = try c.decode(String.self, forKey: .name)
+        ip   = try c.decode(String.self, forKey: .ip)
+        id   = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        type = try c.decodeIfPresent(PrinterType.self, forKey: .type) ?? .snapmakerU1
+        isVisible = try c.decodeIfPresent(Bool.self, forKey: .isVisible) ?? true
+        connectionMode = try c.decodeIfPresent(ConnectionMode.self, forKey: .connectionMode) ?? .local
+        octoEverywhereURL = try c.decodeIfPresent(String.self, forKey: .octoEverywhereURL) ?? ""
+        octoEverywhereAPIKey = try c.decodeIfPresent(String.self, forKey: .octoEverywhereAPIKey) ?? ""
+        themeColor = try c.decodeIfPresent(String.self, forKey: .themeColor) ?? "blue"
+        pushMode = try c.decodeIfPresent(PushMode.self, forKey: .pushMode) ?? .off
+        cloudflareWorkerURL = try c.decodeIfPresent(String.self, forKey: .cloudflareWorkerURL) ?? ""
+        cloudflareNotifySecret = try c.decodeIfPresent(String.self, forKey: .cloudflareNotifySecret) ?? ""
+        smartPlugType = try c.decodeIfPresent(SmartPlugType.self, forKey: .smartPlugType) ?? .tuya
+        smartPlugIP = try c.decodeIfPresent(String.self, forKey: .smartPlugIP) ?? ""
+        smartPlugDeviceID = try c.decodeIfPresent(String.self, forKey: .smartPlugDeviceID) ?? ""
+        smartPlugLocalKey = try c.decodeIfPresent(String.self, forKey: .smartPlugLocalKey) ?? ""
+        autoShutdownEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoShutdownEnabled) ?? false
+        autoShutdownDelayMin = try c.decodeIfPresent(Int.self, forKey: .autoShutdownDelayMin) ?? 5
+        autoShutdownOnComplete = try c.decodeIfPresent(Bool.self, forKey: .autoShutdownOnComplete) ?? true
+        autoShutdownOnCancelled = try c.decodeIfPresent(Bool.self, forKey: .autoShutdownOnCancelled) ?? false
+        energyTrackingEnabled = try c.decodeIfPresent(Bool.self, forKey: .energyTrackingEnabled) ?? false
+        energyPricePerKWh = try c.decodeIfPresent(Double.self, forKey: .energyPricePerKWh) ?? 0.30
+        energyCurrency = try c.decodeIfPresent(String.self, forKey: .energyCurrency) ?? "EUR"
+        energyKeepCount = try c.decodeIfPresent(Int.self, forKey: .energyKeepCount) ?? 100
+    }
+
+    init(id: UUID = UUID(), name: String, ip: String, type: PrinterType) {
+        self.id = id; self.name = name; self.ip = ip; self.type = type
     }
 
     enum PushMode: String, Codable {
@@ -394,6 +448,27 @@ struct CustomCommand: Identifiable, Codable {
     var sfSymbol: String = "terminal.fill"
     var groupID: String = "default"
 
+    // Tolerant decoding, same reason as PrinterConfig: a field added later must
+    // never make the user's saved commands undecodable.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name  = try c.decode(String.self, forKey: .name)
+        gcode = try c.decode(String.self, forKey: .gcode)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        printerTarget = try c.decodeIfPresent(PrinterTarget.self, forKey: .printerTarget) ?? .both
+        colorHex = try c.decodeIfPresent(String.self, forKey: .colorHex) ?? "8B5CF6"
+        sfSymbol = try c.decodeIfPresent(String.self, forKey: .sfSymbol) ?? "terminal.fill"
+        groupID  = try c.decodeIfPresent(String.self, forKey: .groupID) ?? "default"
+    }
+
+    init(id: UUID = UUID(), name: String, gcode: String,
+         printerTarget: PrinterTarget = .both, colorHex: String = "8B5CF6",
+         sfSymbol: String = "terminal.fill", groupID: String = "default") {
+        self.id = id; self.name = name; self.gcode = gcode
+        self.printerTarget = printerTarget; self.colorHex = colorHex
+        self.sfSymbol = sfSymbol; self.groupID = groupID
+    }
+
     var color: Color {
         guard colorHex.count == 6, let val = UInt64(colorHex, radix: 16) else { return .purple }
         return Color(red: Double((val >> 16) & 0xFF) / 255,
@@ -441,6 +516,17 @@ class LanguageStore: ObservableObject {
         UserDefaults.standard.set(code, forKey: "app_language")
         UserDefaults(suiteName: "group.paxxmaker.u1")?.set(code, forKey: "app_language")
         if reloadWidgets { WidgetCenter.shared.reloadAllTimelines() }
+        // The Watch has its OWN app group container — writing the key above
+        // never reaches it. Ship the change over the link instead of waiting
+        // for the Watch to ask (which needs the phone to be reachable).
+        // transferUserInfo queues and is delivered even if the Watch app is
+        // closed; updateApplicationContext would overwrite the pending payload.
+        if WCSession.isSupported(), WCSession.default.activationState == .activated {
+            WCSession.default.transferUserInfo(["lang": code])
+        }
+        // The Worker stores the language per device and phrases the push
+        // notifications with it, so it has to be told about the change too.
+        CloudflarePushService.shared.refreshRegistrations()
     }
 }
 
@@ -542,6 +628,12 @@ class SettingsStore: ObservableObject {
     func savePrinters() {
         if let data = try? JSONEncoder().encode(printers) {
             UserDefaults.standard.set(data, forKey: "printers_config")
+            // Rolling backup for the recovery path in loadPrinters(). Only when
+            // something is actually configured — an empty list is worth keeping
+            // as the live state, but never as the copy we would fall back to.
+            if !printers.isEmpty {
+                UserDefaults.standard.set(data, forKey: "printers_config_backup")
+            }
         }
         // Keep widget list in sync: remove entries for deleted printers
         let activeNames = Set(printers.map { $0.name })
@@ -558,8 +650,23 @@ class SettingsStore: ObservableObject {
     }
 
     func loadPrinters() {
-        if let data = UserDefaults.standard.data(forKey: "printers_config"),
-           let decoded = try? JSONDecoder().decode([PrinterConfig].self, from: data) {
+        guard let data = UserDefaults.standard.data(forKey: "printers_config") else { return }
+        if let decoded = try? JSONDecoder().decode([PrinterConfig].self, from: data) {
+            printers = decoded
+            return
+        }
+        // Second net: salvage entry by entry, so one damaged record can't take
+        // the whole list with it the way a failing array decode used to.
+        if let raw = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+            let rescued: [PrinterConfig] = raw.compactMap { item in
+                guard let d = try? JSONSerialization.data(withJSONObject: item) else { return nil }
+                return try? JSONDecoder().decode(PrinterConfig.self, from: d)
+            }
+            if !rescued.isEmpty { printers = rescued; return }
+        }
+        // Third net: the last list that decoded cleanly.
+        if let backup = UserDefaults.standard.data(forKey: "printers_config_backup"),
+           let decoded = try? JSONDecoder().decode([PrinterConfig].self, from: backup) {
             printers = decoded
         }
     }
@@ -806,6 +913,18 @@ struct PaxxMakerWidgetAttributes: ActivityAttributes {
         var extruderTemp: Double
         var bedTemp: Double
         var timeElapsed: Int
+        /// Position in the file, sent alongside the slicer estimate by the
+        /// printer bridge. Optional: pushes from an older bridge still decode.
+        var progressFile: Double? = nil
+
+        /// What to display. Follows the user's choice in Settings → Extra
+        /// Features; falls back to the slicer value when an older bridge
+        /// doesn't send the file position.
+        var shownProgress: Double {
+            let useFile = UserDefaults(suiteName: "group.paxxmaker.u1")?
+                .bool(forKey: "progress_use_file") ?? false
+            return useFile ? (progressFile ?? progress) : progress
+        }
     }
     var printerName: String
     var filename: String
@@ -1177,6 +1296,14 @@ class PrinterService: ObservableObject {
     @Published var spoolmanConnected: Bool = false {
         didSet { UserDefaults.standard.set(spoolmanConnected, forKey: "spoolman_connected_\(name)") }
     }
+    /// Moonraker HAS a [spoolman] component — independent of whether its link
+    /// to the Spoolman server is up right now. The "Active Spool" tile is
+    /// gated on this: `spoolmanConnected` flaps with a weak Wi-Fi link to the
+    /// Spoolman host, and a tile that comes and goes shifts every tile after
+    /// it — the dashboard then no longer matches the edit-mode layout.
+    @Published var spoolmanAvailable: Bool = false {
+        didSet { UserDefaults.standard.set(spoolmanAvailable, forKey: "spoolman_available_\(name)") }
+    }
     @Published var activeSpoolId: Int? = nil
     // 4-color Spoolman auto-tracking hook (U1 / multi-nozzle only). The hook is
     // a Klipper delayed_gcode watcher (extended/klipper/spoolman_multicolor.cfg)
@@ -1225,6 +1352,7 @@ class PrinterService: ObservableObject {
     var smartPlugIP: String = ""
     var smartPlugDeviceID: String = ""
     var smartPlugLocalKey: String = ""
+    var energyTrackingEnabled: Bool = false
 
     // Manual camera rotation: preferably stored ON THE PRINTER via Moonraker's
     // webcam API (then Fluidd/Mainsail show it the same way). Webcams sourced
@@ -1293,7 +1421,7 @@ class PrinterService: ObservableObject {
             var greq = URLRequest(url: listURL, timeoutInterval: 8)
             if !apiKey.isEmpty { greq.setValue(apiKey, forHTTPHeaderField: "X-Api-Key") }
             URLSession.shared.dataTask(with: greq) { [weak self] data, _, _ in
-                guard let self else { return }
+                guard self != nil else { return }
                 guard let data,
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let result = json["result"] as? [String: Any],
@@ -1314,7 +1442,7 @@ class PrinterService: ObservableObject {
         if !apiKey.isEmpty { req.setValue(apiKey, forHTTPHeaderField: "X-Api-Key") }
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["name": camName, "rotation": newRot])
         URLSession.shared.dataTask(with: req) { [weak self] _, resp, err in
-            guard let self else { return }
+            guard self != nil else { return }
             let code = (resp as? HTTPURLResponse)?.statusCode
             if err == nil, code == 200 {
                 adoptServer(newRot)                       // stored on the printer
@@ -1339,6 +1467,22 @@ class PrinterService: ObservableObject {
     private var previousPrintState: String = "unknown"
     private var previousFilamentDetected: Bool? = nil
     private var currentPollInterval: TimeInterval = 3.0
+    // Byte range of the ACTUAL print gcode, from Moonraker's file metadata.
+    // The printer's own display measures progress across this range, not across
+    // the whole file — start gcode (heating, levelling) and end gcode sit
+    // outside it. Cached per filename; one fetch per print.
+    /// Channels seen holding filament at ANY point during the current print.
+    /// Needed because a runout wipes everything about that channel — type,
+    /// vendor, spool id all go to NONE/0 — so a single sample cannot tell a
+    /// channel that ran out from one that was never loaded. Accumulating over
+    /// the print also survives the sensor blip while loading, which is what
+    /// made a snapshot taken at print start useless.
+    private var everOccupied = [Bool](repeating: false, count: 4)
+
+    private var metaFilename = ""
+    private var gcodeStartByte: Double?
+    private var gcodeEndByte: Double?
+
     private var currentActivity: Activity<PaxxMakerWidgetAttributes>?
     private var activityTokenTask: Task<Void, Never>?
 
@@ -1352,6 +1496,7 @@ class PrinterService: ObservableObject {
         // Restore last known Spoolman availability so the tile survives offline
         // starts; a live 404 will clear it again.
         self.spoolmanConnected = UserDefaults.standard.bool(forKey: "spoolman_connected_\(name)")
+        self.spoolmanAvailable = UserDefaults.standard.object(forKey: "spoolman_available_\(name)") as? Bool ?? self.spoolmanConnected
         self.fwSpoolLink = UserDefaults.standard.bool(forKey: "fw_spoollink_\(name)")
         self.spoollinkAvailable = UserDefaults.standard.bool(forKey: "spoollink_avail_\(name)")
         // Same for the other conditionally-visible tiles, so the dashboard keeps
@@ -1507,7 +1652,10 @@ class PrinterService: ObservableObject {
             // Only trust it when the normal status poll says we're connected.
             if (resp as? HTTPURLResponse)?.statusCode == 404 {
                 DispatchQueue.main.async {
-                    if self.isOnline { self.updateIfChanged(\.spoolmanConnected, false) }
+                    if self.isOnline {
+                        self.updateIfChanged(\.spoolmanConnected, false)
+                        self.updateIfChanged(\.spoolmanAvailable, false)
+                    }
                 }
                 return
             }
@@ -1518,6 +1666,7 @@ class PrinterService: ObservableObject {
             let spoolId = result["spool_id"] as? Int
             DispatchQueue.main.async {
                 self.updateIfChanged(\.spoolmanConnected, connected)
+                self.updateIfChanged(\.spoolmanAvailable, true)
                 self.updateIfChanged(\.activeSpoolId, spoolId)
             }
         }.resume()
@@ -2084,7 +2233,10 @@ class PrinterService: ObservableObject {
         // Subscribe for instant push-driven updates (not just this 3 s poll).
         ensureLiveActivityObserver(activity)
         updateIfChanged(\.printState, s.printState)
-        updateIfChanged(\.progress, s.progress)
+        // shownProgress, not the raw slicer value: the poll path applies the
+        // user's file/slicer choice, and mixing the two made the number jump
+        // between e.g. 52 % and 94 % whenever the LAN poll briefly failed.
+        updateIfChanged(\.progress, s.shownProgress)
         updateIfChanged(\.bedTemp, s.bedTemp)
         updateIfChanged(\.printTimeElapsed, s.timeElapsed)
         if extruderTemps.indices.contains(0), extruderTemps[0] != s.extruderTemp {
@@ -2119,7 +2271,7 @@ class PrinterService: ObservableObject {
                     guard self.isViaLiveActivity || !self.isOnline else { return }
                     guard s.printState == "printing" || s.printState == "paused" else { return }
                     self.updateIfChanged(\.printState, s.printState)
-                    self.updateIfChanged(\.progress, s.progress)
+                    self.updateIfChanged(\.progress, s.shownProgress)
                     self.updateIfChanged(\.bedTemp, s.bedTemp)
                     self.updateIfChanged(\.printTimeElapsed, s.timeElapsed)
                     if self.extruderTemps.indices.contains(0), self.extruderTemps[0] != s.extruderTemp {
@@ -2132,6 +2284,29 @@ class PrinterService: ObservableObject {
             }
             await MainActor.run { self?.laObserverActivityID = nil }
         }
+    }
+
+    /// Ask Moonraker where the real print gcode starts and ends in the file.
+    /// Only the range between the two counts towards progress on the printer's
+    /// own display, so we need it to show the same number.
+    private func fetchGcodeRange(for filename: String) {
+        metaFilename = filename          // claim it now, so we ask only once
+        gcodeStartByte = nil; gcodeEndByte = nil
+        guard let enc = filename.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(baseURL)/server/files/metadata?filename=\(enc)") else { return }
+        var req = URLRequest(url: url, timeoutInterval: 8)
+        if !apiKey.isEmpty { req.setValue(apiKey, forHTTPHeaderField: "X-Api-Key") }
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self, let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let r = json["result"] as? [String: Any] else { return }
+            let a = r["gcode_start_byte"] as? Double
+            let b = r["gcode_end_byte"] as? Double
+            DispatchQueue.main.async {
+                guard self.metaFilename == filename else { return }
+                self.gcodeStartByte = a; self.gcodeEndByte = b
+            }
+        }.resume()
     }
 
     func fetchStatus() {
@@ -2168,12 +2343,42 @@ class PrinterService: ObservableObject {
                     self.updateIfChanged(\.printState, ps["state"] as? String ?? "unknown")
                     self.updateIfChanged(\.filename, ps["filename"] as? String ?? "")
                     self.updateIfChanged(\.printTimeElapsed, Int(ps["print_duration"] as? Double ?? 0))
+                    let fn = ps["filename"] as? String ?? ""
+                    if !fn.isEmpty, fn != self.metaFilename { self.fetchGcodeRange(for: fn) }
                 }
-                // display_status.progress matches what Mainsail/Klipper display shows (respects M73 gcode commands).
-                // Falls back to virtual_sdcard.progress when display_status isn't set.
+                // Two different things, both correct: display_status.progress is
+                // the slicer's own M73 estimate (what Mainsail/Fluidd show), while
+                // virtual_sdcard.progress is the position in the file (what the
+                // printer's own display shows). They drift apart mid-print, so the
+                // user picks which one in Settings → Extra Features.
                 let dispProg = (status["display_status"] as? [String: Any])?["progress"] as? Double
                 let vsdProg  = (status["virtual_sdcard"] as? [String: Any])?["progress"] as? Double ?? 0.0
-                self.updateIfChanged(\.progress, dispProg ?? vsdProg)
+                let useFile = UserDefaults.standard.bool(forKey: "progress_use_file")
+                // "Printer" mode: measure across the print gcode only, the way
+                // the printer's own display does. Without the metadata this
+                // falls back to the plain file position.
+                var fileProg = vsdProg
+                if let vsd = status["virtual_sdcard"] as? [String: Any],
+                   let pos = vsd["file_position"] as? Double,
+                   let a = self.gcodeStartByte, let b = self.gcodeEndByte, b > a {
+                    fileProg = min(1, max(0, (pos - a) / (b - a)))
+                }
+                var prog = useFile ? fileProg : (dispProg ?? vsdProg)
+                // Klipper KEEPS display_status.progress after a print ends, so a
+                // new job shows the previous one's last M73 value (e.g. 40 %)
+                // until its own first M73 — which only comes after calibration.
+                // The file position knows better: still inside the start gcode
+                // means nothing has been printed yet.
+                if self.gcodeStartByte != nil, self.gcodeEndByte != nil, fileProg <= 0 { prog = 0 }
+                // Levelling, flow and shaper calibration happen BEFORE the first
+                // extrusion, and Klipper keeps print_duration at exactly 0 for
+                // the whole preamble. The file pointer has meanwhile read the
+                // start gcode, so the file-position reading would already claim
+                // one or two percent while the printer (rightly) still shows 0.
+                // Use the printer's own "nothing printed yet" signal rather than
+                // guessing at a delay.
+                if (ps?["print_duration"] as? Double ?? 0) <= 0 { prog = 0 }
+                self.updateIfChanged(\.progress, prog)
                 let extruderKeys = ["extruder", "extruder1", "extruder2", "extruder3"]
                 for (i, key) in extruderKeys.enumerated() {
                     if let ex = status[key] as? [String: Any] {
@@ -2210,8 +2415,14 @@ class PrinterService: ObservableObject {
                     self.updateIfChanged(\.activeExtruderIndex, -1)
                 }
                 if let gm = status["gcode_move"] as? [String: Any] {
-                    self.updateIfChanged(\.speedFactor, gm["speed_factor"] as? Double ?? 1.0)
-                    self.updateIfChanged(\.extrudeFactor, gm["extrude_factor"] as? Double ?? 1.0)
+                    let sp = gm["speed_factor"] as? Double ?? 1.0
+                    if self.acceptPolled(sp, current: self.speedFactor, holdUntil: &self.speedFactorHoldUntil) {
+                        self.updateIfChanged(\.speedFactor, sp)
+                    }
+                    let ef = gm["extrude_factor"] as? Double ?? 1.0
+                    if self.acceptPolled(ef, current: self.extrudeFactor, holdUntil: &self.extrudeFactorHoldUntil) {
+                        self.updateIfChanged(\.extrudeFactor, ef)
+                    }
                 }
                 // LED state from Moonraker: color_data is [[R, G, B, W]] — W > 0 means on
                 if let led = status["led cavity_led"] as? [String: Any],
@@ -2285,6 +2496,15 @@ class PrinterService: ObservableObject {
                             )
                         }
                         hapticNotification(.error)
+                    }
+                } else if prevState == "printing" && self.printState == "paused" {
+                    // Was missing entirely: while the app is open the background
+                    // task never sees the change, so nothing announced a pause.
+                    let bgDefaults = UserDefaults(suiteName: "group.paxxmaker.u1")
+                    let bgHandled = (bgDefaults?.dictionary(forKey: "bg_prev_print_states") as? [String: String])?[self.name] == "paused"
+                    if !bgHandled {
+                        if self.pushMode != .cloudflare { self.notifyPause() }
+                        hapticNotification(.warning)
                     }
                 } else if (prevState == "printing" || prevState == "paused") && self.printState == "cancelled" {
                     let bgDefaults = UserDefaults(suiteName: "group.paxxmaker.u1")
@@ -2453,6 +2673,11 @@ class PrinterService: ObservableObject {
             extruderTemp: activeExtruderTemp, bedTemp: bedTemp, timeElapsed: printTimeElapsed
         )
         if prevState != "printing" && printState == "printing" {
+            if prevState != "paused" {
+                everOccupied = [Bool](repeating: false, count: 4)
+                UserDefaults(suiteName: "group.paxxmaker.u1")?
+                    .set(everOccupied, forKey: "ever_occupied_\(name)")
+            }
             let usePush = pushMode == .cloudflare && !cloudflareNotifySecret.isEmpty
             // Self-heal: a print just started — make sure the printer-side bridge
             // (live-progress) is actually running. On firmware without a boot
@@ -2522,6 +2747,58 @@ class PrinterService: ObservableObject {
                 )
             }
         }
+    }
+
+    /// Announce a pause, naming the cause when the printer reveals it: a nozzle
+    /// that reports no filament while still carrying a configured material.
+    /// Otherwise (M600, manual pause) the wording stays neutral.
+    func notifyPause() {
+        let multi = extruderCount > 1
+        Task { [weak self] in
+            guard let self else { return }
+            let nozzle = await self.runoutNozzle(multiNozzle: multi)
+            await MainActor.run {
+                let body = self.filename.isEmpty ? self.name : "\(self.filename) · \(self.name)"
+                guard let n = nozzle else {
+                    self.sendLocalNotification(
+                        title: lz(en: "Print paused", de: "Druck pausiert", fr: "Impression en pause", es: "Impresión en pausa", pt: "Impressão pausada", it: "Stampa in pausa", zh: "打印已暂停"),
+                        body: body, identifier: "print-paused-\(self.name)")
+                    return
+                }
+                let title = n > 0
+                    ? lz(en: "Filament Nozzle \(n) empty", de: "Filament Nozzle \(n) leer", fr: "Filament buse \(n) épuisé", es: "Filamento boquilla \(n) agotado", pt: "Filamento bico \(n) esgotado", it: "Filamento ugello \(n) esaurito", zh: "喷嘴 \(n) 耗材用尽")
+                    : lz(en: "Filament runout", de: "Filament leer", fr: "Filament épuisé", es: "Filamento agotado", pt: "Filamento esgotado", it: "Filamento esaurito", zh: "耗材用尽")
+                self.sendLocalNotification(title: title, body: body, identifier: "print-paused-\(self.name)")
+            }
+        }
+    }
+
+    /// The nozzle whose filament ran out, 0 on a single-nozzle machine, nil when
+    /// the cause is something else. The U1 answers this query with an empty body
+    /// every so often, so ask up to three times before concluding "no runout" —
+    /// a single miss used to turn every runout into a plain "paused".
+    private func fetchTaskConfig() async -> [String: Any]? {
+        // The U1 occasionally answers with an empty body, so try a few times.
+        for attempt in 0..<3 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 400_000_000) }
+            guard let req = authorizedRequest(for: "\(baseURL)/printer/objects/query?print_task_config"),
+                  let (data, _) = try? await URLSession.shared.data(for: req),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let cfg = ((json["result"] as? [String: Any])?["status"] as? [String: Any])?["print_task_config"] as? [String: Any]
+            else { continue }
+            return cfg
+        }
+        return nil
+    }
+
+    private func runoutNozzle(multiNozzle: Bool) async -> Int? {
+        guard let cfg = await fetchTaskConfig() else { return nil }
+        // Empty now, but seen occupied earlier in this print.
+        let exist = cfg["filament_exist"] as? [Bool] ?? []
+        for (i, present) in exist.enumerated() where !present {
+            if i < everOccupied.count && everOccupied[i] { return multiNozzle ? i + 1 : 0 }
+        }
+        return nil
     }
 
     func sendLocalNotification(title: String, body: String, identifier: String = UUID().uuidString) {
@@ -2609,6 +2886,11 @@ class PrinterService: ObservableObject {
             filamentSlots[i] = FilamentSlot(id: i, color: detected ? color : .gray,
                                              colorHex: detected ? hexRGB : "888888",
                                              material: material, detected: detected)
+            if detected && !everOccupied[i] {
+                everOccupied[i] = true
+                UserDefaults(suiteName: "group.paxxmaker.u1")?
+                    .set(everOccupied, forKey: "ever_occupied_\(name)")
+            }
         }
         writeWidgetData()
     }
@@ -2697,14 +2979,31 @@ class PrinterService: ObservableObject {
         }
     }
 
+    // M220/M221 sit in Klipper's command queue and take effect only when the
+    // queued moves before them are done — while printing that can be a few
+    // seconds. Until then the 3 s status poll would report the OLD factor and
+    // snap the slider back. So the value just set is held for a moment and
+    // the poll is only believed again once it confirms it (or time runs out).
+    private var speedFactorHoldUntil = Date.distantPast
+    private var extrudeFactorHoldUntil = Date.distantPast
+
     func setSpeedFactor(_ factor: Double) {
-        speedFactor = max(0.5, min(3.0, factor))
-        sendGCode("M220 S\(Int(speedFactor * 100))")
+        speedFactor = (max(0.5, min(3.0, factor)) * 100).rounded() / 100
+        speedFactorHoldUntil = Date().addingTimeInterval(12)
+        sendGCode("M220 S\(Int((speedFactor * 100).rounded()))")
     }
 
     func setExtrudeFactor(_ factor: Double) {
-        extrudeFactor = max(0.5, min(2.0, factor))
-        sendGCode("M221 S\(Int(extrudeFactor * 100))")
+        extrudeFactor = (max(0.5, min(2.0, factor)) * 100).rounded() / 100
+        extrudeFactorHoldUntil = Date().addingTimeInterval(12)
+        sendGCode("M221 S\(Int((extrudeFactor * 100).rounded()))")
+    }
+
+    /// Poll result for a held factor: accept it when it matches what was set
+    /// (the printer caught up) or the hold has expired.
+    private func acceptPolled(_ polled: Double, current: Double, holdUntil: inout Date) -> Bool {
+        if abs(polled - current) < 0.005 { holdUntil = .distantPast; return true }
+        return Date() >= holdUntil
     }
 
     func setCavityFanSpeed(_ speed: Double) {
@@ -3325,6 +3624,21 @@ struct PreheatPreset: Codable, Identifiable {
     var bed: Int
     // Optional so presets saved before colours existed still decode.
     var colorHex: String? = nil
+
+    // Tolerant decoding — a field added later must not wipe saved presets.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name   = try c.decode(String.self, forKey: .name)
+        nozzle = try c.decodeIfPresent(Int.self, forKey: .nozzle) ?? 0
+        bed    = try c.decodeIfPresent(Int.self, forKey: .bed) ?? 0
+        id     = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        colorHex = try c.decodeIfPresent(String.self, forKey: .colorHex)
+    }
+
+    init(id: UUID = UUID(), name: String, nozzle: Int, bed: Int, colorHex: String? = nil) {
+        self.id = id; self.name = name; self.nozzle = nozzle
+        self.bed = bed; self.colorHex = colorHex
+    }
 }
 
 private struct PreheatIdxBox: Identifiable { let id: Int }
@@ -3332,6 +3646,87 @@ private struct PreheatIdxBox: Identifiable { let id: Int }
 // A tile of tappable preheat presets. Tap = apply (nozzle + bed). Long-press a
 // preset → context menu → edit its material name and temperatures. Presets are
 // stored per printer.
+// Klipper's speed and flow factors (M220 / M221) as their own tile for
+// single-nozzle printers — the status tile hides them in its compact sizes.
+struct SpeedFlowTileView: View {
+    @ObservedObject var printer: PrinterService
+    @AppStorage("app_language") private var appLanguage: String = "en"
+    // Slider position while the finger is down; sent on release so the
+    // printer isn't flooded with M220s on every pixel.
+    @State private var speedDrag: Double? = nil
+    @State private var flowDrag: Double? = nil
+
+    private let speedPresets: [Int] = [50, 75, 100, 150, 200]
+
+    @ViewBuilder
+    private func factorRow(label: String, icon: String, color: Color, value: Double,
+                           range: ClosedRange<Double>, drag: Binding<Double?>,
+                           set: @escaping (Double) -> Void) -> some View {
+        VStack(spacing: 6) {
+            HStack {
+                Image(systemName: icon).font(.system(size: 11, weight: .semibold)).foregroundColor(color)
+                Text(label).font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary)
+                Spacer()
+                Text("\(Int(((drag.wrappedValue ?? value) * 100).rounded())) %")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .foregroundColor(.primary)
+                    .contentTransition(.numericText())
+                    .animation(.easeInOut(duration: 0.2), value: value)
+            }
+            HStack(spacing: 8) {
+                Button { haptic(.light); set(value - 0.05) } label: {
+                    Image(systemName: "minus.circle.fill").font(.system(size: 22)).foregroundColor(color)
+                }.buttonStyle(.plain)
+                Slider(value: Binding(get: { drag.wrappedValue ?? value },
+                                      set: { drag.wrappedValue = $0 }),
+                       in: range, step: 0.01,
+                       onEditingChanged: { editing in
+                           if !editing, let v = drag.wrappedValue { set(v); drag.wrappedValue = nil }
+                       })
+                    .tint(color)
+                    .animation(.easeInOut(duration: 0.2), value: value)
+                Button { haptic(.light); set(value + 0.05) } label: {
+                    Image(systemName: "plus.circle.fill").font(.system(size: 22)).foregroundColor(color)
+                }.buttonStyle(.plain)
+            }
+        }
+    }
+
+    var body: some View {
+        DashboardView_glassCardShell {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(lz(en: "Speed & Flow", de: "Tempo & Flow", fr: "Vitesse & Débit", es: "Velocidad y flujo", pt: "Velocidade e fluxo", it: "Velocità e flusso", zh: "速度与流量"))
+                    .font(.caption).fontWeight(.semibold)
+                    .foregroundColor(.secondary).textCase(.uppercase).tracking(1)
+
+                factorRow(label: lz(en: "Speed", de: "Geschwindigkeit", fr: "Vitesse", es: "Velocidad", pt: "Velocidade", it: "Velocità", zh: "速度"),
+                          icon: "speedometer", color: .blue, value: printer.speedFactor,
+                          range: 0.5...2.0, drag: $speedDrag) { printer.setSpeedFactor($0) }
+
+                // One-tap presets for the speed factor.
+                HStack(spacing: 6) {
+                    ForEach(speedPresets, id: \.self) { p in
+                        let active = Int((printer.speedFactor * 100).rounded()) == p
+                        Button { haptic(.light); printer.setSpeedFactor(Double(p) / 100) } label: {
+                            Text("\(p)%")
+                                .font(.system(size: 11, weight: .semibold))
+                                .frame(maxWidth: .infinity).padding(.vertical, 6)
+                                .background(RoundedRectangle(cornerRadius: 8)
+                                    .fill(active ? Color.blue.opacity(0.85) : Color.secondary.opacity(0.12)))
+                                .foregroundColor(active ? .white : .primary)
+                        }.buttonStyle(.plain)
+                    }
+                }
+
+                factorRow(label: lz(en: "Flow", de: "Flow", fr: "Débit", es: "Flujo", pt: "Fluxo", it: "Flusso", zh: "流量"),
+                          icon: "drop.fill", color: .teal, value: printer.extrudeFactor,
+                          range: 0.5...1.5, drag: $flowDrag) { printer.setExtrudeFactor($0) }
+            }
+        }
+        .disabled(printer.isViaLiveActivity)
+    }
+}
+
 struct PreheatTileView: View {
     @ObservedObject var printer: PrinterService
     @State private var presets: [PreheatPreset] = PreheatTileView.defaults
@@ -3567,7 +3962,7 @@ struct TempSparklineView: View {
 
 // MARK: - Dashboard Tile
 enum DashboardTile: String, CaseIterable, Identifiable {
-    case webcam, webcam2, status, screen, extruder, bed, chamber, preheat, filament, spools, cleaning, calibration, stats, smartPlug, activeSpool
+    case webcam, webcam2, status, screen, extruder, bed, chamber, preheat, filament, spools, cleaning, calibration, stats, smartPlug, activeSpool, energyCost, speed
     var id: String { rawValue }
     var label: String {
         switch self {
@@ -3586,6 +3981,8 @@ enum DashboardTile: String, CaseIterable, Identifiable {
         case .stats: return lz(en: "Statistics", de: "Statistiken", fr: "Statistiques", es: "Estadísticas", pt: "Estatísticas", it: "Statistiche", zh: "统计")
         case .smartPlug: return lz(en: "Smart Plug", de: "Smart-Steckdose", fr: "Prise intelligente", es: "Enchufe inteligente", pt: "Tomada Inteligente", it: "Presa Intelligente", zh: "智能插座")
         case .activeSpool: return lz(en: "Active Spool", de: "Aktive Spule", fr: "Bobine active", es: "Bobina activa", pt: "Bobina ativa", it: "Bobina attiva", zh: "当前料盘")
+        case .energyCost: return lz(en: "Last Print Cost", de: "Kosten letzter Druck", fr: "Coût dernière impression", es: "Coste última impresión", pt: "Custo da última impressão", it: "Costo ultima stampa", zh: "上次打印费用")
+        case .speed: return lz(en: "Speed & Flow", de: "Tempo & Flow", fr: "Vitesse & Débit", es: "Velocidad y flujo", pt: "Velocidade e fluxo", it: "Velocità e flusso", zh: "速度与流量")
         }
     }
     var icon: String {
@@ -3605,6 +4002,8 @@ enum DashboardTile: String, CaseIterable, Identifiable {
         case .stats: return "chart.bar.fill"
         case .smartPlug: return "powerplug.fill"
         case .activeSpool: return "smallcircle.filled.circle"
+        case .energyCost: return "eurosign.circle.fill"
+        case .speed: return "speedometer"
         }
     }
 }
@@ -3621,7 +4020,7 @@ struct TileEditorView: View {
     private static func staticItems(for printerType: PrinterConfig.PrinterType) -> [DashboardItem] {
         let singleNozzleHidden: Set<DashboardTile> = [.screen, .filament, .spools, .cleaning]
         return DashboardTile.allCases
-            .filter { printerType == .singleNozzle ? !singleNozzleHidden.contains($0) : $0 != .cleaning }
+            .filter { printerType == .singleNozzle ? !singleNozzleHidden.contains($0) : ($0 != .cleaning && $0 != .speed) }
             .map { .tile($0) }
     }
 
@@ -3784,23 +4183,30 @@ private struct HidePickerKey: PreferenceKey {
 
 private struct WobbleModifier: ViewModifier {
     var active: Bool
-    @State private var angle: Double
+    /// Per-tile phase offset so the tiles don't all swing in lockstep.
+    private let offset: Double
 
     init(active: Bool, seed: Int = 0) {
         self.active = active
-        // Each tile gets a unique starting angle so they wobble out of phase
-        let t = Double(abs(seed) % 100) / 100.0   // 0.0 … 0.99
-        self._angle = State(initialValue: t * 2.5 - 1.25)  // –1.25 … +1.25
+        offset = Double(abs(seed) % 100) / 100.0        // 0.0 … 0.99
     }
 
+    // phaseAnimator instead of a repeatForever withAnimation on @State: the
+    // old form re-armed on every onAppear (each reorder gives the tile a new
+    // place in the grid) so animations stacked up, and the repeating
+    // transaction leaked into unrelated layout changes — tiles twitched and
+    // shot around while dragging. This loop is self-contained and identical
+    // for every tile.
     func body(content: Content) -> some View {
-        content
-            .rotationEffect(.degrees(active ? angle : 0))
-            .onAppear {
-                withAnimation(.easeInOut(duration: 0.13).repeatForever(autoreverses: true)) {
-                    angle = angle < 0 ? 1.25 : -1.25
-                }
+        if active {
+            content.phaseAnimator([false, true]) { view, phase in
+                view.rotationEffect(.degrees(phase ? 1.1 : -1.1), anchor: .center)
+            } animation: { _ in
+                .easeInOut(duration: 0.14).delay(offset * 0.05)
             }
+        } else {
+            content
+        }
     }
 }
 
@@ -3958,7 +4364,9 @@ struct DashboardView: View {
                 if t == .webcam     { return printer.webcamConfigured }
                 if t == .webcam2    { return printer.webcam2StreamURL != nil }
                 if t == .smartPlug  { return !printer.smartPlugIP.isEmpty }
-                if t == .activeSpool { return printer.spoolmanConnected }
+                if t == .activeSpool { return printer.spoolmanAvailable }
+                if t == .energyCost { return printer.energyTrackingEnabled }
+                if t == .speed { return printer.printerType == .singleNozzle }
                 return true
             }
     }
@@ -3969,8 +4377,10 @@ struct DashboardView: View {
             if t == .webcam     { return printer.webcamConfigured }
             if t == .webcam2    { return printer.webcam2StreamURL != nil }
             if t == .smartPlug  { return !printer.smartPlugIP.isEmpty }
-            if t == .activeSpool { return printer.spoolmanConnected }
+            if t == .activeSpool { return printer.spoolmanAvailable }
+            if t == .energyCost { return printer.energyTrackingEnabled }
             if t == .preheat { return printer.printerType == .singleNozzle }
+            if t == .speed { return printer.printerType == .singleNozzle }
             return printer.printerType == .singleNozzle ? !snExcluded.contains(t) : t != .cleaning
         }
         let parts = tileOrderString.split(separator: ",").map { String($0) }
@@ -4164,6 +4574,35 @@ struct DashboardView: View {
 
     // Groups tiles into rows using a 6-unit bin: full=6, half=3, third=2.
     // Mixed half+third tiles on the same row are allowed as long as total ≤ 6.
+    /// Normal (non-edit) view: no holes. Spacers are dropped and a row with
+    /// room left pulls the next tile that fits up into it, so hiding a tile
+    /// in the middle never leaves an empty column with the rest starting a
+    /// row lower. Edit mode keeps the literal order (spacers included) so
+    /// dragging stays predictable.
+    func packedRows(from items: [DashboardItem]) -> [[DashboardItem]] {
+        func units(_ item: DashboardItem) -> Int {
+            switch effectiveWidthState(for: item) { case 2: return 2; case 1: return 3; default: return 6 }
+        }
+        var pending = items.filter { !$0.isSpacerItem }
+        var rows: [[DashboardItem]] = []
+        while !pending.isEmpty {
+            let first = pending.removeFirst()
+            var row = [first]
+            var remaining = 6 - units(first)
+            var i = 0
+            while remaining > 0, i < pending.count {
+                if units(pending[i]) <= remaining {
+                    remaining -= units(pending[i])
+                    row.append(pending.remove(at: i))
+                } else {
+                    i += 1
+                }
+            }
+            rows.append(row)
+        }
+        return rows
+    }
+
     func tileRows(from items: [DashboardItem]) -> [[DashboardItem]] {
         func unitCount(_ item: DashboardItem) -> Int {
             switch effectiveWidthState(for: item) {
@@ -4360,7 +4799,7 @@ struct DashboardView: View {
                         .padding(.horizontal, 16)
                         .transition(.move(edge: .top).combined(with: .opacity))
                     }
-                    let rows = tileRows(from: isEditMode ? allTileItems : tileOrder)
+                    let rows = isEditMode ? tileRows(from: allTileItems) : packedRows(from: tileOrder)
                     ForEach(0..<rows.count, id: \.self) { rowIndex in
                         dashboardRow(rows[rowIndex], rowIndex: rowIndex)
                     }
@@ -5420,6 +5859,17 @@ struct DashboardView: View {
                 EmptyView()
             }
 
+        case .speed:
+            if printer.printerType == .singleNozzle {
+                SpeedFlowTileView(printer: printer)
+            } else {
+                EmptyView()
+            }
+
+        case .energyCost:
+            EnergyCostTileView(baseURL: printer.baseURL, apiKey: printer.apiKey, printerType: printer.printerType,
+                               isPrinting: printer.printState == "printing" || printer.printState == "paused")
+
         case .smartPlug:
             SmartPlugTileView(
                 plugIP: printer.smartPlugIP,
@@ -6308,7 +6758,16 @@ struct SettingsView: View {
     @EnvironmentObject var printerServices: PrinterServicesManager
     @State private var showAddPrinter = false
     @State private var showNetworkScan = false
-    @State private var editingPrinter: PrinterConfig? = nil
+    /// Carries the "jump to Server Push" wish WITH the printer. A separate
+    /// @State would be read stale on the first presentation — SwiftUI does not
+    /// fully recompute the body when a sheet first appears, which is why this
+    /// only ever worked on the second attempt.
+    struct EditTarget: Identifiable {
+        let printer: PrinterConfig
+        var pushFirst: Bool = false
+        var id: UUID { printer.id }
+    }
+    @State private var editingPrinter: EditTarget? = nil
     @EnvironmentObject var langStore: LanguageStore
     @State private var showAddCommand = false
     @State private var editingCommandIndex: Int? = nil
@@ -6321,33 +6780,37 @@ struct SettingsView: View {
     @AppStorage("splitscreen_mode") private var splitscreenMode: Bool = false
     @AppStorage("expert_mode_enabled") private var expertModeEnabled: Bool = false
     @AppStorage("spoolman_enabled") private var spoolmanEnabled: Bool = false
+    @AppStorage("progress_use_file") private var progressUseFile: Bool = false
     @AppStorage("spoolman_url") private var spoolmanURL: String = ""
     @State private var showResetConfirm = false
+    @State private var showWhatsNewAgain = false
+    /// Left behind by the popup's "Update now" button — open that printer,
+    /// then clear it so it fires exactly once.
+    @AppStorage("pending_push_printer") private var pendingPushPrinter: String = ""
     @Environment(\.editMode) private var editMode
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @StateObject private var donations = DonationManager()
-    @EnvironmentObject var tour: TourGuide
 
     private var isIPad: Bool { horizontalSizeClass == .regular }
 
+    /// Jump target of the popup's "Update now": open the printer whose Server
+    /// Push needs reinstalling. A short delay lets the tab switch settle first —
+    /// presenting a sheet while the tab is still changing drops it.
+    private func openPendingPrinter() {
+        let wanted = pendingPushPrinter
+        guard !wanted.isEmpty,
+              let printer = settings.printers.first(where: { $0.name == wanted }) else { return }
+        pendingPushPrinter = ""
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            editingPrinter = EditTarget(printer: printer, pushFirst: true)
+        }
+    }
+
     var body: some View {
         NavigationStack {
-            ScrollViewReader { tourProxy in
             settingsForm
-                .collectTourFrames(tour)
-                .overlay { tourSettingsOverlay }
-                .onChange(of: tour.step) { _, s in
-                    tourScroll(s, proxy: tourProxy)
-                    // The tour drives the last step: open the top printer's sheet
-                    // so the Server-Push coach mark can point inside it.
-                    if s == .serverPush, editingPrinter == nil {
-                        editingPrinter = settings.printers.first
-                    }
-                }
-                .onAppear {
-                    // The step is usually already .spoolman when this tab appears.
-                    if tour.isActive { tourScroll(tour.step, proxy: tourProxy) }
-                }
+                .onAppear(perform: openPendingPrinter)
+                .onChange(of: pendingPushPrinter) { _, _ in openPendingPrinter() }
                 .navigationTitle(lz(en: "Settings", de: "Einstellungen", fr: "Paramètres", es: "Ajustes", pt: "Configurações", it: "Impostazioni", zh: "设置"))
                 .toolbar { EditButton() }
                 .sheet(isPresented: $showAddPrinter) {
@@ -6355,89 +6818,44 @@ struct SettingsView: View {
                         settings.printers.append(newPrinter)
                         onSave()
                     }
-                    .environmentObject(tour)
                 }
-                .sheet(item: $editingPrinter) { printer in
+                .sheet(item: $editingPrinter) { target in
                     PrinterEditView(
-                        config: printer,
+                        config: target.printer,
+                        scrollToPush: target.pushFirst,
                         onSave: { updated in
                             if let idx = settings.printers.firstIndex(where: { $0.id == updated.id }) {
                                 settings.printers[idx] = updated
                                 onSave()
                             }
                         },
-                        service: printerServices.services.first(where: { $0.name == printer.name })
+                        service: printerServices.services.first(where: { $0.name == target.printer.name })
                     )
-                    .environmentObject(tour)
                 }
                 .sheet(isPresented: $showNetworkScan) {
                     NetworkScanView(settings: settings, onSave: onSave)
                 }
-            }
+                .sheet(isPresented: $showWhatsNewAgain) {
+                    WhatsNewView(
+                        showsServerPushNote: settings.printers.contains { $0.pushMode == .cloudflare },
+                        pushPrinterBaseURL: settings.printers.first { $0.pushMode == .cloudflare }?.effectiveBaseURL,
+                        onOpenServerPush: {
+                            // Opened from Settings this closure was missing, so the
+                            // button did nothing at all. Here we are already in the
+                            // right screen and can open the printer directly.
+                            let target = settings.printers.first { $0.pushMode == .cloudflare }
+                            showWhatsNewAgain = false
+                            guard let target else { return }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                editingPrinter = EditTarget(printer: target, pushFirst: true)
+                            }
+                        }) {
+                        showWhatsNewAgain = false
+                    }
+                }
         }
     }
 
-    // Scroll the Settings list so the highlighted row sits centred in view.
-    private func tourScroll(_ step: TourStep, proxy: ScrollViewProxy) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            withAnimation {
-                switch step {
-                case .spoolman: proxy.scrollTo("tourSpoolmanRow", anchor: .center)
-                case .printer:  proxy.scrollTo(settings.printers.first?.id, anchor: .center)
-                default: break
-                }
-            }
-        }
-    }
-
-    // Coach-mark overlay for the steps that live inside the Settings list.
-    @ViewBuilder
-    private var tourSettingsOverlay: some View {
-        switch tour.step {
-        case .spoolman:
-            ZStack {
-                TourSpotlight(hole: tour.spoolmanFrame, interactive: false)
-                VStack {
-                    Spacer()
-                    TourCallout(
-                        title: "Spoolman",
-                        text: lz(en: "Here you'll find Spoolman — your filament manager.",
-                                 de: "Hier findest du Spoolman – deine Filamentverwaltung.",
-                                 fr: "Ici tu trouves Spoolman – ton gestionnaire de filament.",
-                                 es: "Aquí encuentras Spoolman, tu gestor de filamento.",
-                                 pt: "Aqui você encontra o Spoolman, seu gerenciador de filamento.",
-                                 it: "Qui trovi Spoolman, il tuo gestore di filamento.",
-                                 zh: "在这里可以找到 Spoolman（耗材管理）。"),
-                        okTitle: "OK",
-                        onOK: { withAnimation { tour.confirmSpoolman() } }
-                    )
-                    .padding(.bottom, 24)
-                }
-            }
-        case .printer:
-            ZStack {
-                TourSpotlight(hole: tour.printerFrame, interactive: false)
-                VStack {
-                    Spacer()
-                    TourCallout(
-                        title: lz(en: "Your printer", de: "Dein Drucker", fr: "Ton imprimante", es: "Tu impresora", pt: "Sua impressora", it: "La tua stampante", zh: "你的打印机"),
-                        text: lz(en: "This is your printer. Its push settings are inside.",
-                                 de: "Das ist dein Drucker. Seine Push-Einstellungen sind hier drin.",
-                                 fr: "Voici ton imprimante. Ses réglages push sont à l'intérieur.",
-                                 es: "Esta es tu impresora. Sus ajustes de push están dentro.",
-                                 pt: "Esta é a sua impressora. As configurações de push ficam aqui dentro.",
-                                 it: "Questa è la tua stampante. Le impostazioni push sono qui dentro.",
-                                 zh: "这是你的打印机。推送设置就在里面。"),
-                        okTitle: lz(en: "Next", de: "Weiter", fr: "Suivant", es: "Siguiente", pt: "Próximo", it: "Avanti", zh: "下一步"),
-                        onOK: { withAnimation { tour.confirmPrinter() } }
-                    )
-                    .padding(.bottom, 24)
-                }
-            }
-        default:
-            EmptyView()
-        }
-    }
 
     @ViewBuilder
     private var ipadSettingsDetail: some View {
@@ -6451,9 +6869,10 @@ struct SettingsView: View {
                 },
                 onDismiss: { showAddPrinter = false }
             )
-        } else if let printer = editingPrinter {
+        } else if let target = editingPrinter {
             PrinterEditView(
-                config: printer,
+                config: target.printer,
+                scrollToPush: target.pushFirst,
                 onSave: { updated in
                     if let idx = settings.printers.firstIndex(where: { $0.id == updated.id }) {
                         settings.printers[idx] = updated
@@ -6462,7 +6881,7 @@ struct SettingsView: View {
                     editingPrinter = nil
                 },
                 onDismiss: { editingPrinter = nil },
-                service: printerServices.services.first(where: { $0.name == printer.name })
+                service: printerServices.services.first(where: { $0.name == target.printer.name })
             )
         } else if showNetworkScan {
             NetworkScanView(
@@ -6501,6 +6920,48 @@ struct SettingsView: View {
                     }
                 }
                 Section(header: Text(lz(en: "Extra Features", de: "Zusatzfunktionen", fr: "Fonctions supplémentaires", es: "Funciones adicionales", pt: "Recursos Extras", it: "Funzioni Extra", zh: "附加功能"))) {
+                    // Two honest definitions of "progress" that drift apart
+                    // mid-print; let the user pick which one the app shows.
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Image(systemName: "chart.bar.fill").foregroundColor(.orange).frame(width: 28)
+                            Text(lz(en: "Progress", de: "Fortschritt", fr: "Progression", es: "Progreso", pt: "Progresso", it: "Avanzamento", zh: "进度"))
+                            Spacer()
+                            Picker("", selection: $progressUseFile) {
+                                Text(lz(en: "Slicer", de: "Slicer", fr: "Slicer", es: "Slicer", pt: "Slicer", it: "Slicer", zh: "切片软件")).tag(false)
+                                Text(lz(en: "Printer", de: "Drucker", fr: "Imprimante", es: "Impresora", pt: "Impressora", it: "Stampante", zh: "打印机")).tag(true)
+                            }
+                            .pickerStyle(.segmented).frame(width: 170)
+                            .onChange(of: progressUseFile) { _, newValue in
+                                // Tell the Watch right away; it polls the printer
+                                // itself when the phone is out of reach and would
+                                // otherwise keep using the old definition.
+                                // The Live Activity is rendered by the widget
+                                // extension, which can only read the app group.
+                                UserDefaults(suiteName: "group.paxxmaker.u1")?
+                                    .set(newValue, forKey: "progress_use_file")
+                                if WCSession.isSupported(), WCSession.default.activationState == .activated {
+                                    WCSession.default.transferUserInfo(["progressUseFile": newValue])
+                                }
+                            }
+                        }
+                        Text(progressUseFile
+                             ? lz(en: "The value the printer itself shows — on its display and in the Klipper tab.",
+                                  de: "Der Wert, den der Drucker selbst zeigt — auf dem Display und im Klipper-Tab.",
+                                  fr: "La valeur affichée par l’imprimante elle-même — sur son écran et dans l’onglet Klipper.",
+                                  es: "El valor que muestra la propia impresora: en su pantalla y en la pestaña Klipper.",
+                                  pt: "O valor que a própria impressora mostra — no visor e na aba Klipper.",
+                                  it: "Il valore mostrato dalla stampante stessa — sul display e nella scheda Klipper.",
+                                  zh: "打印机自己显示的数值——屏幕上和 Klipper 标签页中。")
+                             : lz(en: "The slicer's own estimate (M73) — the better basis for the remaining time, but it does not match the printer's display.",
+                                  de: "Die Schätzung des Slicers (M73) — die bessere Grundlage für die Restzeit, stimmt aber nicht mit dem Druckerdisplay überein.",
+                                  fr: "L’estimation du slicer (M73) — meilleure base pour le temps restant, mais ne correspond pas à l’écran de l’imprimante.",
+                                  es: "La estimación del slicer (M73): mejor base para el tiempo restante, pero no coincide con la pantalla de la impresora.",
+                                  pt: "A estimativa do slicer (M73) — melhor base para o tempo restante, mas não coincide com o visor da impressora.",
+                                  it: "La stima dello slicer (M73) — base migliore per il tempo rimanente, ma non coincide con il display della stampante.",
+                                  zh: "切片软件自己的估算（M73）——剩余时间的更佳依据，但与打印机屏幕不一致。"))
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
                     HStack {
                         Image(systemName: "rectangle.grid.1x2").foregroundColor(.indigo).frame(width: 28)
                         Toggle(lz(en: "Printers as Tabs", de: "Drucker als einzelne Tabs", fr: "Imprimantes en onglets", es: "Impresoras comme pestañas", pt: "Impressoras como Abas", it: "Stampanti come Schede", zh: "打印机以标签页显示"), isOn: $printersAsTabs)
@@ -6515,6 +6976,7 @@ struct SettingsView: View {
                         Image(systemName: "wave.3.right").foregroundColor(.blue).frame(width: 28)
                         Toggle("NFC", isOn: $showNFCTab)
                     }
+
                     HStack {
                         Image(systemName: "chevron.left.forwardslash.chevron.right").foregroundColor(.green).frame(width: 28)
                         Toggle("Klipper", isOn: $showKlipperTab)
@@ -6531,8 +6993,6 @@ struct SettingsView: View {
                         Image(systemName: "record.circle.fill").foregroundColor(.pink).frame(width: 28)
                         Toggle("Spoolman", isOn: $spoolmanEnabled)
                     }
-                    .id("tourSpoolmanRow")
-                    .tourTarget(.spoolman)
                     if spoolmanEnabled {
                         HStack {
                             Image(systemName: "network").foregroundColor(.pink).frame(width: 28)
@@ -6544,7 +7004,7 @@ struct SettingsView: View {
                 Section(header: Text(lz(en: "My Printers", de: "Meine Drucker", fr: "Mes imprimantes", es: "Mis impresoras", pt: "Minhas Impressoras", it: "Le mie Stampanti", zh: "我的打印机"))) {
                     ForEach(settings.printers) { printer in
                         HStack(spacing: 0) {
-                            Button(action: { editingPrinter = printer }) {
+                            Button(action: { editingPrinter = EditTarget(printer: printer) }) {
                                 HStack(spacing: 12) {
                                     Image(printer.type.imageName)
                                         .resizable().scaledToFit()
@@ -6591,7 +7051,6 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.plain)
                         }
-                        .tourTarget(printer.id == settings.printers.first?.id ? .printer : .inactive)
                     }
                     .onDelete { indices in
                         // Capture push config before removal for Cloudflare cleanup
@@ -6919,6 +7378,20 @@ struct SettingsView: View {
                     }
                 }
 
+                // Above Reset so anyone who dismissed the popup too quickly can
+                // read it again — it carries setup steps, not just news.
+                Section {
+                    Button { showWhatsNewAgain = true } label: {
+                        HStack {
+                            Image(systemName: "sparkles").foregroundColor(.orange).frame(width: 28)
+                            Text(lz(en: "What's new", de: "Das ist neu", fr: "Nouveautés", es: "Novedades", pt: "Novidades", it: "Novità", zh: "新功能"))
+                                .foregroundColor(.primary)
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                }
+
                 Section(header: Text(lz(en: "Reset", de: "Zurücksetzen", fr: "Réinitialiser", es: "Restablecer", pt: "Redefinir", it: "Ripristina", zh: "重置"))) {
                     Button(action: { showResetConfirm = true }) {
                         HStack {
@@ -7220,6 +7693,9 @@ struct OctoEverywhereGuideView: View {
 // MARK: - Printer Edit View
 struct PrinterEditView: View {
     @State var config: PrinterConfig
+    /// Opened from the "Update now" button: jump straight to Server Push
+    /// instead of leaving the user to scroll past every other section.
+    var scrollToPush: Bool = false
     var onSave: (PrinterConfig) -> Void
     var onDismiss: (() -> Void)? = nil
     @Environment(\.dismiss) var dismiss
@@ -7232,7 +7708,6 @@ struct PrinterEditView: View {
     @State private var pushIsWorking = false
     @State private var showPushInfo = false
     @State private var showLocalSwitchConfirm = false
-    @EnvironmentObject var tour: TourGuide
     // Shared with PushAutoSetupView (via @Binding) so switching to Local reuses
     // the exact same SSH credentials as that card's own "Remove from printer"
     // button, instead of an independent lookup that could drift out of sync.
@@ -7307,10 +7782,121 @@ struct PrinterEditView: View {
     }
 
     @State private var showSmartPlugGuide = false
+    @State private var showAutoShutdown = false
+    @State private var showEnergySetup = false
 
+
+    /// Kept as its own property so it can be rendered in two places: at the
+    /// TOP when arriving from "Update now", in its normal position otherwise.
+    /// Scrolling to it was unreliable — Form creates rows only once they
+    /// become visible, so the jump target did not exist yet.
+    @ViewBuilder private var pushNotificationsSection: some View {
+                // MARK: Push Notifications Section
+                Section(header: HStack {
+                    Text(lz(en: "Push Notifications", de: "Push-Benachrichtigungen", fr: "Notifications push", es: "Notificaciones push", pt: "Notificações Push", it: "Notifiche Push", zh: "推送通知"))
+                    Spacer()
+                    Button { showPushInfo = true } label: {
+                        Image(systemName: "questionmark.circle")
+                            .foregroundColor(.secondary)
+                            .font(.footnote)
+                    }
+                    .buttonStyle(.plain)
+                }) {
+                    // Server mode row
+                    Button {
+                        config.pushMode = .cloudflare
+                        if config.cloudflareNotifySecret.isEmpty {
+                            config.cloudflareNotifySecret = CloudflarePushService.generateSecret()
+                        }
+                        pushStatusMsg = nil
+                    } label: {
+                        HStack(spacing: 14) {
+                            Image(systemName: "cloud.fill")
+                                .foregroundColor(.gray)
+                                .frame(width: 28)
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(lz(en: "Server Push", de: "Server-Push", fr: "Push serveur", es: "Push servidor", pt: "Push do Servidor", it: "Push dal Server", zh: "服务器推送"))
+                                        .foregroundColor(.primary)
+                                        .font(.body)
+                                }
+                                Text(lz(en: "Works even when the app is closed", de: "Funktioniert auch wenn App geschlossen ist", fr: "Fonctionne même si l'app est fermée", es: "Funciona aunque la app esté cerrada", pt: "Funciona mesmo com o app fechado", it: "Funziona anche ad app chiusa", zh: "即使应用关闭也能运行"))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            if config.pushMode == .cloudflare {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.gray)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+
+                    // Inline auto-setup card (only when server push is selected)
+                    if config.pushMode == .cloudflare {
+                        PushAutoSetupView(
+                            printerID: config.name,
+                            secret: config.cloudflareNotifySecret,
+                            printerIP: config.ip,
+                            printerType: config.type,
+                            sshUsername: $sshUsername,
+                            sshPassword: $sshPassword,
+                            onSecretAdopted: { adopted in config.cloudflareNotifySecret = adopted }
+                        )
+                        .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                        .listRowBackground(Color.clear)
+                    }
+
+                    // Local mode row
+                    Button {
+                        if config.pushMode == .cloudflare && !config.cloudflareNotifySecret.isEmpty {
+                            showLocalSwitchConfirm = true   // ask about removing the printer script
+                        } else {
+                            config.pushMode = .off
+                            pushStatusMsg = nil
+                        }
+                    } label: {
+                        HStack(spacing: 14) {
+                            Image(systemName: "iphone")
+                                .foregroundColor(.blue)
+                                .frame(width: 28)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(lz(en: "Local (App Pull)", de: "Lokal (App Pull)", fr: "Local (App Pull)", es: "Local (App Pull)", pt: "Local (App Pull)", it: "Locale (App Pull)", zh: "本地（应用拉取）"))
+                                    .foregroundColor(.primary)
+                                    .font(.body)
+                                Text(lz(en: "Works only when the app is active in foreground or background (100% Local)", de: "Funktioniert nur wenn App im Vordergrund oder Hintergrund aktiv ist (100% Lokal)", fr: "Fonctionne uniquement si l'app est active en premier plan ou arrière-plan (100% Local)", es: "Funciona solo cuando la app está activa en primer o segundo plano (100% Local)", pt: "Funciona apenas quando o app está ativo em primeiro ou segundo plano (100% Local)", it: "Funziona solo quando l'app è attiva in primo piano o in background (100% Locale)", zh: "仅当应用在前台或后台活跃时有效（100% 本地）"))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            if config.pushMode == .off {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.blue)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+
+                    if let msg = pushStatusMsg {
+                        HStack(spacing: 8) {
+                            if pushIsWorking { ProgressView().scaleEffect(0.8) }
+                            Text(msg)
+                                .font(.caption)
+                                .foregroundColor(pushStatusIsError ? .red : .secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+    }
 
     // Normalise fields, persist, register push, then close the sheet.
     private func performSave() {
+        // The SSH password now has its own section, so it must be stored here
+        // rather than only when the push card happens to be open.
+        let pid = config.name
+        if sshPassword.isEmpty { SSHCredentialStore.delete(for: pid) }
+        else { SSHCredentialStore.save(sshPassword, for: pid) }
         var updated = config
         updated.ip = config.ip.hasPrefix("http") ? config.ip : "http://\(config.ip)"
         if !updated.octoEverywhereURL.isEmpty && !updated.octoEverywhereURL.hasPrefix("http") {
@@ -7340,39 +7926,11 @@ struct PrinterEditView: View {
         dismiss()
     }
 
-    // Coach-mark shown inside this sheet, pointing at the Server-Push row.
-    @ViewBuilder
-    private var tourServerPushOverlay: some View {
-        if tour.step == .serverPush {
-            ZStack {
-                TourSpotlight(hole: tour.serverPushFrame, interactive: false)
-                VStack {
-                    Spacer()
-                    TourCallout(
-                        title: lz(en: "Server Push", de: "Server-Push", fr: "Push serveur", es: "Push servidor", pt: "Push do Servidor", it: "Push dal Server", zh: "服务器推送"),
-                        text: lz(en: "Here you'll find Server Push.",
-                                 de: "Hier findest du Server-Push.",
-                                 fr: "Ici tu trouves le push serveur.",
-                                 es: "Aquí encuentras el Push del servidor.",
-                                 pt: "Aqui você encontra o Push do Servidor.",
-                                 it: "Qui trovi il Push dal Server.",
-                                 zh: "在这里可以找到服务器推送。"),
-                        okTitle: lz(en: "Got it", de: "Verstanden", fr: "Compris", es: "Entendido", pt: "Entendi", it: "Capito", zh: "明白了"),
-                        onOK: {
-                            withAnimation { tour.confirmServerPush() }
-                            onDismiss?(); dismiss()
-                        }
-                    )
-                    .padding(.bottom, 24)
-                }
-            }
-        }
-    }
-
     var body: some View {
         NavigationView {
-            ScrollViewReader { tourProxy in
             Form {
+                if scrollToPush { pushNotificationsSection }
+
                 Section(header: Text(lz(en: "Printer Info", de: "Drucker Info", fr: "Infos imprimante", es: "Info impresora", pt: "Informações da Impressora", it: "Informazioni Stampante", zh: "打印机信息"))) {
                     HStack {
                         Image(systemName: "tag").foregroundColor(.blue)
@@ -7486,6 +8044,39 @@ struct PrinterEditView: View {
                         }
                     }
                 }
+                // MARK: SSH Access
+                // Its own section: both Server Push and Auto-Shutdown need these
+                // credentials, so burying them inside the push card meant setting
+                // them up twice — or not finding them at all.
+                Section(header: Text(lz(en: "SSH Access", de: "SSH-Zugriff", fr: "Accès SSH", es: "Acceso SSH", pt: "Acesso SSH", it: "Accesso SSH", zh: "SSH 访问"))) {
+                    if config.type == .singleNozzle {
+                        HStack {
+                            Image(systemName: "person.fill").foregroundColor(.secondary).frame(width: 28)
+                            TextField(lz(en: "SSH username", de: "SSH-Benutzername", fr: "Nom d'utilisateur SSH", es: "Usuario SSH", pt: "Usuário SSH", it: "Nome utente SSH", zh: "SSH 用户名"), text: $sshUsername)
+                                .textInputAutocapitalization(.never).disableAutocorrection(true)
+                                // Persist as typed — the push card only saved it after a
+                                // successful install, so Auto-Shutdown and power costs
+                                // fell back to "pi" until then.
+                                .onChange(of: sshUsername) { _, v in
+                                    SSHUsernameStore.save(v.trimmingCharacters(in: .whitespaces), for: config.name)
+                                }
+                        }
+                    }
+                    HStack {
+                        Image(systemName: "key.fill").foregroundColor(.secondary).frame(width: 28)
+                        SecureField(lz(en: "SSH password", de: "SSH-Passwort", fr: "Mot de passe SSH", es: "Contraseña SSH", pt: "Senha SSH", it: "Password SSH", zh: "SSH 密码"), text: $sshPassword)
+                            .textInputAutocapitalization(.never).disableAutocorrection(true)
+                    }
+                    Text(lz(en: "Needed to install Server Push and Auto-Shutdown on the printer. Stored in the iOS keychain, never sent anywhere else.",
+                            de: "Wird gebraucht, um Server-Push und Auto-Shutdown auf dem Drucker einzurichten. Liegt im iOS-Schlüsselbund und wird nirgendwo hin übertragen.",
+                            fr: "Nécessaire pour installer le Push serveur et l'arrêt automatique sur l'imprimante. Stocké dans le trousseau iOS, jamais transmis ailleurs.",
+                            es: "Necesaria para instalar el Push servidor y el apagado automático en la impresora. Se guarda en el llavero de iOS y no se envía a ningún sitio.",
+                            pt: "Necessária para instalar o Push do Servidor e o desligamento automático na impressora. Fica no chaveiro do iOS e não é enviada a lugar nenhum.",
+                            it: "Serve per installare il Push dal Server e lo spegnimento automatico sulla stampante. Resta nel portachiavi di iOS e non viene inviata altrove.",
+                            zh: "用于在打印机上安装服务器推送和自动关机。保存在 iOS 钥匙串中，不会发送到别处。"))
+                        .font(.caption).foregroundColor(.secondary)
+                }
+
                 // MARK: Smart Plug Section
                 Section(header: HStack {
                     Text(lz(en: "Smart Plug", de: "Smart-Steckdose", fr: "Prise intelligente", es: "Enchufe inteligente", pt: "Tomada Inteligente", it: "Presa Intelligente", zh: "智能插座"))
@@ -7527,107 +8118,55 @@ struct PrinterEditView: View {
                                 .autocapitalization(.none).disableAutocorrection(true)
                         }
                     }
-                }
 
-                // MARK: Push Notifications Section
-                Section(header: HStack {
-                    Text(lz(en: "Push Notifications", de: "Push-Benachrichtigungen", fr: "Notifications push", es: "Notificaciones push", pt: "Notificações Push", it: "Notifiche Push", zh: "推送通知"))
-                    Spacer()
-                    Button { showPushInfo = true } label: {
-                        Image(systemName: "questionmark.circle")
-                            .foregroundColor(.secondary)
-                            .font(.footnote)
-                    }
-                    .buttonStyle(.plain)
-                }) {
-                    // Server mode row
-                    Button {
-                        config.pushMode = .cloudflare
-                        if config.cloudflareNotifySecret.isEmpty {
-                            config.cloudflareNotifySecret = CloudflarePushService.generateSecret()
-                        }
-                        pushStatusMsg = nil
-                    } label: {
-                        HStack(spacing: 14) {
-                            Image(systemName: "cloud.fill")
-                                .foregroundColor(.gray)
+                    // Auto-shutdown lives with the plug it switches. Needs a plug
+                    // address — without one there is nothing to turn off.
+                    Button { showAutoShutdown = true } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "power")
+                                .foregroundColor(config.autoShutdownEnabled ? .green : .secondary)
                                 .frame(width: 28)
                             VStack(alignment: .leading, spacing: 2) {
-                                HStack(spacing: 6) {
-                                    Text(lz(en: "Server Push", de: "Server-Push", fr: "Push serveur", es: "Push servidor", pt: "Push do Servidor", it: "Push dal Server", zh: "服务器推送"))
-                                        .foregroundColor(.primary)
-                                        .font(.body)
-                                }
-                                Text(lz(en: "Works even when the app is closed", de: "Funktioniert auch wenn App geschlossen ist", fr: "Fonctionne même si l'app est fermée", es: "Funciona aunque la app esté cerrada", pt: "Funciona mesmo com o app fechado", it: "Funziona anche ad app chiusa", zh: "即使应用关闭也能运行"))
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                            Spacer()
-                            if config.pushMode == .cloudflare {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundColor(.gray)
-                            }
-                        }
-                        .padding(.vertical, 2)
-                    }
-                    .id("tourServerPush")
-                    .tourTarget(.serverPush)
-
-                    // Inline auto-setup card (only when server push is selected)
-                    if config.pushMode == .cloudflare {
-                        PushAutoSetupView(
-                            printerID: config.name,
-                            secret: config.cloudflareNotifySecret,
-                            printerIP: config.ip,
-                            printerType: config.type,
-                            sshUsername: $sshUsername,
-                            sshPassword: $sshPassword,
-                            onSecretAdopted: { adopted in config.cloudflareNotifySecret = adopted }
-                        )
-                        .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
-                        .listRowBackground(Color.clear)
-                    }
-
-                    // Local mode row
-                    Button {
-                        if config.pushMode == .cloudflare && !config.cloudflareNotifySecret.isEmpty {
-                            showLocalSwitchConfirm = true   // ask about removing the printer script
-                        } else {
-                            config.pushMode = .off
-                            pushStatusMsg = nil
-                        }
-                    } label: {
-                        HStack(spacing: 14) {
-                            Image(systemName: "iphone")
-                                .foregroundColor(.blue)
-                                .frame(width: 28)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(lz(en: "Local (App Pull)", de: "Lokal (App Pull)", fr: "Local (App Pull)", es: "Local (App Pull)", pt: "Local (App Pull)", it: "Locale (App Pull)", zh: "本地（应用拉取）"))
+                                Text(lz(en: "Auto Shutdown", de: "Auto-Shutdown", fr: "Arrêt automatique", es: "Apagado automático", pt: "Desligamento automático", it: "Spegnimento automatico", zh: "自动关机"))
                                     .foregroundColor(.primary)
-                                    .font(.body)
-                                Text(lz(en: "Works only when the app is active in foreground or background (100% Local)", de: "Funktioniert nur wenn App im Vordergrund oder Hintergrund aktiv ist (100% Lokal)", fr: "Fonctionne uniquement si l'app est active en premier plan ou arrière-plan (100% Local)", es: "Funciona solo cuando la app está activa en primer o segundo plano (100% Local)", pt: "Funciona apenas quando o app está ativo em primeiro ou segundo plano (100% Local)", it: "Funziona solo quando l'app è attiva in primo piano o in background (100% Locale)", zh: "仅当应用在前台或后台活跃时有效（100% 本地）"))
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
+                                Text(config.autoShutdownEnabled
+                                     ? (config.autoShutdownDelayMin == 0
+                                        ? lz(en: "Active — immediately", de: "Aktiv — sofort", fr: "Actif — immédiat", es: "Activo — inmediato", pt: "Ativo — imediato", it: "Attivo — subito", zh: "已启用——立即")
+                                        : lz(en: "Active — after \(config.autoShutdownDelayMin) min", de: "Aktiv — nach \(config.autoShutdownDelayMin) Min", fr: "Actif — après \(config.autoShutdownDelayMin) min", es: "Activo — tras \(config.autoShutdownDelayMin) min", pt: "Ativo — após \(config.autoShutdownDelayMin) min", it: "Attivo — dopo \(config.autoShutdownDelayMin) min", zh: "已启用——\(config.autoShutdownDelayMin) 分钟后"))
+                                     : lz(en: "Off", de: "Aus", fr: "Désactivé", es: "Desactivado", pt: "Desativado", it: "Disattivato", zh: "关闭"))
+                                    .font(.caption).foregroundColor(.secondary)
                             }
                             Spacer()
-                            if config.pushMode == .off {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundColor(.blue)
-                            }
+                            Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
                         }
-                        .padding(.vertical, 2)
                     }
+                    .disabled(config.smartPlugIP.isEmpty)
+                    .opacity(config.smartPlugIP.isEmpty ? 0.45 : 1)
 
-                    if let msg = pushStatusMsg {
-                        HStack(spacing: 8) {
-                            if pushIsWorking { ProgressView().scaleEffect(0.8) }
-                            Text(msg)
-                                .font(.caption)
-                                .foregroundColor(pushStatusIsError ? .red : .secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                    // Directly below Auto-Shutdown: both are driven by the same
+                    // daemon on the printer and need the same plug.
+                    Button { showEnergySetup = true } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "bolt.fill")
+                                .foregroundColor(config.energyTrackingEnabled ? .green : .secondary)
+                                .frame(width: 28)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(lz(en: "Power costs", de: "Stromkosten", fr: "Coûts d'électricité", es: "Costes de electricidad", pt: "Custos de energia", it: "Costi di energia", zh: "电费"))
+                                    .foregroundColor(.primary)
+                                Text(config.energyTrackingEnabled
+                                     ? String(format: "%.2f %@/kWh", config.energyPricePerKWh, EnergyLog.symbol(config.energyCurrency))
+                                     : lz(en: "Off", de: "Aus", fr: "Désactivé", es: "Desactivado", pt: "Desativado", it: "Disattivato", zh: "关闭"))
+                                    .font(.caption).foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
                         }
                     }
+                    .disabled(config.smartPlugIP.isEmpty)
+                    .opacity(config.smartPlugIP.isEmpty ? 0.45 : 1)
                 }
+
+                if !scrollToPush { pushNotificationsSection }
 
                 // 4-color Spoolman hook removal — U1 only, appears only when
                 // the hook is actually installed (the subview self-hides).
@@ -7665,26 +8204,66 @@ struct PrinterEditView: View {
                     .accessibilityLabel(lz(en: "Save", de: "Speichern", fr: "Enregistrer", es: "Guardar", pt: "Salvar", it: "Salva", zh: "保存"))
                 }
             }
-            .onChange(of: tour.step) { _, s in
-                if s == .serverPush {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                        withAnimation { tourProxy.scrollTo("tourServerPush", anchor: .center) }
+        }
+        .task {
+            // Ask the printer what is really installed (Auto-Shutdown, power
+            // costs) and mirror it — set up from another device, it would
+            // otherwise look uninstalled here. No settings file = nothing
+            // installed, in which case the local flags are cleared as well.
+            let base = config.ip.hasPrefix("http") ? config.ip : "http://\(config.ip)"
+            guard !config.smartPlugIP.isEmpty else { return }
+            if let onPrinter = await AutoShutdownInstaller.readSettings(baseURL: base, apiKey: "", dir: AutoShutdownInstaller.dir(for: config.type)) {
+                if AutoShutdownInstaller.adopt(onPrinter, into: &config) { onSave(config) }
+            } else if await AutoShutdownInstaller.printerReachable(baseURL: base),
+                      config.autoShutdownEnabled || config.energyTrackingEnabled {
+                config.autoShutdownEnabled = false
+                config.energyTrackingEnabled = false
+                onSave(config)
+            }
+        }
+        .onAppear {
+            // Load the stored password up front: the SSH section is always
+            // visible now, so it can't rely on the push card doing this.
+            if sshPassword.isEmpty {
+                // Note the !isEmpty: a stored-but-empty entry used to satisfy the
+                // optional binding and leave the field blank, which is how the
+                // U1 default below got skipped and Auto-Shutdown then asked for
+                // a password that looked like it was already there.
+                if let saved = SSHCredentialStore.load(for: config.name), !saved.isEmpty {
+                    sshPassword = saved
+                } else if config.type == .snapmakerU1 {
+                    sshPassword = "snapmaker"      // U1 factory default
+                }
+            }
+            // Saved username first (entered or detected earlier), detection
+            // only when nothing is stored yet.
+            if config.type == .singleNozzle && sshUsername.isEmpty,
+               let saved = SSHUsernameStore.load(for: config.name), !saved.isEmpty {
+                sshUsername = saved
+            }
+            if config.type == .singleNozzle && sshUsername.isEmpty {
+                let host = config.ip
+                    .replacingOccurrences(of: "http://", with: "")
+                    .replacingOccurrences(of: "https://", with: "")
+                    .components(separatedBy: ":").first ?? config.ip
+                Task {
+                    if let u = await SSHInstaller.detectUsername(host: host) {
+                        await MainActor.run {
+                            if sshUsername.isEmpty { sshUsername = u; SSHUsernameStore.save(u, for: config.name) }
+                        }
                     }
                 }
             }
-            .onAppear {
-                // The step is usually already .serverPush before this sheet
-                // appears (set when the printer row was tapped), so onChange
-                // won't fire — scroll here too.
-                if tour.step == .serverPush {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        withAnimation { tourProxy.scrollTo("tourServerPush", anchor: .center) }
-                    }
-                }
+        }
+        .sheet(isPresented: $showEnergySetup) {
+            EnergyTrackingSheet(config: $config, sshUser: sshUsername, sshPassword: sshPassword) { updated in
+                onSave(updated)
             }
+        }
+        .sheet(isPresented: $showAutoShutdown) {
+            AutoShutdownSheet(config: $config, sshUser: sshUsername, sshPassword: sshPassword) { updated in
+                onSave(updated)          // persist without closing the edit screen
             }
-            .collectTourFrames(tour)
-            .overlay { tourServerPushOverlay }
         }
         .sheet(isPresented: $showOctoGuide) {
             OctoEverywhereGuideView(printerType: config.type)
@@ -7875,12 +8454,59 @@ struct PushAutoSetupView: View {
     private var useSudo: Bool { printerType == .singleNozzle }
 
     @State private var sshRunning = false
+    /// nil = not checked yet. The installer registers Moonraker notifiers
+    /// named paxxmaker_*, and those are readable over plain HTTP — so the
+    /// app can tell an already-installed printer from a fresh one instead
+    /// of always offering to set it up.
+    @State private var installedOnPrinter: Bool? = nil
+    /// Version marker from the notifier config. nil while unknown; the empty
+    /// string means the file exists WITHOUT a marker — which can only be an
+    /// install from before the marker existed, so it is outdated by definition.
+    @State private var bridgeVersion: String? = nil
+    /// The bridge version this app build expects the Worker to ship.
+    private let expectedBridgeVersion = paxxmakerExpectedBridgeVersion
     @State private var sshSuccess: Bool? = nil
     @State private var sshResultText: String? = nil
     @State private var sshErrorDetail: String? = nil
     // Note: the install/remove confirmations live in their own child views
     // (PushInstallButton / PushRemoveButton) — dialogs sharing one view or
     // one state in this Form hierarchy got mixed up by SwiftUI.
+
+    private func checkInstalledOnPrinter() async {
+        let base = printerIP.hasPrefix("http") ? printerIP : "http://\(printerIP)"
+        // Bypass the URL cache: right after a re-install the old file (without
+        // the version marker) would otherwise be served again and the
+        // "older version" warning would stay although the install succeeded.
+        func fresh(_ u: URL) -> URLRequest {
+            var r = URLRequest(url: u, timeoutInterval: 10)
+            r.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            return r
+        }
+        guard let url = URL(string: "\(base)/server/config"),
+              let (data, _) = try? await URLSession.shared.data(for: fresh(url)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cfg = (json["result"] as? [String: Any])?["config"] as? [String: Any]
+        else { return }
+        let found = cfg.keys.contains { $0.lowercased().hasPrefix("notifier paxxmaker") }
+        await MainActor.run { installedOnPrinter = found }
+        guard found else { return }
+        // The marker lives in the notifier config, the only file of the install
+        // that Moonraker actually serves. Two possible locations: paxx12 loads
+        // extended/moonraker/*.cfg, standard Klipper gets its own file.
+        for path in ["extended/moonraker/paxxmaker.cfg", "paxxmaker-moonraker.conf"] {
+            guard let u = URL(string: "\(base)/server/files/config/\(path)"),
+                  let (d, r) = try? await URLSession.shared.data(for: fresh(u)),
+                  (r as? HTTPURLResponse)?.statusCode == 200,
+                  let text = String(data: d, encoding: .utf8) else { continue }
+            var version = ""
+            for line in text.split(separator: "\n") where line.contains("paxxmaker-version:") {
+                version = line.split(separator: ":").last?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+            }
+            await MainActor.run { bridgeVersion = version }
+            return
+        }
+    }
 
     private func runSSH(uninstall: Bool) {
         guard !sshPassword.isEmpty else {
@@ -7949,7 +8575,7 @@ struct PushAutoSetupView: View {
                         await MainActor.run { onSecretAdopted(existing) }
                     }
                     // Token VOR der Installation registrieren: die Bridge prueft
-                    // direkt nach dem Start, ob ueberhaupt ein Geraet Push will,
+                    // direkt nach dem Start, ob überhaupt ein Gerät Push will,
                     // und wuerde sich sonst sofort wieder selbst deinstallieren
                     // (die Registrierung beim "Speichern" kaeme zu spaet).
                     if let token = CloudflarePushService.shared.storedDeviceToken {
@@ -7978,6 +8604,15 @@ struct PushAutoSetupView: View {
                         SSHCredentialStore.save(pw, for: pid)
                         SSHUsernameStore.save(user, for: pid)
                     }
+                    if uninstall {
+                        installedOnPrinter = false; bridgeVersion = nil
+                    }
+                }
+                if !uninstall {
+                    // Re-read what is on the printer now so the version note
+                    // reflects the fresh install instead of the previous check.
+                    await MainActor.run { bridgeVersion = nil }
+                    await checkInstalledOnPrinter()
                 }
             } catch {
                 await MainActor.run {
@@ -8000,31 +8635,42 @@ struct PushAutoSetupView: View {
                 .font(.caption).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            // Standard Klipper printers have varying usernames — show a field
-            // (auto-filled from Moonraker). The U1 is always root, so no field.
-            if printerType == .singleNozzle {
-                HStack(spacing: 8) {
-                    Image(systemName: "person.fill").foregroundColor(.secondary).frame(width: 20)
-                    TextField(lz(en: "SSH username", de: "SSH-Benutzername", fr: "Nom d'utilisateur SSH", es: "Usuario SSH", pt: "Usuário SSH", it: "Nome utente SSH", zh: "SSH 用户名"), text: $sshUsername)
-                        .textInputAutocapitalization(.never).disableAutocorrection(true)
+            // Credentials moved to their own "SSH Access" section above — Auto-
+            // Shutdown needs them too, and having them in two places drifted.
+            // Same resolution as runSSH() further down — the plain state can be
+            // empty while a password is stored, and warning then is just wrong.
+            if sshPassword.isEmpty, (SSHCredentialStore.load(for: printerID) ?? "").isEmpty,
+               printerType != .snapmakerU1 {
+                Label(lz(en: "Enter the SSH password under \"SSH Access\" first.",
+                         de: "Bitte zuerst oben unter \"SSH-Zugriff\" das SSH-Passwort eintragen.",
+                         fr: "Saisis d'abord le mot de passe SSH sous « Accès SSH ».",
+                         es: "Introduce primero la contraseña SSH en «Acceso SSH».",
+                         pt: "Insira primeiro a senha SSH em \"Acesso SSH\".",
+                         it: "Inserisci prima la password SSH in «Accesso SSH».",
+                         zh: "请先在\"SSH 访问\"中输入 SSH 密码。"),
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if installedOnPrinter == true {
+                if let v = bridgeVersion, v != expectedBridgeVersion {
+                    // Empty marker = installed before markers existed.
+                    Label(v.isEmpty
+                          ? lz(en: "An older version is installed — please install it again.", de: "Es ist eine ältere Version installiert — bitte neu aufspielen.", fr: "Une version plus ancienne est installée — merci de la réinstaller.", es: "Hay una versión antigua instalada: vuelve a instalarla.", pt: "Há uma versão antiga instalada — instale novamente.", it: "È installata una versione precedente — reinstallala.", zh: "安装的是旧版本——请重新安装。")
+                          : lz(en: "Version \(v) installed, \(expectedBridgeVersion) is available — please install it again.", de: "Version \(v) installiert, \(expectedBridgeVersion) ist verfügbar — bitte neu aufspielen.", fr: "Version \(v) installée, \(expectedBridgeVersion) est disponible — merci de la réinstaller.", es: "Versión \(v) instalada, \(expectedBridgeVersion) está disponible: vuelve a instalarla.", pt: "Versão \(v) instalada, \(expectedBridgeVersion) está disponível — instale novamente.", it: "Versione \(v) installata, \(expectedBridgeVersion) è disponibile — reinstallala.", zh: "已安装版本 \(v)，可用版本为 \(expectedBridgeVersion)——请重新安装。"),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Label(lz(en: "Already set up on this printer.", de: "Auf diesem Drucker bereits eingerichtet.", fr: "Déjà configuré sur cette imprimante.", es: "Ya configurado en esta impresora.", pt: "Já configurado nesta impressora.", it: "Già configurato su questa stampante.", zh: "此打印机上已完成设置。"),
+                          systemImage: "checkmark.circle.fill")
+                        .font(.footnote).foregroundColor(.green)
                 }
-                .padding(10)
-                .background(Color(.systemBackground))
-                .cornerRadius(9)
-                .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.secondary.opacity(0.25), lineWidth: 1))
             }
 
-            HStack(spacing: 8) {
-                Image(systemName: "key.fill").foregroundColor(.secondary).frame(width: 20)
-                SecureField(lz(en: "SSH password", de: "SSH-Passwort", fr: "Mot de passe SSH", es: "Contraseña SSH", pt: "Senha SSH", it: "Password SSH", zh: "SSH 密码"), text: $sshPassword)
-                    .textInputAutocapitalization(.never).disableAutocorrection(true)
-            }
-            .padding(10)
-            .background(Color(.systemBackground))
-            .cornerRadius(9)
-            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.secondary.opacity(0.25), lineWidth: 1))
-
-            PushInstallButton(running: sshRunning) { runSSH(uninstall: false) }
+            PushInstallButton(running: sshRunning,
+                              alreadyInstalled: installedOnPrinter == true) { runSSH(uninstall: false) }
 
             if let ok = sshSuccess, let msg = sshResultText {
                 VStack(alignment: .leading, spacing: 4) {
@@ -8046,6 +8692,7 @@ struct PushAutoSetupView: View {
         .background(Color.gray.opacity(0.06))
         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.gray.opacity(0.22), lineWidth: 1))
         .cornerRadius(14)
+        .task { await checkInstalledOnPrinter() }
         .onAppear {
             if sshPassword.isEmpty, let saved = SSHCredentialStore.load(for: printerID) {
                 sshPassword = saved
@@ -8079,6 +8726,7 @@ struct PushAutoSetupView: View {
 // nothing can get crossed with other dialogs in the surrounding Form.
 private struct PushInstallButton: View {
     let running: Bool
+    var alreadyInstalled: Bool = false
     let action: () -> Void
     @State private var confirm = false
 
@@ -8087,7 +8735,9 @@ private struct PushInstallButton: View {
             HStack(spacing: 6) {
                 if running { ProgressView().tint(.white) }
                 Text(running ? lz(en: "Working…", de: "Wird ausgeführt…", fr: "En cours…", es: "En curso…", pt: "Em andamento…", it: "In corso…", zh: "处理中…")
-                             : lz(en: "Set up now", de: "Jetzt einrichten", fr: "Configurer", es: "Configurar", pt: "Configurar", it: "Configura", zh: "立即设置"))
+                             : alreadyInstalled
+                               ? lz(en: "Reinstall", de: "Neu aufspielen", fr: "Réinstaller", es: "Reinstalar", pt: "Reinstalar", it: "Reinstalla", zh: "重新安装")
+                               : lz(en: "Set up now", de: "Jetzt einrichten", fr: "Configurer", es: "Configurar", pt: "Configurar", it: "Configura", zh: "立即设置"))
             }
             .fontWeight(.semibold)
             .frame(maxWidth: .infinity).padding(.vertical, 12)
@@ -8259,25 +8909,25 @@ struct SmartPlugGuideView: View {
                     // Step 2
                     stepCard(number: 2, icon: "globe", color: .indigo,
                              title: lz(en: "Set up Tuya developer account", de: "Tuya-Entwicklerkonto einrichten", fr: "Configurer le compte développeur Tuya", es: "Configurar cuenta desarrolladora Tuya", pt: "Configurar conta de desenvolvedor Tuya", it: "Configura account sviluppatore Tuya", zh: "设置 Tuya 开发者账户"),
-                             body: lz(en: "Go to iot.tuya.com, sign up and create a Cloud Project. Subscribe to the IoT Core API. Under Devices > Link Tuya App Account, link your SmartLife account. Then note down your API Key (Access ID) and API Secret from the project overview — you will need both for the wizard.", de: "Gehe zu iot.tuya.com, registriere dich und erstelle ein Cloud-Projekt. Abonniere die IoT Core API. Unter Geraete > Tuya-App-Konto verknuepfen dein SmartLife-Konto verknuepfen. Notiere dann den API Key (Access ID) und API Secret aus der Projektübersicht — beides brauchst du fuer den Wizard.", fr: "Allez sur iot.tuya.com, inscrivez-vous et créez un projet Cloud. Abonnez-vous à l'API IoT Core. Dans Appareils > Lier un compte Tuya, liez votre compte SmartLife. Notez ensuite l'API Key (Access ID) et l'API Secret depuis la vue d'ensemble du projet — vous en aurez besoin pour l'assistant.", es: "Ve a iot.tuya.com, regístrate y crea un proyecto Cloud. Suscríbete a la API IoT Core. En Dispositivos > Vincular cuenta Tuya, vincula tu cuenta SmartLife. Anota el API Key (Access ID) y el API Secret desde la vista del proyecto — los necesitarás para el asistente.", pt: "Acesse iot.tuya.com, cadastre-se e crie um Cloud Project. Assine a IoT Core API. Em Devices > Link Tuya App Account, vincule sua conta SmartLife. Depois anote sua API Key (Access ID) e API Secret na visão geral do projeto — você precisará de ambos para o assistente.", it: "Vai su iot.tuya.com, registrati e crea un Cloud Project. Sottoscrivi la IoT Core API. In Devices > Link Tuya App Account, collega il tuo account SmartLife. Poi annota API Key (Access ID) e API Secret dalla panoramica del progetto — ti serviranno entrambi per la procedura guidata.", zh: "前往 iot.tuya.com 注册并创建一个 Cloud Project，订阅 IoT Core API。在 Devices > Link Tuya App Account 中关联您的 SmartLife 账户。然后在项目概览中记下 API Key（Access ID）和 API Secret——向导需要用到这两项。"),
+                             body: lz(en: "Go to iot.tuya.com, sign up and create a Cloud Project. Subscribe to the IoT Core API. Under Devices > Link Tuya App Account, link your SmartLife account. Then note down your API Key (Access ID) and API Secret from the project overview — you will need both for the wizard.", de: "Gehe zu iot.tuya.com, registriere dich und erstelle ein Cloud-Projekt. Abonniere die IoT Core API. Verknüpfe unter Geräte > Tuya-App-Konto verknüpfen dein SmartLife-Konto. Notiere dann den API Key (Access ID) und API Secret aus der Projektübersicht — beides brauchst du für den Wizard.", fr: "Allez sur iot.tuya.com, inscrivez-vous et créez un projet Cloud. Abonnez-vous à l'API IoT Core. Dans Appareils > Lier un compte Tuya, liez votre compte SmartLife. Notez ensuite l'API Key (Access ID) et l'API Secret depuis la vue d'ensemble du projet — vous en aurez besoin pour l'assistant.", es: "Ve a iot.tuya.com, regístrate y crea un proyecto Cloud. Suscríbete a la API IoT Core. En Dispositivos > Vincular cuenta Tuya, vincula tu cuenta SmartLife. Anota el API Key (Access ID) y el API Secret desde la vista del proyecto — los necesitarás para el asistente.", pt: "Acesse iot.tuya.com, cadastre-se e crie um Cloud Project. Assine a IoT Core API. Em Devices > Link Tuya App Account, vincule sua conta SmartLife. Depois anote sua API Key (Access ID) e API Secret na visão geral do projeto — você precisará de ambos para o assistente.", it: "Vai su iot.tuya.com, registrati e crea un Cloud Project. Sottoscrivi la IoT Core API. In Devices > Link Tuya App Account, collega il tuo account SmartLife. Poi annota API Key (Access ID) e API Secret dalla panoramica del progetto — ti serviranno entrambi per la procedura guidata.", zh: "前往 iot.tuya.com 注册并创建一个 Cloud Project，订阅 IoT Core API。在 Devices > Link Tuya App Account 中关联您的 SmartLife 账户。然后在项目概览中记下 API Key（Access ID）和 API Secret——向导需要用到这两项。"),
                              command: nil)
 
                     // Step 3
                     stepCard(number: 3, icon: "wand.and.stars", color: .purple,
                              title: lz(en: "Run the tinytuya wizard", de: "tinytuya-Wizard starten", fr: "Lancer l'assistant tinytuya", es: "Ejecutar el asistente tinytuya", pt: "Executar o assistente tinytuya", it: "Esegui la procedura guidata tinytuya", zh: "运行 tinytuya 向导"),
-                             body: lz(en: "Run the wizard in Terminal. It will ask for: API Key, API Secret, any Device ID (or type \"scan\"), and your region (eu, us, cn, …). It then downloads all device data and saves it to devices.json.", de: "Den Wizard im Terminal starten. Er fragt nach: API Key, API Secret, einer beliebigen Geraete-ID (oder \"scan\" eingeben) und deiner Region (eu, us, cn, …). Anschliessend laedt er alle Gerätedaten herunter und speichert sie in devices.json.", fr: "Lancez l'assistant dans Terminal. Il demandera : API Key, API Secret, un ID appareil quelconque (ou tapez \"scan\") et votre région (eu, us, cn, …). Il télécharge ensuite toutes les données et les enregistre dans devices.json.", es: "Ejecuta el asistente en Terminal. Pedirá: API Key, API Secret, cualquier ID de dispositivo (o escribe \"scan\") y tu región (eu, us, cn, …). Luego descarga todos los datos y los guarda en devices.json.", pt: "Execute o assistente no Terminal. Ele pedirá: API Key, API Secret, qualquer Device ID (ou digite \"scan\") e sua região (eu, us, cn, …). Em seguida, ele baixa todos os dados do dispositivo e os salva em devices.json.", it: "Esegui la procedura guidata nel Terminale. Chiederà: API Key, API Secret, un Device ID qualsiasi (o digita \"scan\") e la tua regione (eu, us, cn, …). Poi scarica tutti i dati del dispositivo e li salva in devices.json.", zh: "在终端中运行向导。它会要求输入：API Key、API Secret、任意设备 ID（或输入 \"scan\"）以及您的地区（eu、us、cn 等）。随后它会下载所有设备数据并保存到 devices.json。"),
+                             body: lz(en: "Run the wizard in Terminal. It will ask for: API Key, API Secret, any Device ID (or type \"scan\"), and your region (eu, us, cn, …). It then downloads all device data and saves it to devices.json.", de: "Den Wizard im Terminal starten. Er fragt nach: API Key, API Secret, einer beliebigen Geräte-ID (oder \"scan\" eingeben) und deiner Region (eu, us, cn, …). Anschließend lädt er alle Gerätedaten herunter und speichert sie in devices.json.", fr: "Lancez l'assistant dans Terminal. Il demandera : API Key, API Secret, un ID appareil quelconque (ou tapez \"scan\") et votre région (eu, us, cn, …). Il télécharge ensuite toutes les données et les enregistre dans devices.json.", es: "Ejecuta el asistente en Terminal. Pedirá: API Key, API Secret, cualquier ID de dispositivo (o escribe \"scan\") y tu región (eu, us, cn, …). Luego descarga todos los datos y los guarda en devices.json.", pt: "Execute o assistente no Terminal. Ele pedirá: API Key, API Secret, qualquer Device ID (ou digite \"scan\") e sua região (eu, us, cn, …). Em seguida, ele baixa todos os dados do dispositivo e os salva em devices.json.", it: "Esegui la procedura guidata nel Terminale. Chiederà: API Key, API Secret, un Device ID qualsiasi (o digita \"scan\") e la tua regione (eu, us, cn, …). Poi scarica tutti i dati del dispositivo e li salva in devices.json.", zh: "在终端中运行向导。它会要求输入：API Key、API Secret、任意设备 ID（或输入 \"scan\"）以及您的地区（eu、us、cn 等）。随后它会下载所有设备数据并保存到 devices.json。"),
                              command: "python3 -m tinytuya wizard")
 
                     // Step 4
                     stepCard(number: 4, icon: "doc.text.magnifyingglass", color: .green,
                              title: lz(en: "Find your device in devices.json", de: "Gerät in devices.json suchen", fr: "Trouver votre appareil dans devices.json", es: "Buscar tu dispositivo en devices.json", pt: "Encontre seu dispositivo em devices.json", it: "Trova il tuo dispositivo in devices.json", zh: "在 devices.json 中查找您的设备"),
-                             body: lz(en: "The wizard creates devices.json in the current folder. Find your plug by name. Copy \"id\" (Device ID, ~20 chars) and \"key\" (Local Key, 16 chars) into the app settings. The \"ip\" field contains the IP address if you chose to scan the network.", de: "Der Wizard erstellt devices.json im aktuellen Ordner. Steckdose anhand des Namens finden. \"id\" (Geraete-ID, ca. 20 Zeichen) und \"key\" (Local Key, 16 Zeichen) in die App-Einstellungen eintragen. Das Feld \"ip\" enthaelt die IP-Adresse, wenn du das Netzwerk gescannt hast.", fr: "L'assistant crée devices.json dans le dossier courant. Trouvez votre prise par son nom. Copiez \"id\" (ID appareil, ~20 cars) et \"key\" (clé locale, 16 cars) dans les réglages. Le champ \"ip\" contient l'adresse IP si vous avez scanné le réseau.", es: "El asistente crea devices.json en la carpeta actual. Busca tu enchufe por nombre. Copia \"id\" (ID de dispositivo, ~20 chars) y \"key\" (clave local, 16 chars) en los ajustes. El campo \"ip\" contiene la IP si escaneaste la red.", pt: "O assistente cria devices.json na pasta atual. Encontre sua tomada pelo nome. Copie \"id\" (Device ID, ~20 caracteres) e \"key\" (Local Key, 16 caracteres) nas configurações do app. O campo \"ip\" contém o endereço IP se você optou por escanear a rede.", it: "La procedura guidata crea devices.json nella cartella corrente. Trova la tua presa per nome. Copia \"id\" (Device ID, ~20 caratteri) e \"key\" (Local Key, 16 caratteri) nelle impostazioni dell'app. Il campo \"ip\" contiene l'indirizzo IP se hai scelto di scansionare la rete.", zh: "向导会在当前文件夹中生成 devices.json。请按名称找到您的插座，将 \"id\"（设备 ID，约 20 位字符）和 \"key\"（Local Key，16 位字符）复制到应用设置中。如果您选择了扫描网络，\"ip\" 字段中会包含 IP 地址。"),
+                             body: lz(en: "The wizard creates devices.json in the current folder. Find your plug by name. Copy \"id\" (Device ID, ~20 chars) and \"key\" (Local Key, 16 chars) into the app settings. The \"ip\" field contains the IP address if you chose to scan the network.", de: "Der Wizard erstellt devices.json im aktuellen Ordner. Steckdose anhand des Namens finden. \"id\" (Geräte-ID, ca. 20 Zeichen) und \"key\" (Local Key, 16 Zeichen) in die App-Einstellungen eintragen. Das Feld \"ip\" enthält die IP-Adresse, wenn du das Netzwerk gescannt hast.", fr: "L'assistant crée devices.json dans le dossier courant. Trouvez votre prise par son nom. Copiez \"id\" (ID appareil, ~20 cars) et \"key\" (clé locale, 16 cars) dans les réglages. Le champ \"ip\" contient l'adresse IP si vous avez scanné le réseau.", es: "El asistente crea devices.json en la carpeta actual. Busca tu enchufe por nombre. Copia \"id\" (ID de dispositivo, ~20 chars) y \"key\" (clave local, 16 chars) en los ajustes. El campo \"ip\" contiene la IP si escaneaste la red.", pt: "O assistente cria devices.json na pasta atual. Encontre sua tomada pelo nome. Copie \"id\" (Device ID, ~20 caracteres) e \"key\" (Local Key, 16 caracteres) nas configurações do app. O campo \"ip\" contém o endereço IP se você optou por escanear a rede.", it: "La procedura guidata crea devices.json nella cartella corrente. Trova la tua presa per nome. Copia \"id\" (Device ID, ~20 caratteri) e \"key\" (Local Key, 16 caratteri) nelle impostazioni dell'app. Il campo \"ip\" contiene l'indirizzo IP se hai scelto di scansionare la rete.", zh: "向导会在当前文件夹中生成 devices.json。请按名称找到您的插座，将 \"id\"（设备 ID，约 20 位字符）和 \"key\"（Local Key，16 位字符）复制到应用设置中。如果您选择了扫描网络，\"ip\" 字段中会包含 IP 地址。"),
                              command: nil)
 
                     // Info row
                     HStack(spacing: 10) {
                         Image(systemName: "info.circle.fill").foregroundColor(.orange)
-                        Text(lz(en: "The Local Key changes if the device is re-linked or the SmartLife account is re-connected. Re-run the wizard if the connection stops working.", de: "Der Local Key aendert sich, wenn das Gerät erneut verknüpft oder das SmartLife-Konto neu verbunden wird. Den Wizard erneut ausfuehren, wenn die Verbindung nicht mehr funktioniert.", fr: "La clé locale change si l'appareil est ré-associé ou le compte SmartLife reconnecté. Relancez l'assistant si la connexion ne fonctionne plus.", es: "La clave local cambia si el dispositivo se vuelve a vincular o la cuenta SmartLife se reconecta. Vuelve a ejecutar el asistente si la conexión deja de funcionar.", pt: "O Local Key muda se o dispositivo for vinculado novamente ou a conta SmartLife for reconectada. Execute o assistente novamente se a conexão parar de funcionar.", it: "Il Local Key cambia se il dispositivo viene ricollegato o l'account SmartLife viene riconnesso. Riesegui la procedura guidata se la connessione smette di funzionare.", zh: "如果设备重新关联或 SmartLife 账户重新连接，Local Key 将会改变。如果连接失效，请重新运行向导。"))
+                        Text(lz(en: "The Local Key changes if the device is re-linked or the SmartLife account is re-connected. Re-run the wizard if the connection stops working.", de: "Der Local Key ändert sich, wenn das Gerät erneut verknüpft oder das SmartLife-Konto neu verbunden wird. Den Wizard erneut ausführen, wenn die Verbindung nicht mehr funktioniert.", fr: "La clé locale change si l'appareil est ré-associé ou le compte SmartLife reconnecté. Relancez l'assistant si la connexion ne fonctionne plus.", es: "La clave local cambia si el dispositivo se vuelve a vincular o la cuenta SmartLife se reconecta. Vuelve a ejecutar el asistente si la conexión deja de funcionar.", pt: "O Local Key muda se o dispositivo for vinculado novamente ou a conta SmartLife for reconectada. Execute o assistente novamente se a conexão parar de funcionar.", it: "Il Local Key cambia se il dispositivo viene ricollegato o l'account SmartLife viene riconnesso. Riesegui la procedura guidata se la connessione smette di funzionare.", zh: "如果设备重新关联或 SmartLife 账户重新连接，Local Key 将会改变。如果连接失效，请重新运行向导。"))
                         .font(.caption).foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     }
@@ -8596,12 +9246,14 @@ struct SmartPlugTileView: View {
                     .font(.caption2)
                     .animation(.easeInOut(duration: 0.25), value: isOn == true)
 
-                    if let w = watts {
-                        Text(String(format: "%.1f W", w))
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                            .transition(.opacity)
-                    }
+                    // Always occupy the line, even before the first reading —
+                    // rendering it only once a value exists made the tile grow a
+                    // row taller a moment after it appeared.
+                    Text(watts.map { String(format: "%.1f W", $0) } ?? " ")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .opacity(watts == nil ? 0 : 1)
+                        .animation(.easeInOut(duration: 0.2), value: watts == nil)
                 }
             }
             .padding(16)
@@ -8977,16 +9629,20 @@ struct OnboardingView: View {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return nil }
         var ptr = ifaddr
-        while ptr != nil {
-            let interface = ptr!.pointee
-            if interface.ifa_addr.pointee.sa_family == UInt8(AF_INET),
+        while let cur = ptr {
+            let interface = cur.pointee
+            // ifa_addr is NULL for interfaces that carry no address — which is
+            // exactly what appears the moment Wi-Fi comes up (AWDL, hotspot and
+            // tunnel interfaces). Dereferencing it crashed the app right there.
+            if let addr = interface.ifa_addr,
+               addr.pointee.sa_family == UInt8(AF_INET),
                String(cString: interface.ifa_name) == "en0" {
                 var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                getnameinfo(addr, socklen_t(addr.pointee.sa_len),
                             &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
                 address = String(cString: hostname)
             }
-            ptr = ptr!.pointee.ifa_next
+            ptr = interface.ifa_next
         }
         freeifaddrs(ifaddr)
         guard let ip = address else { return nil }
@@ -9167,16 +9823,20 @@ struct NetworkScanView: View {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return nil }
         var ptr = ifaddr
-        while ptr != nil {
-            let interface = ptr!.pointee
-            if interface.ifa_addr.pointee.sa_family == UInt8(AF_INET),
+        while let cur = ptr {
+            let interface = cur.pointee
+            // ifa_addr is NULL for interfaces that carry no address — which is
+            // exactly what appears the moment Wi-Fi comes up (AWDL, hotspot and
+            // tunnel interfaces). Dereferencing it crashed the app right there.
+            if let addr = interface.ifa_addr,
+               addr.pointee.sa_family == UInt8(AF_INET),
                String(cString: interface.ifa_name) == "en0" {
                 var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                getnameinfo(addr, socklen_t(addr.pointee.sa_len),
                             &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
                 address = String(cString: hostname)
             }
-            ptr = ptr!.pointee.ifa_next
+            ptr = interface.ifa_next
         }
         freeifaddrs(ifaddr)
         guard let ip = address else { return nil }
@@ -9206,6 +9866,7 @@ class PrinterServicesManager: ObservableObject {
                 existing.smartPlugIP = config.smartPlugIP
                 existing.smartPlugDeviceID = config.smartPlugDeviceID
                 existing.smartPlugLocalKey = config.smartPlugLocalKey
+                existing.energyTrackingEnabled = config.energyTrackingEnabled
                 // Previously only set by the Dashboard view's onAppear, so a
                 // printer never actually opened this session (e.g. right after
                 // launch, before the user swiped to it) kept PrinterService's
@@ -9225,6 +9886,7 @@ class PrinterServicesManager: ObservableObject {
                 svc.smartPlugIP = config.smartPlugIP
                 svc.smartPlugDeviceID = config.smartPlugDeviceID
                 svc.smartPlugLocalKey = config.smartPlugLocalKey
+                svc.energyTrackingEnabled = config.energyTrackingEnabled
                 if let hex = Self.resolveThemeHex(config.themeColor) { svc.themeHex = hex }
                 updated.append(svc)
             }
@@ -9618,21 +10280,14 @@ struct ContentView: View {
     @AppStorage("has_shown_firmware_notice") private var hasShownFirmwareNotice: Bool = false
     @AppStorage("has_selected_language") private var hasSelectedLanguage: Bool = false
     @AppStorage("has_accepted_disclaimer") private var hasAcceptedDisclaimer: Bool = false
-    // Versioned so the one-time feature tour also fires for existing users after
-    // they update to this version. Bump the suffix to re-show it in a future update.
-    @AppStorage("has_seen_feature_tour_1") private var hasSeenFeatureTour: Bool = false
-    // "What's new" popup for the U1 per-nozzle Spoolman update (one-time, own key
-    // so existing users who already saw the old tour still get this one).
-    @AppStorage("has_seen_whatsnew_spoollink_1") private var hasSeenWhatsNewSL: Bool = false
+    @AppStorage("has_seen_whatsnew_runout_1") private var hasSeenWhatsNewSL: Bool = false
     @State private var showWhatsNewSL = false
-    // Release behaviour: the walkthrough fires exactly once (gated by
-    // has_seen_feature_tour_1) and then marks itself as seen. Flip to true only
-    // for repeated testing.
-    private let alwaysShowTourForTesting = false
+    /// Set when the popup's "Update now" is tapped; SettingsView opens
+    /// that printer and clears it again.
+    @AppStorage("pending_push_printer") private var pendingPushPrinter: String = ""
     @State private var showLanguagePicker: Bool = false
     @State private var showFirmwareNotice: Bool = false
     @State private var showDisclaimer: Bool = false
-    @StateObject private var tour = TourGuide()
     // Persisted so relaunching the app returns to the tab that was last open.
     @AppStorage("last_root_tab") private var rootTabSel: String = "main"
     // Persisted so relaunching returns to the printer that was last swiped to.
@@ -9647,65 +10302,17 @@ struct ContentView: View {
         splitscreenMode && horizontalSizeClass == .regular && visiblePrinters.count >= 2
     }
 
-    // Start the guided walkthrough from the printer tab so "tap Settings" makes sense.
-    private func startTour() {
-        rootTabSel = "main"
-        tour.start()
-    }
-
     // Show the one-time "what's new" popup. Unlike the previous one this is not
     // gated on owning a U1: the Spoollink half is U1-only, but the thank-you for
     // the feedback is addressed to everyone.
-    private func maybeShowWhatsNew() {
-        guard settings.hasCompletedOnboarding, !hasSeenWhatsNewSL else { return }
-        showWhatsNewSL = true
-    }
+    // Shows exactly once per update, then marks itself seen. Anyone who taps it
+    // away too quickly finds it again under Settings › What's new.
+    private let whatsNewAlwaysShow = false
 
-    // Root-level coach marks: the intro card and the "tap Settings" step.
-    // (The Spoolman/printer steps live in SettingsView, Server-Push in the sheet.)
-    @ViewBuilder
-    private var tourRootOverlay: some View {
-        switch tour.step {
-        case .intro:
-            ZStack {
-                Color.black.opacity(0.62).ignoresSafeArea()
-                VStack(spacing: 16) {
-                    Image(systemName: "sparkles").font(.system(size: 38)).foregroundColor(.yellow)
-                    Text(lz(en: "What's new", de: "Das ist neu", fr: "Nouveautés", es: "Novedades", pt: "Novidades", it: "Novità", zh: "新功能"))
-                        .font(.title2).bold()
-                    Text(lz(en: "A quick tour shows you where to find the two new features: Spoolman and Server Push.",
-                            de: "Eine kurze Führung zeigt dir, wo du die zwei neuen Funktionen findest: Spoolman und Server-Push.",
-                            fr: "Une visite rapide te montre où trouver les deux nouveautés : Spoolman et le push serveur.",
-                            es: "Un recorrido rápido te muestra dónde están las dos novedades: Spoolman y Push del servidor.",
-                            pt: "Um tour rápido mostra onde encontrar os dois novos recursos: Spoolman e Push do Servidor.",
-                            it: "Un breve tour ti mostra dove trovare le due novità: Spoolman e Push dal Server.",
-                            zh: "快速导览将向你展示两项新功能的位置：Spoolman 和服务器推送。"))
-                        .font(.subheadline).foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button {
-                        rootTabSel = "settings"   // drive to Settings for the next step
-                        withAnimation { tour.advanceFromIntro() }
-                    } label: {
-                        Text(lz(en: "Start", de: "Los geht's", fr: "C'est parti", es: "Empezar", pt: "Começar", it: "Iniziamo", zh: "开始"))
-                            .fontWeight(.semibold).frame(maxWidth: .infinity).padding(.vertical, 12)
-                            .background(Color.accentColor).foregroundColor(.white).cornerRadius(12)
-                    }
-                    .padding(.top, 2)
-                    Button { withAnimation { tour.finish() } } label: {
-                        Text(lz(en: "Skip", de: "Überspringen", fr: "Passer", es: "Omitir", pt: "Pular", it: "Salta", zh: "跳过"))
-                            .font(.footnote).foregroundColor(.secondary)
-                    }
-                }
-                .padding(24)
-                .background(RoundedRectangle(cornerRadius: 16).fill(Color(.secondarySystemBackground)))
-                .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
-                .shadow(color: .black.opacity(0.35), radius: 14)
-                .padding(.horizontal, 30)
-            }
-        default:
-            EmptyView()
-        }
+    private func maybeShowWhatsNew() {
+        guard settings.hasCompletedOnboarding else { return }
+        guard !hasSeenWhatsNewSL || whatsNewAlwaysShow else { return }
+        showWhatsNewSL = true
     }
 
     var body: some View {
@@ -9778,7 +10385,6 @@ struct ContentView: View {
         .environmentObject(langStore)
         .environmentObject(settings)
         .environmentObject(printerServices)
-        .environmentObject(tour)
         .onAppear {
             // Restored tab may no longer exist (its feature was turned off) —
             // fall back to the printer tab so the TabView isn't left blank.
@@ -9806,15 +10412,6 @@ struct ContentView: View {
         .onChange(of: settings.hasCompletedOnboarding) { _, done in
             if done && hasShownFirmwareNotice {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { maybeShowWhatsNew() }
-            }
-        }
-        // When the walkthrough finishes, remember it so it never repeats.
-        .onChange(of: tour.step) { _, s in
-            if s == .finished {
-                if !alwaysShowTourForTesting { hasSeenFeatureTour = true }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    withAnimation { tour.step = .inactive }
-                }
             }
         }
         .sheet(isPresented: $showLanguagePicker) {
@@ -9853,44 +10450,85 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showWhatsNewSL) {
-            WhatsNewSpoollinkView { hasSeenWhatsNewSL = true; showWhatsNewSL = false }
+            // The reinstall note only concerns printers actually on Server Push;
+            // for everyone else it would be a confusing instruction.
+            WhatsNewView(
+                showsServerPushNote: settings.printers.contains { $0.pushMode == .cloudflare },
+                pushPrinterBaseURL: settings.printers.first { $0.pushMode == .cloudflare }?.effectiveBaseURL,
+                onOpenServerPush: {
+                    // Remember which printer, switch to Settings, close the popup —
+                    // SettingsView picks the marker up and opens that printer.
+                    pendingPushPrinter = settings.printers.first { $0.pushMode == .cloudflare }?.name ?? ""
+                    rootTabSel = "settings"
+                    // Deliberately NOT marked as seen: whoever leaves through this
+                    // button never reaches page two, and the request for a rating
+                    // would be lost. It comes back on the next launch.
+                    showWhatsNewSL = false
+                }) {
+                hasSeenWhatsNewSL = true; showWhatsNewSL = false
+            }
         }
-        .overlay { tourRootOverlay }
-        .animation(.easeInOut(duration: 0.25), value: tour.step)
     }
 }
 
 // MARK: - What's New popup (Spoollink + feedback note)
-struct WhatsNewSpoollinkView: View {
+/// Version marker the installer writes into the notifier config — the only file
+/// of a Server Push install that Moonraker serves. "" means the file exists
+/// without a marker, i.e. an install from before markers existed.
+func paxxmakerBridgeVersion(baseURL: String) async -> String? {
+    for path in ["extended/moonraker/paxxmaker.cfg", "paxxmaker-moonraker.conf"] {
+        guard let u = URL(string: "\(baseURL)/server/files/config/\(path)") else { continue }
+        var req = URLRequest(url: u, timeoutInterval: 8)
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        guard let (d, r) = try? await URLSession.shared.data(for: req),
+              (r as? HTTPURLResponse)?.statusCode == 200,
+              let text = String(data: d, encoding: .utf8) else { continue }
+        var version = ""
+        for line in text.split(separator: "\n") where line.contains("paxxmaker-version:") {
+            version = line.split(separator: ":").last?.trimmingCharacters(in: .whitespaces) ?? ""
+        }
+        return version
+    }
+    return nil
+}
+
+let paxxmakerExpectedBridgeVersion = "2.2"
+
+struct WhatsNewView: View {
+    var showsServerPushNote: Bool = false
+    /// Base URL of the printer whose Server Push would be reinstalled — used to
+    /// check whether it is outdated at all.
+    var pushPrinterBaseURL: String? = nil
+    var onOpenServerPush: () -> Void = {}
     var onDismiss: () -> Void
+    /// nil = not checked / unreachable. false means "already current" and is the
+    /// only case in which the box is hidden — an unknown state still warns.
+    @State private var pushOutdated: Bool? = nil
+    /// Two pages: what changed, then the request for a rating. Keeping the ask
+    /// on its own page means it isn't skimmed past together with the news.
+    @State private var page = 1
+    /// Drives the star wave on page two. Set once the page appears so the
+    /// animation runs on arrival rather than silently before it.
+    @State private var starsIn = false
+
     var body: some View {
         VStack(spacing: 0) {
-            // Scrollable so large Dynamic Type can't push the button off-screen.
-            ScrollView {
-            VStack(spacing: 18) {
-            Image(systemName: "link.circle.fill")
-                .font(.system(size: 46)).foregroundColor(.orange).padding(.top, 10)
-            Text(lz(en: "New: SpoolLink", de: "Neu: SpoolLink", fr: "Nouveau : SpoolLink", es: "Nuevo: SpoolLink", pt: "Novo: SpoolLink", it: "Novità: SpoolLink", zh: "新功能：SpoolLink"))
-                .font(.title2).bold().multilineTextAlignment(.center)
-            Text(lz(
-                en: "The app now supports SpoolLink. If you run firmware v1.5.2-paxx12-21 with SpoolLink on your U1, it is picked up automatically — there is nothing to switch on. The “Spools” tile then turns into a SpoolLink tile.\n\nThank you so much for your feedback, I was really happy to read it! I haven’t got round to everything yet, but I’ll be tackling the rest step by step.",
-                de: "Die App unterstützt jetzt SpoolLink. Wer auf dem U1 die Firmware v1.5.2-paxx12-21 mit SpoolLink nutzt, bei dem wird das automatisch erkannt — es muss nichts eingeschaltet werden. Die Kachel „Spulen“ wird dann zur SpoolLink-Kachel.\n\nVielen Dank für euer Feedback, ich habe mich sehr darüber gefreut! Ich bin noch nicht zu allem gekommen, nehme den Rest aber nach und nach in Angriff.",
-                fr: "L’app prend désormais en charge SpoolLink. Si tu utilises le firmware v1.5.2-paxx12-21 avec SpoolLink sur ta U1, il est détecté automatiquement — rien à activer. La tuile « Bobines » devient alors une tuile SpoolLink.\n\nMerci beaucoup pour vos retours, ils m’ont fait très plaisir ! Je n’ai pas encore eu le temps de tout traiter, mais je m’y attelle petit à petit.",
-                es: "La app ya es compatible con SpoolLink. Si usas el firmware v1.5.2-paxx12-21 con SpoolLink en tu U1, se detecta automáticamente: no hay nada que activar. La tarjeta «Bobinas» se convierte entonces en una tarjeta de SpoolLink.\n\n¡Muchas gracias por vuestros comentarios, me han hecho mucha ilusión! Todavía no he podido con todo, pero iré abordando el resto poco a poco.",
-                pt: "O app agora é compatível com o SpoolLink. Se você usa o firmware v1.5.2-paxx12-21 com SpoolLink na sua U1, ele é detectado automaticamente — não há nada para ativar. O bloco “Bobinas” passa então a ser um bloco SpoolLink.\n\nMuito obrigado pelo feedback, fiquei muito feliz com ele! Ainda não consegui fazer tudo, mas vou tratar do resto aos poucos.",
-                it: "L’app ora supporta SpoolLink. Se usi il firmware v1.5.2-paxx12-21 con SpoolLink sulla tua U1, viene rilevato automaticamente: non c’è nulla da attivare. Il riquadro «Bobine» diventa allora un riquadro SpoolLink.\n\nGrazie mille per i vostri riscontri, mi hanno fatto molto piacere! Non sono ancora riuscito a fare tutto, ma affronterò il resto poco a poco.",
-                zh: "应用现已支持 SpoolLink。如果你的 U1 使用带 SpoolLink 的固件 v1.5.2-paxx12-21，应用会自动识别，无需手动开启。“料盘”卡片随之会变成 SpoolLink 卡片。\n\n非常感谢大家的反馈，我看得很开心！有些内容我还没来得及处理，但会逐步完成。"))
-                .font(.subheadline).foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
+            // A ScrollView always claims the full height offered, which made the
+            // sheet full-screen with a lot of empty space. ViewThatFits uses the
+            // plain stack whenever it fits — so the sheet is exactly as tall as
+            // the text — and falls back to the scrollable copy only when it
+            // genuinely doesn't, e.g. at very large Dynamic Type.
+            ViewThatFits(in: .vertical) {
+                currentPage
+                ScrollView { currentPage }
             }
-            .padding(.horizontal, 28)
-            .padding(.top, 28)
-            .padding(.bottom, 20)
-            }   // ScrollView
 
-            Button(action: onDismiss) {
-                Text(lz(en: "Got it", de: "Verstanden", fr: "Compris", es: "Entendido", pt: "Entendi", it: "Ho capito", zh: "知道了"))
+            Button {
+                if page == 1 { withAnimation { page = 2 } } else { onDismiss() }
+            } label: {
+                Text(page == 1
+                     ? lz(en: "Got it", de: "Verstanden", fr: "Compris", es: "Entendido", pt: "Entendi", it: "Ho capito", zh: "知道了")
+                     : "OK")
                     .fontWeight(.semibold).frame(maxWidth: .infinity).padding(.vertical, 13)
                     .background(Color.accentColor).foregroundColor(.white).cornerRadius(12)
             }
@@ -9898,7 +10536,129 @@ struct WhatsNewSpoollinkView: View {
             .padding(.bottom, 24)
             .background(Color(.systemBackground))
         }
-        .presentationDetents([.medium, .large])
+        .task {
+            // Only warn when the printer really has an older bridge. Unreachable
+            // stays "unknown" and keeps the box — better one hint too many than
+            // a missed reinstall.
+            guard showsServerPushNote, let base = pushPrinterBaseURL else { return }
+            if let v = await paxxmakerBridgeVersion(baseURL: base) {
+                await MainActor.run { pushOutdated = (v != paxxmakerExpectedBridgeVersion) }
+            }
+        }
+        // Sheet height follows the content instead of filling the screen.
+        .presentationSizing(.fitted)
+    }
+
+    @ViewBuilder
+    private var currentPage: some View {
+        if page == 1 { textBlock } else { ratingPage }
+    }
+
+    private var ratingPage: some View {
+            VStack(spacing: 18) {
+                HStack(spacing: 10) {
+                    ForEach(0..<5, id: \.self) { i in
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 34))
+                            .foregroundStyle(
+                                LinearGradient(colors: [Color(red: 1.0, green: 0.84, blue: 0.25),
+                                                        Color(red: 1.0, green: 0.65, blue: 0.0)],
+                                               startPoint: .top, endPoint: .bottom))
+                            .scaleEffect(starsIn ? 1 : 0.2)
+                            .opacity(starsIn ? 1 : 0)
+                            .offset(y: starsIn ? 0 : 18)
+                            .rotationEffect(.degrees(starsIn ? 0 : -25))
+                            // The stagger is what makes it read as a wave rather
+                            // than five things appearing at once.
+                            .animation(.spring(response: 0.45, dampingFraction: 0.55)
+                                        .delay(Double(i) * 0.11), value: starsIn)
+                    }
+                }
+                .padding(.top, 10)
+                .onAppear { starsIn = true }
+                Text(lz(
+                    en: "If you like the app, I'd be really happy about a good App Store rating — it only takes a few seconds and means a lot.",
+                    de: "Wenn dir die App gefällt, freue ich mich sehr über eine gute Bewertung im App Store — das dauert nur ein paar Sekunden, bedeutet mir aber viel.",
+                    fr: "Si l'app te plaît, une bonne note sur l'App Store me ferait très plaisir — ça ne prend que quelques secondes et compte beaucoup pour moi.",
+                    es: "Si te gusta la app, me alegraría mucho una buena valoración en el App Store: solo lleva unos segundos y significa mucho para mí.",
+                    pt: "Se você gosta do app, ficaria muito feliz com uma boa avaliação na App Store — leva só alguns segundos e significa muito para mim.",
+                    it: "Se l'app ti piace, mi farebbe molto piacere una buona recensione sull'App Store — bastano pochi secondi e per me conta tanto.",
+                    zh: "如果你喜欢这款应用，欢迎在 App Store 给个好评——只需几秒钟，对我意义很大。"))
+                    .font(.subheadline).foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // action=write-review opens the review sheet straight away
+                // instead of dropping the user on the store page.
+                Link(destination: URL(string: "https://apps.apple.com/app/id6770208998?action=write-review")!) {
+                    Label(lz(en: "Write a review", de: "Zur App-Bewertung", fr: "Laisser un avis", es: "Escribir una valoración", pt: "Avaliar o app", it: "Scrivi una recensione", zh: "去评价"),
+                          systemImage: "star.fill")
+                        .font(.subheadline.weight(.semibold))
+                }
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 28)
+            .padding(.bottom, 20)
+    }
+
+    private var textBlock: some View {
+            VStack(spacing: 18) {
+            Image(systemName: "bell.badge.fill")
+                .font(.system(size: 46)).foregroundColor(.orange).padding(.top, 10)
+            Text(lz(en: "New: filament notification, Auto Shutdown & costs", de: "Neu: Filament-Benachrichtigung, Auto-Shutdown & Kosten", fr: "Nouveau : alerte filament, arrêt automatique et coûts", es: "Nuevo: aviso de filamento, apagado automático y costes", pt: "Novo: aviso de filamento, desligamento automático e custos", it: "Novità: avviso filamento, spegnimento automatico e costi", zh: "新功能：耗材通知、自动关机与费用"))
+                .font(.title2).bold().multilineTextAlignment(.center)
+            Text(lz(
+                en: "Push notifications now tell a pause apart from an empty spool — on multi-nozzle printers including which nozzle it is.\n\nSmart plug: the printer switches it off by itself once a print is done — with an adjustable delay, and optionally after a cancel too. It also measures the power consumption of every print and, together with the filament used, works out what it cost — priced from your Spoolman spool or straight from the slicer profile in the G-code. New tile “Last Print Cost” with a tap-through history. Settings › My Printers › Printer › Smart Plug.\n\nYou can also choose which progress the app shows: the slicer’s estimate, or the same number as the printer’s display. Settings › Extra Features › Progress.",
+                de: "Push-Benachrichtigungen unterscheiden jetzt zwischen einer Pause und leerem Filament — beim Multi-Nozzle-Drucker mit Angabe der betroffenen Nozzle.\n\nSmart-Steckdose: Der Drucker schaltet sie nach dem Druck selbst ab — mit einstellbarer Verzögerung und auf Wunsch auch nach einem Abbruch. Außerdem misst er den Stromverbrauch jedes Drucks und rechnet zusammen mit dem verbrauchten Filament aus, was er gekostet hat — bepreist über deine Spoolman-Spule oder direkt aus dem Slicer-Profil im G-Code. Neue Kachel „Kosten letzter Druck“ mit antippbarem Verlauf. Einstellungen › Meine Drucker › Drucker › Smart-Steckdose.\n\nAußerdem kannst du jetzt selbst wählen, welchen Fortschritt die App anzeigt: die Schätzung des Slicers oder dieselbe Zahl wie das Druckerdisplay. Einstellungen › Zusatzfunktionen › Fortschritt.",
+                fr: "Les notifications push distinguent désormais une pause d’une bobine vide — sur les imprimantes multi-buses avec la buse concernée.\n\nPrise intelligente : l'imprimante la coupe elle-même une fois l'impression terminée — avec un délai réglable, et si tu veux aussi après une annulation. Elle mesure aussi la consommation de chaque impression et, avec le filament utilisé, calcule ce qu'elle a coûté — au prix de ta bobine Spoolman ou directement du profil du slicer dans le G-code. Nouvelle tuile « Coût dernière impression » avec historique. Réglages › Mes imprimantes › Imprimante › Prise intelligente.\n\nTu peux aussi choisir la progression affichée : l’estimation du slicer ou le même chiffre que l’écran de l’imprimante. Réglages › Fonctions supplémentaires › Progression.",
+                es: "Las notificaciones push ahora distinguen una pausa de una bobina vacía — en impresoras multiboquilla, indicando la boquilla afectada.\n\nEnchufe inteligente: la impresora lo apaga sola al terminar la impresión, con retardo ajustable y, si quieres, también tras una cancelación. Además mide el consumo de cada impresión y, junto con el filamento usado, calcula lo que costó — con el precio de tu bobina en Spoolman o directamente del perfil del slicer en el G-code. Nueva tarjeta «Coste última impresión» con historial. Ajustes › Mis impresoras › Impresora › Enchufe inteligente.\n\nAdemás puedes elegir qué progreso muestra la app: la estimación del slicer o el mismo número que la pantalla de la impresora. Ajustes › Funciones adicionales › Progreso.",
+                pt: "As notificações push agora distinguem uma pausa de uma bobina vazia — em impressoras multibico, indicando qual bico.\n\nTomada inteligente: a impressora a desliga sozinha ao terminar a impressão, com atraso ajustável e, se quiser, também após um cancelamento. Ela também mede o consumo de cada impressão e, junto com o filamento usado, calcula quanto custou — com o preço da sua bobina no Spoolman ou direto do perfil do fatiador no G-code. Novo bloco “Custo da última impressão” com histórico. Ajustes › Minhas impressoras › Impressora › Tomada inteligente.\n\nVocê também pode escolher qual progresso o app mostra: a estimativa do slicer ou o mesmo número do visor da impressora. Ajustes › Funções adicionais › Progresso.",
+                it: "Le notifiche push ora distinguono una pausa da una bobina esaurita — sulle stampanti multiugello indicando quale ugello.\n\nPresa intelligente: la stampante la spegne da sola a stampa finita, con ritardo regolabile e, se vuoi, anche dopo un annullamento. Misura inoltre il consumo di ogni stampa e, insieme al filamento usato, calcola quanto è costata — al prezzo della tua bobina Spoolman o direttamente dal profilo dello slicer nel G-code. Nuovo riquadro «Costo ultima stampa» con cronologia. Impostazioni › Le mie stampanti › Stampante › Presa intelligente.\n\nPuoi inoltre scegliere quale avanzamento mostra l’app: la stima dello slicer o lo stesso numero del display della stampante. Impostazioni › Funzioni aggiuntive › Avanzamento.",
+                zh: "推送通知现在能区分“暂停”和“耗材用尽”——多喷嘴打印机还会指明是哪个喷嘴。\n\n智能插座：打印完成后，打印机会自行关闭它——延迟时间可调，也可选择在取消打印后关闭。它还会测量每次打印的耗电量，并结合所用耗材算出费用——价格来自你的 Spoolman 料盘或直接来自 G-code 中的切片配置。新增“上次打印费用”磁贴，可点击查看记录。设置 › 我的打印机 › 打印机 › 智能插座。\n\n你还可以自行选择应用显示哪种进度：切片软件的估算，或与打印机屏幕一致的数值。设置 › 附加功能 › 进度。"))
+                .font(.subheadline).foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Only for printers actually running Server Push — the others have
+            // nothing to reinstall and the instruction would only confuse.
+            if showsServerPushNote, pushOutdated != false {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text(lz(en: "Action needed", de: "Aktion nötig", fr: "Action requise", es: "Acción necesaria", pt: "Ação necessária", it: "Azione necessaria", zh: "需要操作"))
+                            .font(.subheadline).bold()
+                    }
+                    Text(lz(
+                        en: "To use this feature, Server Push has to be installed on the printer again.",
+                        de: "Um diese Funktion zu nutzen, muss Server-Push auf dem Drucker neu aufgespielt werden.",
+                        fr: "Pour utiliser cette fonction, le Push serveur doit etre reinstalle sur l'imprimante.",
+                        es: "Para usar esta funcion hay que volver a instalar el Push servidor en la impresora.",
+                        pt: "Para usar este recurso, o Push do Servidor precisa ser instalado novamente na impressora.",
+                        it: "Per usare questa funzione il Push dal Server va reinstallato sulla stampante.",
+                        zh: "要使用此功能，需要在打印机上重新安装服务器推送。"))
+                        .font(.subheadline)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    // A button instead of a route to follow: the user is three
+                    // screens away from the thing they need to tap.
+                    Button { onOpenServerPush() } label: {
+                        Label(lz(en: "Update now", de: "Jetzt updaten", fr: "Mettre a jour", es: "Actualizar ahora", pt: "Atualizar agora", it: "Aggiorna ora", zh: "立即更新"),
+                              systemImage: "arrow.up.circle.fill")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .padding(.top, 2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange.opacity(0.12)))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.orange.opacity(0.45), lineWidth: 1))
+            }
+
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 28)
+            .padding(.bottom, 20)
     }
 }
 

@@ -601,6 +601,12 @@ struct SpoollinkSheet: View {
     @AppStorage("spoolman_url") private var spoolmanURL: String = ""
 
     @State private var spools: [SpoolmanSpool] = []
+    /// False while Spoolman could not be reached. The card UID comes from the
+    /// PRINTER and shows up regardless, so without this the sheet would claim
+    /// "not linked" for spools that are perfectly linked — and tapping it would
+    /// overwrite a correct link. The Spoolman address is a per-device setting,
+    /// so this happens on a second device that has not been set up yet.
+    @State private var spoolsLoaded = false
     @State private var pickChannel: SpoollinkChannelBox? = nil
     @State private var linkChannel: SpoollinkChannelBox? = nil
     @State private var busy = false
@@ -734,7 +740,10 @@ struct SpoollinkSheet: View {
                                 HStack {
                                     Text(lz(en: "Material", de: "Material", fr: "Matériau", es: "Material", pt: "Material", it: "Materiale", zh: "材料"))
                                     Spacer()
-                                    if let l = linked {
+                                    if !spoolsLoaded {
+                                        Text(lz(en: "Spoolman unreachable", de: "Spoolman nicht erreichbar", fr: "Spoolman injoignable", es: "Spoolman no accesible", pt: "Spoolman inacessível", it: "Spoolman non raggiungibile", zh: "无法连接 Spoolman"))
+                                            .foregroundStyle(.secondary).lineLimit(1)
+                                    } else if let l = linked {
                                         // Once linked, showing the spool's colour
                                         // here is helpful rather than redundant.
                                         ColorDot(hex: l.filament.color_hex, size: 14)
@@ -743,11 +752,13 @@ struct SpoollinkSheet: View {
                                         Text(lz(en: "link", de: "verknüpfen", fr: "lier", es: "vincular", pt: "vincular", it: "collega", zh: "关联"))
                                             .foregroundStyle(.orange)
                                     }
-                                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                                    if spoolsLoaded {
+                                        Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                                    }
                                 }
                             }
                             .buttonStyle(.plain)
-                            .disabled(busy)
+                            .disabled(busy || !spoolsLoaded)
                         }
 
                         // Last row of the nozzle: unlinks the tag, clears the assignment and
@@ -844,15 +855,7 @@ struct SpoollinkSheet: View {
             pt: "“Ler etiquetas” relê a etiqueta RFID de cada canal. Vincular uma etiqueta a uma bobina faz a atribuição segui-la, mesmo trocando de bico.",
             it: "«Leggi i tag» rilegge il tag RFID di ogni canale. Collegare un tag a una bobina fa seguire l'assegnazione a quella bobina, anche cambiando ugello.",
             zh: "“读取料盘标签”会重新读取各通道的 RFID 标签。将标签关联到料盘后，分配会跟随该料盘，换到其他喷嘴也一样。")
-        guard !printer.spoollinkCommandsReady else { return base }
-        return base + "\n\n" + lz(
-            en: "This firmware has no manual assignment command (SET_SPOOL_ID), so linking the tag is the way to assign a spool.",
-            de: "Diese Firmware kennt keinen Befehl zur manuellen Zuweisung (SET_SPOOL_ID) — die Zuweisung läuft deshalb über das Verknüpfen des Tags.",
-            fr: "Ce firmware n'a pas de commande d'attribution manuelle (SET_SPOOL_ID) : l'attribution passe donc par le tag.",
-            es: "Este firmware no tiene comando de asignación manual (SET_SPOOL_ID); la asignación se hace vinculando la etiqueta.",
-            pt: "Este firmware não tem comando de atribuição manual (SET_SPOOL_ID); a atribuição é feita vinculando a etiqueta.",
-            it: "Questo firmware non ha un comando di assegnazione manuale (SET_SPOOL_ID): l'assegnazione avviene collegando il tag.",
-            zh: "此固件没有手动分配命令（SET_SPOOL_ID），因此通过关联标签来分配料盘。")
+        return base
     }
 
     // One comparison line: what the tag says vs what the printer has loaded.
@@ -887,7 +890,7 @@ struct SpoollinkSheet: View {
     private func loadSpools() async {
         guard let svc = SpoolmanService(rawHost: spoolmanURL) else { return }
         if let list = try? await svc.spools(includeArchived: false) {
-            await MainActor.run { self.spools = list }
+            await MainActor.run { self.spools = list; self.spoolsLoaded = true }
             await MainActor.run { printer.refreshSpoolCardIndex() }
         }
     }

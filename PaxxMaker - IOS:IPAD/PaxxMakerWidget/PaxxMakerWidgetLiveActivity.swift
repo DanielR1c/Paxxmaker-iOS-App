@@ -17,7 +17,7 @@ struct PaxxMakerWidgetLiveActivity: Widget {
                         .padding(.leading, 4)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    Text("\(Int(context.state.progress * 100))%")
+                    Text("\(Int(context.state.shownProgress * 100))%")
                         .font(.system(size: 13, weight: .bold))
                         .foregroundStyle(stateColor(context.state.printState))
                         .monospacedDigit()
@@ -29,7 +29,7 @@ struct PaxxMakerWidgetLiveActivity: Widget {
                             Capsule().fill(.secondary.opacity(0.18)).frame(height: 4)
                             Capsule()
                                 .fill(stateColor(context.state.printState))
-                                .frame(width: max(4, geo.size.width * context.state.progress), height: 4)
+                                .frame(width: max(4, geo.size.width * context.state.shownProgress), height: 4)
                         }
                     }
                     .frame(height: 4)
@@ -41,7 +41,7 @@ struct PaxxMakerWidgetLiveActivity: Widget {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(stateColor(context.state.printState))
             } compactTrailing: {
-                Text("\(Int(context.state.progress * 100))%")
+                Text("\(Int(context.state.shownProgress * 100))%")
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(stateColor(context.state.printState))
                     .monospacedDigit()
@@ -76,7 +76,7 @@ private struct LiveActivityBannerView: View {
     }
 
     private var etaString: String {
-        let p = context.state.progress
+        let p = context.state.shownProgress
         let elapsed = context.state.timeElapsed
         guard p > 0.02, elapsed > 0 else { return "" }
         let remaining = Int(Double(elapsed) / p * (1.0 - p))
@@ -98,7 +98,7 @@ private struct LiveActivityBannerView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(.white)
                 Spacer()
-                Text("\(Int(context.state.progress * 100))%")
+                Text("\(Int(context.state.shownProgress * 100))%")
                     .font(.system(size: 20, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
                     .monospacedDigit()
@@ -111,7 +111,7 @@ private struct LiveActivityBannerView: View {
                         .frame(height: 6)
                     Capsule()
                         .fill(stateColor)
-                        .frame(width: max(6, geo.size.width * context.state.progress), height: 6)
+                        .frame(width: max(6, geo.size.width * context.state.shownProgress), height: 6)
                 }
             }
             .frame(height: 6)

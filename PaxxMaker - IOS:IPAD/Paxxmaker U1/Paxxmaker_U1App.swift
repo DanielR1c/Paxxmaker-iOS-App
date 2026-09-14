@@ -118,6 +118,8 @@ class PhoneConnectivityManager: NSObject, WCSessionDelegate {
                 // The Watch has no access to the phone's app group, so ship the
                 // chosen app language along — otherwise it uses the system one.
                 reply["lang"] = UserDefaults.standard.string(forKey: "app_language") ?? "en"
+                // Same reason: which progress source to use is a phone setting.
+                reply["progressUseFile"] = UserDefaults.standard.bool(forKey: "progress_use_file")
                 if let cfgData = defaults.data(forKey: "watch_printer_configs") {
                     reply["configs"] = cfgData
                 }
@@ -346,6 +348,56 @@ struct Paxxmaker_U1App: App {
         LAPollingSession.shared.scheduleNext(configs: printingConfigs, delay: 0)
     }
 
+    /// Why did the printer pause? Returns the 1-based nozzle whose filament ran
+    /// out, 0 for a runout on a single-nozzle machine, nil when the cause is
+    /// something else (M600, manual pause) — then the wording stays neutral.
+    /// Asked only ON a pause and as its own small query: folding
+    /// print_task_config into the status query risks the U1 truncating it.
+    private func runoutNozzle(baseURL: String, apiKey: String, name: String, multiNozzle: Bool) async -> Int?? {
+        guard let url = URL(string: "\(baseURL)/printer/objects/query?print_task_config") else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 6)
+        if !apiKey.isEmpty { req.setValue(apiKey, forHTTPHeaderField: "X-Api-Key") }
+        // The U1 answers this with an empty body every so often; a single miss
+        // used to turn every runout into a plain "paused".
+        var cfg: [String: Any]? = nil
+        for attempt in 0..<3 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 400_000_000) }
+            if let (data, _) = try? await URLSession.shared.data(for: req),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let c = ((json["result"] as? [String: Any])?["status"] as? [String: Any])?["print_task_config"] as? [String: Any] {
+                cfg = c
+                break
+            }
+        }
+        guard let cfg else { return nil }
+        // A runout wipes everything about that channel (type, vendor, spool id
+        // all go to NONE/0), so a single sample cannot tell it from a channel
+        // that was never loaded. The foreground records which channels were
+        // seen occupied during this print; use that.
+        let exist = cfg["filament_exist"] as? [Bool] ?? []
+        let seen = UserDefaults(suiteName: "group.paxxmaker.u1")?
+            .array(forKey: "ever_occupied_\(name)") as? [Bool] ?? []
+        for (i, present) in exist.enumerated() where !present {
+            if i < seen.count && seen[i] { return .some(multiNozzle ? i + 1 : 0) }
+        }
+        return nil
+    }
+
+    /// Byte range of the actual print gcode. Background wakes are rare, so this
+    /// is fetched fresh each cycle rather than cached across launches.
+    private func gcodeRange(baseURL: String, apiKey: String, filename: String) async -> (Double, Double)? {
+        guard let enc = filename.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(baseURL)/server/files/metadata?filename=\(enc)") else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 6)
+        if !apiKey.isEmpty { req.setValue(apiKey, forHTTPHeaderField: "X-Api-Key") }
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let r = json["result"] as? [String: Any],
+              let a = r["gcode_start_byte"] as? Double,
+              let b = r["gcode_end_byte"] as? Double else { return nil }
+        return (a, b)
+    }
+
     private func checkPrinterStatesInBackground(rescheduleURLSession: Bool = false) async {
         schedulePrinterStatusCheck()
 
@@ -371,9 +423,29 @@ struct Paxxmaker_U1App: App {
             let prevState = states[config.id] ?? "unknown"
             states[config.id] = newState
 
+            // This drives the Live Activity while the app polls in the
+            // background, so it has to follow the SAME two rules as the
+            // foreground app — otherwise the lock screen disagrees with the
+            // dashboard as soon as push is off and the app polls instead.
+            let elapsedRaw = ps["print_duration"] as? Double ?? 0
             let dispProg = (status["display_status"] as? [String: Any])?["progress"] as? Double
-            let progress = dispProg ?? (status["virtual_sdcard"] as? [String: Any])?["progress"] as? Double ?? 0.0
-            let timeElapsed = (ps["print_duration"] as? Double).map { Int($0) } ?? 0
+            let vsd      = status["virtual_sdcard"] as? [String: Any] ?? [:]
+            let vsdProg  = vsd["progress"] as? Double ?? 0.0
+            let useFile  = UserDefaults.standard.bool(forKey: "progress_use_file")
+            // Same range-based reading as the foreground app: only the bytes
+            // between gcode_start_byte and gcode_end_byte count, which is what
+            // the printer's own display measures.
+            var fileProg = vsdProg
+            let fname = ps["filename"] as? String ?? ""
+            if useFile, !fname.isEmpty, let pos = vsd["file_position"] as? Double,
+               let range = await gcodeRange(baseURL: config.baseURL, apiKey: config.apiKey, filename: fname),
+               range.1 > range.0 {
+                fileProg = min(1, max(0, (pos - range.0) / (range.1 - range.0)))
+            }
+            var progress = useFile ? fileProg : (dispProg ?? vsdProg)
+            // Klipper holds print_duration at 0 through levelling/calibration.
+            if elapsedRaw <= 0 { progress = 0 }
+            let timeElapsed = Int(elapsedRaw)
             let liveState   = PaxxMakerWidgetAttributes.ContentState(
                 printState: newState, progress: progress,
                 extruderTemp: 0, bedTemp: 0, timeElapsed: timeElapsed
@@ -447,6 +519,39 @@ struct Paxxmaker_U1App: App {
                     content.sound = .default
                     try? await UNUserNotificationCenter.current().add(
                         UNNotificationRequest(identifier: "print-err-\(config.name)", content: content, trigger: nil))
+                } else if prevState == "printing" && newState == "paused" {
+                    // Name the cause when the printer reveals it: a nozzle this
+                    // print uses reports no filament. Otherwise (M600, manual
+                    // pause) the wording stays neutral rather than guessing.
+                    let multi = (status["extruder1"] as? [String: Any]) != nil
+                    let runout = await runoutNozzle(baseURL: config.baseURL, apiKey: config.apiKey, name: config.name, multiNozzle: multi)
+                    let content = UNMutableNotificationContent()
+                    if let nozzle = runout ?? nil {
+                        // Nozzle named right after the material, matching the
+                        // server push wording. Index only on multi-nozzle
+                        // printers — "Nozzle 1" on an Ender would be noise.
+                        content.title = nozzle > 0
+                            ? lz(en: "Filament Nozzle \(nozzle) empty", de: "Filament Nozzle \(nozzle) leer", fr: "Filament buse \(nozzle) épuisé", es: "Filamento boquilla \(nozzle) agotado", pt: "Filamento bico \(nozzle) esgotado", it: "Filamento ugello \(nozzle) esaurito", zh: "喷嘴 \(nozzle) 耗材用尽")
+                            : lz(en: "Filament runout", de: "Filament leer", fr: "Filament épuisé", es: "Filamento agotado", pt: "Filamento esgotado", it: "Filamento esaurito", zh: "耗材用尽")
+                        content.body = config.name
+                    } else {
+                        content.title = lz(en: "Print paused", de: "Druck pausiert", fr: "Impression en pause", es: "Impresión en pausa", pt: "Impressão pausada", it: "Stampa in pausa", zh: "打印已暂停")
+                        content.body = config.name
+                    }
+                    content.sound = .default
+                    try? await UNUserNotificationCenter.current().add(
+                        UNNotificationRequest(identifier: "print-paused-\(config.name)", content: content, trigger: nil))
+                } else if (prevState == "printing" || prevState == "paused")
+                            && (newState == "cancelled" || newState == "standby") {
+                    // Stopping a print was not announced here at all. Klipper
+                    // reports "cancelled"; some firmwares drop straight back to
+                    // "standby", so both count.
+                    let content = UNMutableNotificationContent()
+                    content.title = lz(en: "Print cancelled", de: "Druck abgebrochen", fr: "Impression annulée", es: "Impresión cancelada", pt: "Impressão cancelada", it: "Stampa annullata", zh: "打印已取消")
+                    content.body = config.name
+                    content.sound = .default
+                    try? await UNUserNotificationCenter.current().add(
+                        UNNotificationRequest(identifier: "print-cancelled-\(config.name)", content: content, trigger: nil))
                 }
             }
 

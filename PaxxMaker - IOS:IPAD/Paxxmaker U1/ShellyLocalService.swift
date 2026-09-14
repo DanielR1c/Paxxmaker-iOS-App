@@ -11,8 +11,11 @@ import Foundation
 enum ShellyLocalService {
 
     static func getStatus(host: String) async throws -> PlugStatus {
-        if let result = try? await gen1Status(host: host) { return result }
-        return try await gen2Status(host: host)
+        // Gen2 first: Gen2+ devices also answer the Gen1 /relay/0 call (for
+        // compatibility) but have no /meter/0 — asked Gen1-first they reported
+        // on/off without any wattage. A Gen1 device 404s on /rpc and falls through.
+        if let result = try? await gen2Status(host: host) { return result }
+        return try await gen1Status(host: host)
     }
 
     static func setPower(_ on: Bool, host: String) async throws {
@@ -28,8 +31,9 @@ enum ShellyLocalService {
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw ShellyError.badStatus }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let ison = json["ison"] as? Bool else { throw ShellyError.parseFailure }
-        // Try to get power from /meter/0
-        let watts = try? await gen1Meter(host: host)
+        // Power lives in /meter/0; older firmware only exposes it via /status.
+        var watts = try? await gen1Meter(host: host)
+        if watts == nil { watts = try? await gen1StatusMeter(host: host) }
         return PlugStatus(power: ison, watts: watts)
     }
 
@@ -40,6 +44,18 @@ enum ShellyLocalService {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw ShellyError.parseFailure }
         if let w = json["power"] as? Double { return w }
         if let w = json["power"] as? Int    { return Double(w) }
+        throw ShellyError.parseFailure
+    }
+
+    private static func gen1StatusMeter(host: String) async throws -> Double {
+        let url = try localURL("http://\(host)/status")
+        let (data, resp) = try await session.data(from: url)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw ShellyError.badStatus }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let meters = json["meters"] as? [[String: Any]], let m = meters.first
+        else { throw ShellyError.parseFailure }
+        if let w = m["power"] as? Double { return w }
+        if let w = m["power"] as? Int    { return Double(w) }
         throw ShellyError.parseFailure
     }
 

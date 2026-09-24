@@ -1,6 +1,6 @@
 ## Version 2.4 (Beta)
 
-The beta now includes Paxxmaker-Slicer. If you'd like to try it, install [PaxxMaker-Connect](https://github.com/DanielR1c/PaxxMaker-Connect) and join the beta team in [TestFlight](https://testflight.apple.com).
+The beta now includes Paxxmaker-Slicer. If you'd like to try it, install [PaxxMaker-Connect](https://github.com/DanielR1c/PaxxMaker-Connect) and join the beta team in [TestFlight](https://testflight.apple.com/join/buYCzVWP).
 
 ---
 

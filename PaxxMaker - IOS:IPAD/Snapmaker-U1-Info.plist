@@ -23,7 +23,20 @@
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>PaxxMaker steuert deine Smart-Steckdosen direkt über dein lokales Netzwerk und ruft ihren Status ab.</string>
+	<string>PaxxMaker steuert deine Smart-Steckdosen direkt über dein lokales Netzwerk, ruft ihren Status ab und findet PaxxMaker-Connect auf deinem Mac.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Zum Scannen des QR-Codes von PaxxMaker-Connect auf dem Mac.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key><string>com.paxxmaker.u1</string>
+			<key>CFBundleURLSchemes</key><array><string>paxxmaker</string></array>
+		</dict>
+	</array>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_paxxconnect._tcp</string>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>

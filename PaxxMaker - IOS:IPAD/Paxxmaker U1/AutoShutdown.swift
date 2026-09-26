@@ -1136,7 +1136,11 @@ def main():
     ok_n = fail_n = 0        # wattage reads this print — for the log and the record
     last_status = 0          # when the status file was last refreshed
     finfo = None             # slicer filament numbers for the running file
-    spools = {}              # tool index -> Spoolman spool id seen while printing
+    spools = {}              # channel -> FIRST Spoolman spool id seen while printing
+    cur_spool = {}           # channel -> spool id loaded right now (may change mid-print)
+    usage = {}               # channel -> {spool id -> mm extruded from it}
+    spool_infos = {}         # spool id -> Spoolman description (all spools seen)
+    last_mm = None           # filament_used at the previous sample
 
     while running:
         # Re-read the settings when the app has uploaded a new file. Without
@@ -1171,7 +1175,7 @@ def main():
             if started:
                 wh, last_sample, ok_n, fail_n = 0.0, None, 0, 0
                 job = {"file": filename, "started": int(time.time())}
-                finfo, spools = None, {}
+                finfo, spools, cur_spool, usage, spool_infos, last_mm = None, {}, {}, {}, {}, None
                 if track:
                     log.info("Verbrauchszaehlung gestartet fuer %s", filename)
                     finfo = file_filament_info(filename)
@@ -1180,7 +1184,11 @@ def main():
                     job["channels"] = channel_info()
                     job["map"] = extruder_map()
                     spools = spoolman_channel_map()        # full table first …
+                    cur_spool = dict(spools)
                     job["channels"] = enrich_channels(job["channels"], spools)
+                    for c in job["channels"]:
+                        if c.get("spool_id"):
+                            spool_infos[c["spool_id"]] = c
                     log.info("Kanalbelegung: %s, Zuordnung Tool->Kanal: %s",
                              [c["type"] for c in job["channels"]], job["map"])
 
@@ -1197,6 +1205,16 @@ def main():
                 late = {ch: sid for ch, sid in spools.items() if sid not in known}
                 if late:
                     job["channels"] = enrich_channels(job.get("channels") or [], late)
+                    for c in job["channels"]:
+                        if c.get("spool_id"):
+                            spool_infos[c["spool_id"]] = c
+                # Spools that only came in mid-print need their description too.
+                for per in usage.values():
+                    for s_id in per:
+                        if s_id and s_id not in spool_infos:
+                            info = spoolman_spool(s_id)
+                            if info:
+                                spool_infos[s_id] = info
                 used_mm = float(st.get("filament_mm") or 0)
                 grams, tools_g = filament_grams(finfo, used_mm)
                 log.info("Verbrauch %s: %.1f Wh (%d Messwerte, %d Lesefehler), Filament %.0f mm = %.1f g, Spulen %s",
@@ -1222,6 +1240,9 @@ def main():
                     "extruder_map": extruder_map() or (job or {}).get("map") or [],
                     "filament_slicer_price_kg": finfo.get("price_kg") or [],
                     "spools": {str(k): v for k, v in spools.items()},
+                    "spool_usage_mm": {str(ch): {str(s_id): round(mm, 1) for s_id, mm in per.items()}
+                                       for ch, per in usage.items()},
+                    "spool_infos": {str(s_id): info for s_id, info in spool_infos.items()},
                 }, keep=int(cfg.get("keep", ENERGY_KEEP) or 0))
                 # The tile only needs the newest print: hand it over in the
                 # small status file so it never has to fetch the whole log.
@@ -1255,15 +1276,29 @@ def main():
         if track and state in ("printing", "paused"):
             # Remember which spool fed which nozzle — Moonraker's active spool
             # follows the tool changes, so sampling it maps tool -> spool.
+            tool = int(st.get("tool") or 0)
             sid = active_spool_id()                    # … sampling only fills gaps
+            table = spoolman_channel_map()
             if sid:
-                spools.setdefault(int(st.get("tool") or 0), sid)
-            # The channel table is often complete only after the first one or
-            # two tool changes — keep re-reading it through the print and fill
-            # in whatever is still missing.
-            if ok_n % 6 == 0:
-                for ch, sid in spoolman_channel_map().items():
-                    spools.setdefault(ch, sid)
+                table.setdefault(tool, sid)
+            # Re-read every sample: the table is often complete only after the
+            # first tool changes, and a spool swapped MID-PRINT (empty spool,
+            # new one assigned) must be charged from that moment on.
+            # Filament extruded since the last sample came from the spool that
+            # was loaded UNTIL now — book it before taking over a swap.
+            # (0 = no spool known for that head.)
+            mm_now = float(st.get("filament_mm") or 0)
+            if last_mm is not None and mm_now > last_mm:
+                per = usage.setdefault(tool, {})
+                key = cur_spool.get(tool, 0)
+                per[key] = per.get(key, 0.0) + (mm_now - last_mm)
+            last_mm = mm_now
+            for ch, s_id in table.items():
+                spools.setdefault(ch, s_id)
+                if cur_spool.get(ch) != s_id:
+                    if cur_spool.get(ch):
+                        log.info("Kanal %d: Spule %s -> %s gewechselt", ch + 1, cur_spool.get(ch), s_id)
+                    cur_spool[ch] = s_id
             w = plug_watts(cfg)
             if w is None:
                 # A Tuya plug takes one connection at a time; the app polling

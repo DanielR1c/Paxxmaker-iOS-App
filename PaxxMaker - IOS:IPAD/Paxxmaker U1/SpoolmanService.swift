@@ -16,10 +16,32 @@ enum SpoolmanError: LocalizedError {
         switch self {
         case .notConfigured:      return lz(en: "Spoolman URL not set", de: "Spoolman-Adresse nicht gesetzt", fr: "Adresse Spoolman non définie", es: "Dirección de Spoolman no configurada", pt: "Endereço do Spoolman não definido", it: "Indirizzo Spoolman non impostato", zh: "未设置 Spoolman 地址")
         case .badURL:             return lz(en: "Invalid Spoolman URL", de: "Ungültige Spoolman-Adresse", fr: "Adresse Spoolman invalide", es: "Dirección de Spoolman no válida", pt: "Endereço do Spoolman inválido", it: "Indirizzo Spoolman non valido", zh: "Spoolman 地址无效")
-        case .http(let c, let m): return "HTTP \(c)\(m.isEmpty ? "" : ": \(m)")"
+        case .http(let c, let m): return SpoolmanError.httpText(c) + (m.isEmpty ? "" : " " + m)
         case .transport(let m):   return m
         case .decoding(let m):    return m
         }
+    }
+}
+
+extension SpoolmanError {
+    /// A number alone says nothing — name what happened and keep the number.
+    static func httpText(_ code: Int) -> String {
+        let meaning: String
+        switch code {
+        case 0:
+            meaning = lz(en: "Spoolman did not answer", de: "Spoolman hat nicht geantwortet", fr: "Spoolman n'a pas répondu", es: "Spoolman no respondió", pt: "O Spoolman não respondeu", it: "Spoolman non ha risposto", zh: "Spoolman 没有回应")
+        case 401, 403:
+            meaning = lz(en: "Spoolman refused the access", de: "Spoolman hat den Zugriff verweigert", fr: "Spoolman a refusé l'accès", es: "Spoolman denegó el acceso", pt: "O Spoolman recusou o acesso", it: "Spoolman ha negato l'accesso", zh: "Spoolman 拒绝了访问")
+        case 404:
+            meaning = lz(en: "Spoolman does not know this spool or address", de: "Spoolman kennt diese Spule oder Adresse nicht", fr: "Spoolman ne connaît pas cette bobine ou adresse", es: "Spoolman no conoce esta bobina o dirección", pt: "O Spoolman não conhece esta bobina ou endereço", it: "Spoolman non conosce questa bobina o indirizzo", zh: "Spoolman 不认识该线轴或地址")
+        case 409, 422:
+            meaning = lz(en: "Spoolman did not accept the entry", de: "Spoolman hat den Eintrag nicht angenommen", fr: "Spoolman n'a pas accepté l'entrée", es: "Spoolman no aceptó la entrada", pt: "O Spoolman não aceitou o registo", it: "Spoolman non ha accettato la voce", zh: "Spoolman 未接受该条目")
+        case 500...599:
+            meaning = lz(en: "something went wrong inside Spoolman", de: "in Spoolman ist etwas schiefgegangen", fr: "un problème est survenu dans Spoolman", es: "algo falló dentro de Spoolman", pt: "algo correu mal dentro do Spoolman", it: "qualcosa è andato storto in Spoolman", zh: "Spoolman 内部出错")
+        default:
+            meaning = lz(en: "Spoolman refused the request", de: "Spoolman hat die Anfrage abgelehnt", fr: "Spoolman a refusé la requête", es: "Spoolman rechazó la petición", pt: "O Spoolman recusou o pedido", it: "Spoolman ha rifiutato la richiesta", zh: "Spoolman 拒绝了该请求")
+        }
+        return meaning.prefix(1).uppercased() + meaning.dropFirst() + " (HTTP \(code))."
     }
 }
 

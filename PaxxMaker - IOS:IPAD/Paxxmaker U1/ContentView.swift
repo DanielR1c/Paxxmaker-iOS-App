@@ -1035,6 +1035,9 @@ class PrinterService: ObservableObject {
     // True when the shown status comes from the Live Activity push (printer LAN
     // unreachable), not a live LAN connection — used to hide the "LIVE" badge.
     @Published var isViaLiveActivity: Bool = false
+    /// Input lock: the dashboard's control tiles ignore touches (the printer
+    /// screen keeps mirroring). Kept per printer across launches.
+    @Published var inputLocked: Bool = false { didSet { UserDefaults.standard.set(inputLocked, forKey: "input_lock_\(name)") } }
     // Spoolman (via Moonraker) — set when the printer's Moonraker has the
     // [spoolman] component connected; activeSpoolId is the spool it deducts from.
     // Cached per printer: once Spoolman has been seen, the tile keeps showing
@@ -1059,9 +1062,11 @@ class PrinterService: ObservableObject {
     // missing (filament tag detection switched off in the firmware config).
     @Published var spoollinkCommandsReady: Bool = true
     @Published var slotCardUIDs: [String] = ["", "", "", ""]   // RFID card UID per channel
-    @Published var slotMaterials: [String] = ["", "", "", ""]
-    @Published var slotVendors: [String] = ["", "", "", ""]
-    @Published var slotColorHexes: [String] = ["", "", "", ""]   // RRGGBB per channel
+    // Cached like the spool tile, so painting and the G-code preview show the
+    // last loaded colours while the printer is off.
+    @Published var slotMaterials: [String] = ["", "", "", ""] { didSet { cacheChannelInfo() } }
+    @Published var slotVendors: [String] = ["", "", "", ""] { didSet { cacheChannelInfo() } }
+    @Published var slotColorHexes: [String] = ["", "", "", ""] { didSet { cacheChannelInfo() } }   // RRGGBB per channel
     @Published var slotSubtypes: [String] = ["", "", "", ""]
     // What the RFID tag itself reports (may differ from the loaded config).
     @Published var tagVendors: [String] = ["", "", "", ""]
@@ -1099,6 +1104,17 @@ class PrinterService: ObservableObject {
         let uid = (slotCardUIDs[safe: ch] ?? "").uppercased()
         guard !uid.isEmpty else { return }
         relinkCardUID(uid, to: spoolId, channel: ch)
+    }
+
+    /// A tag read with the PHONE (no printer involved): give its UID to the
+    /// chosen spool in Spoolman. If that tag currently sits in one of the
+    /// printer's channels, that channel follows right away.
+    func linkCardUID(_ uid: String, to spoolId: Int) {
+        let u = uid.uppercased()
+        if let ch = slotCardUIDs.firstIndex(where: { $0.uppercased() == u }) {
+            assignSpool(channel: ch, spoolId: spoolId)
+        }
+        relinkCardUID(u, to: spoolId, channel: nil)
     }
 
     /// spoollink keeps a copy of the resolved spool per card UID in
@@ -1497,6 +1513,12 @@ class PrinterService: ObservableObject {
         // starts; a live 404 will clear it again.
         self.spoolmanConnected = UserDefaults.standard.bool(forKey: "spoolman_connected_\(name)")
         self.spoolmanAvailable = UserDefaults.standard.object(forKey: "spoolman_available_\(name)") as? Bool ?? self.spoolmanConnected
+        // A tag linked from the Spoolman window (no printer chosen there):
+        // every printer takes it over — its channel and its spoollink cache.
+        NotificationCenter.default.addObserver(forName: .paxxCardUIDLinked, object: nil, queue: .main) { [weak self] n in
+            guard let self, let uid = n.userInfo?["uid"] as? String, let sid = n.userInfo?["spool"] as? Int else { return }
+            self.linkCardUID(uid, to: sid)
+        }
         self.fwSpoolLink = UserDefaults.standard.bool(forKey: "fw_spoollink_\(name)")
         self.spoollinkAvailable = UserDefaults.standard.bool(forKey: "spoollink_avail_\(name)")
         // Same for the other conditionally-visible tiles, so the dashboard keeps
@@ -1514,6 +1536,7 @@ class PrinterService: ObservableObject {
         self.totalPrintTime = ud.double(forKey: "stats_time_\(name)")
         self.totalFilamentUsedMm = ud.double(forKey: "stats_fil_\(name)")
         self.longestPrintTime = ud.double(forKey: "stats_longest_\(name)")
+        self.inputLocked = ud.bool(forKey: "input_lock_\(name)")
         if let data = ud.data(forKey: "slots_\(name)"),
            let cache = try? JSONDecoder().decode([SlotCache].self, from: data), cache.count == 4 {
             self.filamentSlots = cache.map {
@@ -1521,10 +1544,23 @@ class PrinterService: ObservableObject {
                              colorHex: $0.colorHex, material: $0.material, detected: $0.detected)
             }
         }
+        if let data = ud.data(forKey: "channels_\(name)"),
+           let c = try? JSONDecoder().decode([String: [String]].self, from: data),
+           let cols = c["cols"], let mats = c["mats"], let vends = c["vends"], cols.count == 4, mats.count == 4, vends.count == 4 {
+            self.slotColorHexes = cols; self.slotMaterials = mats; self.slotVendors = vends
+        }
         loadUserCamRotations()
         startPolling()
     }
     deinit { timer?.invalidate(); spoolTimer?.invalidate(); laObserverTask?.cancel() }
+
+    private func cacheChannelInfo() {
+        guard slotColorHexes.count == 4, slotMaterials.count == 4, slotVendors.count == 4,
+              slotColorHexes.contains(where: { !$0.isEmpty }) || slotMaterials.contains(where: { !$0.isEmpty }) else { return }
+        if let data = try? JSONEncoder().encode(["cols": slotColorHexes, "mats": slotMaterials, "vends": slotVendors]) {
+            UserDefaults.standard.set(data, forKey: "channels_\(name)")
+        }
+    }
 
     var offlineSinceLabel: String {
         guard let date = lastSeenDate else {
@@ -2406,6 +2442,17 @@ class PrinterService: ObservableObject {
                 }
                 if let fan = status["fan"] as? [String: Any] {
                     self.updateIfChanged(\.fanSpeed, fan["speed"] as? Double ?? 0.0)
+                }
+                // Klipper's axis limits are the TRAVEL (U1 reports 271×335,
+                // an Ender 251×230), not the printable area — kept only as the
+                // upper bound for the bed size field in the slicer tab.
+                if let th = status["toolhead"] as? [String: Any],
+                   let mx = th["axis_maximum"] as? [Double], mx.count >= 3,
+                   let mn = th["axis_minimum"] as? [Double], mn.count >= 3, mx[0] > mn[0], mx[1] > mn[1] {
+                    let size = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]]
+                    if UserDefaults.standard.array(forKey: "axis_travel_\(self.name)") as? [Double] != size {
+                        UserDefaults.standard.set(size, forKey: "axis_travel_\(self.name)")
+                    }
                 }
                 if let th = status["toolhead"] as? [String: Any],
                    let activeKey = th["extruder"] as? String {
@@ -4863,7 +4910,21 @@ struct DashboardView: View {
                     }
                 }
             }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                // Input lock: closed = the control tiles and the printer screen
+                // take no touches, so nothing gets sent by accident. Sits next
+                // to the settings button, well away from the emergency stop.
+                Button {
+                    haptic(printer.inputLocked ? .light : .medium)
+                    withAnimation(.easeInOut(duration: 0.2)) { printer.inputLocked.toggle() }
+                } label: {
+                    Image(systemName: printer.inputLocked ? "lock.fill" : "lock.open")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(printer.inputLocked ? .orange : .primary)
+                }
+                .accessibilityLabel(printer.inputLocked
+                    ? lz(en: "Unlock input", de: "Eingabe entsperren", fr: "Déverrouiller la saisie", es: "Desbloquear entrada", pt: "Desbloquear entrada", it: "Sblocca input", zh: "解锁输入")
+                    : lz(en: "Lock input", de: "Eingabe sperren", fr: "Verrouiller la saisie", es: "Bloquear entrada", pt: "Bloquear entrada", it: "Blocca input", zh: "锁定输入"))
                 if isEditMode {
                     Button(lz(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo", pt: "Concluído", it: "Fatto", zh: "完成")) {
                         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { isEditMode = false }
@@ -4956,15 +5017,28 @@ struct DashboardView: View {
 
     @ViewBuilder
     func tileView(for item: DashboardItem) -> some View {
+        let locked = printer.inputLocked && !isEditMode
         if item.isSpacerItem {
             Color.clear
                 .frame(maxWidth: .infinity, minHeight: 80)
         } else if let gid = item.customGroupID {
-            customGroupTile(groupID: gid)
+            customGroupTile(groupID: gid).disabled(locked).opacity(locked ? 0.6 : 1)
         } else if let tile = item.asStaticTile {
-            staticTileView(for: tile)
+            if tile == .screen {
+                // Keeps mirroring the real display, just takes no touches.
+                staticTileView(for: tile).allowsHitTesting(!locked)
+            } else if Self.lockableTiles.contains(tile) {
+                staticTileView(for: tile).disabled(locked).opacity(locked ? 0.6 : 1)
+            } else {
+                staticTileView(for: tile)
+            }
         }
     }
+
+    /// Tiles with controls that reach the printer (pause/stop, speed & flow,
+    /// head attach, temperatures, M600, filament, cleaning, calibration …).
+    /// Webcams, statistics and spool info stay usable while locked.
+    private static let lockableTiles: Set<DashboardTile> = [.status, .extruder, .bed, .chamber, .preheat, .filament, .cleaning, .calibration, .speed, .smartPlug]
 
     func deleteSpacerItem(_ item: DashboardItem) {
         var items = allTileItems
@@ -6045,9 +6119,102 @@ struct FilesView: View {
     @State private var showCopyResult = false
     @State private var showTypeMismatchWarning = false
     @State private var pendingCopyTarget: PrinterService? = nil
+    // G-code preview of a file on the printer, drawn like the slicer's.
+    @State private var previewLoading: PrinterFile? = nil
+    @State private var preview: GCodePreviewItem? = nil
+    struct GCodePreviewItem: Identifiable { let id = UUID(); let file: PrinterFile; let data: Data }
 
     var otherServices: [PrinterService] {
         allServices.filter { $0.baseURL != printer.baseURL }
+    }
+
+    private var previewLabel: String { lz(en: "Preview", de: "Vorschau", fr: "Aperçu", es: "Vista previa", pt: "Pré-visualização", it: "Anteprima", zh: "预览") }
+
+    // One file of the list. Row, context menu and swipe buttons are separate
+    // builders: in one expression the type checker gives up.
+    @ViewBuilder private func fileRow(_ file: PrinterFile) -> some View {
+        HStack(spacing: 10) {
+            if let thumbURL = printer.fileThumbnails[file.filename] {
+                AsyncImage(url: thumbURL) { img in
+                    img.resizable().aspectRatio(contentMode: .fill)
+                } placeholder: {
+                    Color.secondary.opacity(0.15)
+                }
+                .frame(width: 52, height: 52)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(file.displayName).font(.subheadline).bold().lineLimit(1)
+                HStack {
+                    Label(file.formattedSize, systemImage: "doc").font(.caption).foregroundColor(.secondary)
+                    Spacer()
+                    Text(file.formattedDate).font(.caption).foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .background(.ultraThinMaterial)
+        .cornerRadius(12)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.2), lineWidth: 1))
+        .contextMenu { fileContextMenu(file) }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) { fileSwipeButtons(file) }
+    }
+
+    @ViewBuilder private func fileContextMenu(_ file: PrinterFile) -> some View {
+        Button { fileToStart = file } label: {
+            Label(lz(en: "Print", de: "Drucken", fr: "Imprimer", es: "Imprimir", pt: "Imprimir", it: "Stampa", zh: "打印"), systemImage: "play.fill")
+        }
+        Button { openPreview(file) } label: { Label(previewLabel, systemImage: "cube.transparent") }
+        if !otherServices.isEmpty {
+            if otherServices.count == 1 {
+                Button {
+                    requestCopy(file, to: otherServices[0])
+                } label: {
+                    Label(lz(en: "Send to \(otherServices[0].name)", de: "Senden an \(otherServices[0].name)", fr: "Envoyer à \(otherServices[0].name)", es: "Enviar a \(otherServices[0].name)", pt: "Enviar para \(otherServices[0].name)", it: "Invia a \(otherServices[0].name)", zh: "发送到 \(otherServices[0].name)"), systemImage: "arrow.right.circle")
+                }
+            } else {
+                Button {
+                    fileToCopy = file
+                    showCopyPicker = true
+                } label: {
+                    Label(lz(en: "Send to printer…", de: "Senden an Drucker…", fr: "Envoyer à imprimante…", es: "Enviar a impresora…", pt: "Enviar para a impressora…", it: "Invia alla stampante…", zh: "发送到打印机…"), systemImage: "arrow.right.circle")
+                }
+            }
+        }
+        Divider()
+        Button(role: .destructive) { fileToDelete = file } label: {
+            Label(lz(en: "Delete", de: "Löschen", fr: "Supprimer", es: "Eliminar", pt: "Excluir", it: "Elimina", zh: "删除"), systemImage: "trash")
+        }
+    }
+
+    @ViewBuilder private func fileSwipeButtons(_ file: PrinterFile) -> some View {
+        Button(role: .destructive) { fileToDelete = file } label: { Label(lz(en: "Delete", de: "Löschen", fr: "Supprimer", es: "Eliminar", pt: "Excluir", it: "Elimina", zh: "删除"), systemImage: "trash") }
+        Button { fileToStart = file } label: { Label(lz(en: "Print", de: "Drucken", fr: "Imprimer", es: "Imprimir", pt: "Imprimir", it: "Stampa", zh: "打印"), systemImage: "play.fill") }.tint(.green)
+        Button { openPreview(file) } label: { Label(previewLabel, systemImage: "cube.transparent") }.tint(.blue)
+    }
+
+    /// The G-code viewer for a file on the printer; "Print" starts it right away.
+    private func previewView(_ item: GCodePreviewItem) -> some View {
+        let cfg = PrinterConfig(name: printer.name, ip: printer.baseURL, type: printer.printerType)
+        let colours: [String] = printer.printerType == .snapmakerU1 ? printer.slotColorHexes : [printer.singleNozzleFilamentColorHex]
+        return GCodePreviewView(gcode: item.data, bed: BedSize.for(cfg), printerName: printer.name,
+                                toolColorHexes: colours, printerService: printer, offerSendOnly: false) { _ in
+            printer.startPrint(filename: item.file.filename)
+        }
+    }
+
+    private func openPreview(_ file: PrinterFile) {
+        previewLoading = file
+        printer.downloadFileData(filename: file.filename) { data in
+            previewLoading = nil
+            if let data, !data.isEmpty {
+                preview = GCodePreviewItem(file: file, data: data)
+            } else {
+                copyResultMessage = lz(en: "Could not load the G-code from the printer.", de: "Der G-Code konnte nicht vom Drucker geladen werden.", fr: "Impossible de charger le G-code depuis l'imprimante.", es: "No se pudo cargar el G-code de la impresora.", pt: "Não foi possível carregar o G-code da impressora.", it: "Impossibile caricare il G-code dalla stampante.", zh: "无法从打印机加载 G-code。")
+                showCopyResult = true
+            }
+        }
     }
 
     func copyFile(_ file: PrinterFile, to target: PrinterService) {
@@ -6113,62 +6280,10 @@ struct FilesView: View {
             } else {
                 List {
                     ForEach(filteredFiles) { file in
-                        HStack(spacing: 10) {
-                            if let thumbURL = printer.fileThumbnails[file.filename] {
-                                AsyncImage(url: thumbURL) { img in
-                                    img.resizable().aspectRatio(contentMode: .fill)
-                                } placeholder: {
-                                    Color.secondary.opacity(0.15)
-                                }
-                                .frame(width: 52, height: 52)
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                            }
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(file.displayName).font(.subheadline).bold().lineLimit(1)
-                                HStack {
-                                    Label(file.formattedSize, systemImage: "doc").font(.caption).foregroundColor(.secondary)
-                                    Spacer()
-                                    Text(file.formattedDate).font(.caption).foregroundColor(.secondary)
-                                }
-                            }
-                        }
-                        .padding(.vertical, 8)
-                        .padding(.horizontal, 12)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(12)
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.2), lineWidth: 1))
-                        .contextMenu {
-                            Button { fileToStart = file } label: {
-                                Label(lz(en: "Print", de: "Drucken", fr: "Imprimer", es: "Imprimir", pt: "Imprimir", it: "Stampa", zh: "打印"), systemImage: "play.fill")
-                            }
-                            if !otherServices.isEmpty {
-                                if otherServices.count == 1 {
-                                    Button {
-                                        requestCopy(file, to: otherServices[0])
-                                    } label: {
-                                        Label(lz(en: "Send to \(otherServices[0].name)", de: "Senden an \(otherServices[0].name)", fr: "Envoyer à \(otherServices[0].name)", es: "Enviar a \(otherServices[0].name)", pt: "Enviar para \(otherServices[0].name)", it: "Invia a \(otherServices[0].name)", zh: "发送到 \(otherServices[0].name)"), systemImage: "arrow.right.circle")
-                                    }
-                                } else {
-                                    Button {
-                                        fileToCopy = file
-                                        showCopyPicker = true
-                                    } label: {
-                                        Label(lz(en: "Send to printer…", de: "Senden an Drucker…", fr: "Envoyer à imprimante…", es: "Enviar a impresora…", pt: "Enviar para a impressora…", it: "Invia alla stampante…", zh: "发送到打印机…"), systemImage: "arrow.right.circle")
-                                    }
-                                }
-                            }
-                            Divider()
-                            Button(role: .destructive) { fileToDelete = file } label: {
-                                Label(lz(en: "Delete", de: "Löschen", fr: "Supprimer", es: "Eliminar", pt: "Excluir", it: "Elimina", zh: "删除"), systemImage: "trash")
-                            }
-                        }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button(role: .destructive) { fileToDelete = file } label: { Label(lz(en: "Delete", de: "Löschen", fr: "Supprimer", es: "Eliminar", pt: "Excluir", it: "Elimina", zh: "删除"), systemImage: "trash") }
-                            Button { fileToStart = file } label: { Label(lz(en: "Print", de: "Drucken", fr: "Imprimer", es: "Imprimir", pt: "Imprimir", it: "Stampa", zh: "打印"), systemImage: "play.fill") }.tint(.green)
-                        }
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+                        fileRow(file)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
                     }
                 }
                 .listStyle(.plain)
@@ -6183,8 +6298,10 @@ struct FilesView: View {
         } message: { Text("\(fileToDelete?.displayName ?? "") \(lz(en: "really delete?", de: "wirklich löschen?", fr: "vraiment supprimer ?", es: "¿realmente eliminar?", pt: "excluir mesmo?", it: "eliminare davvero?", zh: "确定删除？"))") }
         .alert(lz(en: "Start Print?", de: "Druck starten?", fr: "Lancer l'impression ?", es: "¿Iniciar impresión?", pt: "Iniciar impressão?", it: "Avviare la stampa?", zh: "开始打印？"), isPresented: Binding(get: { fileToStart != nil }, set: { if !$0 { fileToStart = nil } })) {
             Button(lz(en: "Start", de: "Starten", fr: "Démarrer", es: "Iniciar", pt: "Iniciar", it: "Avvia", zh: "开始")) { if let f = fileToStart { printer.startPrint(filename: f.filename) }; fileToStart = nil }
+            Button(previewLabel) { if let f = fileToStart { openPreview(f) }; fileToStart = nil }
             Button(lz(en: "Cancel", de: "Abbrechen", fr: "Annuler", es: "Cancelar", pt: "Cancelar", it: "Annulla", zh: "取消"), role: .cancel) { fileToStart = nil }
         } message: { Text("\(fileToStart?.displayName ?? "") \(lz(en: "start printing?", de: "drucken?", fr: "lancer ?", es: "¿imprimir?", pt: "iniciar impressão?", it: "avviare la stampa?", zh: "开始打印？"))") }
+        .fullScreenCover(item: $preview) { item in previewView(item) }
         .alert(lz(en: "Result", de: "Ergebnis", fr: "Résultat", es: "Resultado", pt: "Resultado", it: "Risultato", zh: "结果"), isPresented: $showCopyResult) {
             Button("OK", role: .cancel) { copyResultMessage = nil }
         } message: { Text(copyResultMessage ?? "") }
@@ -6232,12 +6349,13 @@ struct FilesView: View {
             .presentationDetents([.medium])
         }
         .overlay {
-            if isCopying {
+            if isCopying || previewLoading != nil {
                 ZStack {
                     Color.black.opacity(0.35).ignoresSafeArea()
                     VStack(spacing: 16) {
                         ProgressView().scaleEffect(1.4).tint(.white)
-                        Text(lz(en: "Copying…", de: "Kopieren…", fr: "Copie en cours…", es: "Copiando…", pt: "Copiando…", it: "Copia in corso…", zh: "正在复制…"))
+                        Text(isCopying ? lz(en: "Copying…", de: "Kopieren…", fr: "Copie en cours…", es: "Copiando…", pt: "Copiando…", it: "Copia in corso…", zh: "正在复制…")
+                                       : lz(en: "Loading G-code…", de: "G-Code wird geladen…", fr: "Chargement du G-code…", es: "Cargando G-code…", pt: "Carregando G-code…", it: "Carico il G-code…", zh: "正在加载 G-code…"))
                             .font(.subheadline).foregroundColor(.white)
                     }
                     .padding(32)
@@ -6267,7 +6385,11 @@ struct PrintControlView: View {
     var printerID: String = ""
     var themeColorKey: String = "blue"
     var allServices: [PrinterService] = []
+    // Restored per printer on relaunch (Dashboard / Files / Klipper / …), like
+    // the root tab and the printer page already are. A plain @State reset to
+    // the dashboard every time the app was closed.
     @State private var selectedTab = 0
+    @State private var restoredTab = false
     @State private var hideTopPicker = false
     @AppStorage("expert_mode_enabled") private var expertModeEnabled: Bool = false
     @AppStorage("show_timelapse_tab") private var showTimelapseTab: Bool = true
@@ -6299,7 +6421,21 @@ struct PrintControlView: View {
                             Text(lz(en: "Config", de: "Konfiguration", fr: "Config", es: "Config", pt: "Configuração", it: "Configurazione", zh: "配置")).tag(4)
                         }
                     }
-                    .pickerStyle(.segmented).padding()
+                    .pickerStyle(.segmented)
+                    // Tight under the title bar so the tiles get the room.
+                    .padding(.horizontal).padding(.top, 2).padding(.bottom, 8)
+                    .onAppear {
+                        guard !restoredTab else { return }
+                        restoredTab = true
+                        let saved = UserDefaults.standard.integer(forKey: "last_subtab_\(printerID)")
+                        // Only a tab that still exists (its feature may have been switched off).
+                        let ok = saved == 0 || saved == 1 || (saved == 2 && showKlipperTab)
+                            || (saved == 3 && showTimelapseTab) || (saved == 4 && showFirmwareTab)
+                        if ok { selectedTab = saved }
+                    }
+                    .onChange(of: selectedTab) { _, v in
+                        UserDefaults.standard.set(v, forKey: "last_subtab_\(printerID)")
+                    }
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
                 if selectedTab == 0 { DashboardView(printer: printerService, printerID: printerID) }
@@ -6345,22 +6481,75 @@ struct PrintControlView: View {
                 }
                 .ignoresSafeArea()
             )
-            .navigationTitle(printerService.name)
-            .navigationBarTitleDisplayMode(.inline)
+            .modifier(PrinterTitle(printer: printerService))
             .toolbarBackground(.hidden, for: .navigationBar)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    HStack {
-                        Text(printerService.name)
-                            .font(.system(size: 20, weight: .bold))
-                        Spacer()
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
         }
         .navigationViewStyle(.stack)
         .tint(themeColor)
+    }
+}
+
+/// Printer name in the bar as before (20 pt bold, the orange lock line
+/// underneath while locked) — but centred on the SCREEN. A principal item is
+/// only centred between the bar buttons, and the right side has two of them;
+/// so the view measures where it landed and shifts itself to the middle.
+struct PrinterTitle: ViewModifier {
+    @ObservedObject var printer: PrinterService
+    func body(content: Content) -> some View {
+        content
+            .navigationTitle(printer.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) { PrinterTitleView(printer: printer) }
+            }
+    }
+}
+
+struct PrinterTitleView: View {
+    @ObservedObject var printer: PrinterService
+    @AppStorage("app_language") private var appLanguage: String = "en"
+
+    var body: some View {
+        // The iPad's bar is wide enough that the two buttons on the right
+        // barely move the middle — and the greedy height the measuring needs
+        // pushed the name onto a line of its own below them. So the trick
+        // stays where it is needed: on the iPhone.
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            titleStack.fixedSize()
+                .animation(.easeInOut(duration: 0.2), value: printer.inputLocked)
+        } else {
+            centredOnScreen
+        }
+    }
+
+    private var titleStack: some View {
+        VStack(spacing: 0) {
+            Text(printer.name)
+                .font(.system(size: printer.inputLocked ? 18 : 20, weight: .bold))
+                .lineLimit(1)
+            if printer.inputLocked {
+                HStack(spacing: 3) {
+                    Image(systemName: "lock.fill")
+                    Text(lz(en: "Input lock active", de: "Eingabesperre aktiv", fr: "Verrouillage de la saisie actif", es: "Bloqueo de entrada activo", pt: "Bloqueio de entrada ativo", it: "Blocco input attivo", zh: "输入锁定已启用"))
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.orange)
+                .lineLimit(1)
+            }
+        }
+    }
+
+    private var centredOnScreen: some View {
+        GeometryReader { g in
+            let screenMid = (UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.bounds.midX)
+                ?? UIScreen.main.bounds.midX
+            titleStack
+                .fixedSize()
+            .frame(width: g.size.width, height: g.size.height)
+            .offset(x: screenMid - g.frame(in: .global).midX)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeInOut(duration: 0.2), value: printer.inputLocked)
     }
 }
 
@@ -6774,6 +6963,7 @@ struct SettingsView: View {
     @State private var draftCommand = CustomCommand(name: "", gcode: "")
     @State private var activeGroupID: String = "default"
     @AppStorage("show_nfc_tab") private var showNFCTab: Bool = true
+    @AppStorage("show_slicer_tab") private var showSlicerTab: Bool = false
     @AppStorage("show_timelapse_tab") private var showTimelapseTab: Bool = true
     @AppStorage("show_klipper_tab") private var showKlipperTab: Bool = true
     @AppStorage("printers_as_tabs") private var printersAsTabs: Bool = false
@@ -6837,7 +7027,7 @@ struct SettingsView: View {
                 }
                 .sheet(isPresented: $showWhatsNewAgain) {
                     WhatsNewView(
-                        showsServerPushNote: settings.printers.contains { $0.pushMode == .cloudflare },
+                        showsServerPushNote: false,   // nothing to reinstall for this release
                         pushPrinterBaseURL: settings.printers.first { $0.pushMode == .cloudflare }?.effectiveBaseURL,
                         onOpenServerPush: {
                             // Opened from Settings this closure was missing, so the
@@ -6975,6 +7165,10 @@ struct SettingsView: View {
                     HStack {
                         Image(systemName: "wave.3.right").foregroundColor(.blue).frame(width: 28)
                         Toggle("NFC", isOn: $showNFCTab)
+                    }
+                    HStack {
+                        Image(systemName: "cube.transparent").foregroundColor(.orange).frame(width: 28)
+                        Toggle(lz(en: "PaxxMaker Slicer", de: "PaxxMaker-Slicer", fr: "PaxxMaker Slicer", es: "PaxxMaker Slicer", pt: "PaxxMaker Slicer", it: "PaxxMaker Slicer", zh: "PaxxMaker 切片") + " (Beta)", isOn: $showSlicerTab)
                     }
 
                     HStack {
@@ -9984,6 +10178,7 @@ struct ScrollablePrinterTabView: View {
     let printers: [(PrinterConfig, PrinterService)]
     let allServices: [PrinterService]
     let showNFCTab: Bool
+    var showSlicerTab: Bool = false
     let onSettingsSave: () -> Void
 
     @EnvironmentObject var settings: SettingsStore
@@ -9998,7 +10193,8 @@ struct ScrollablePrinterTabView: View {
 
     var nfcTabIndex: Int { printers.count }
     var spoolmanTabIndex: Int { printers.count + (showNFCTab ? 1 : 0) }
-    var settingsTabIndex: Int { printers.count + (showNFCTab ? 1 : 0) + (spoolmanEnabled ? 1 : 0) }
+    var slicerTabIndex: Int { printers.count + (showNFCTab ? 1 : 0) + (spoolmanEnabled ? 1 : 0) }
+    var settingsTabIndex: Int { slicerTabIndex + (showSlicerTab ? 1 : 0) }
 
     private var isSplitscreenInTabMode: Bool {
         splitscreenMode && horizontalSizeClass == .regular && printers.count >= 2
@@ -10021,6 +10217,17 @@ struct ScrollablePrinterTabView: View {
                 // removed, or NFC/Spoolman turned off since last launch) —
                 // clamp it so we don't land on a blank/wrong tab.
                 if selectedTab < 0 || selectedTab > settingsTabIndex { selectedTab = 0 }
+            }
+            // "Done" after sending a slice: show the printer that got the file.
+            .onReceive(NotificationCenter.default.publisher(for: .paxxShowPrinter)) { note in
+                guard let id = note.object as? String,
+                      let idx = printers.firstIndex(where: { $0.0.id.uuidString == id }) else { return }
+                // The plate view is still closing at this moment; switching
+                // underneath it would fight that animation.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    selectedTab = idx
+                    if isSplitscreenInTabMode { splitCurrentPage = min(idx, max(printers.count - 1, 0)) }
+                }
             }
     }
 
@@ -10053,6 +10260,11 @@ struct ScrollablePrinterTabView: View {
                         .tabItem { Label("Spoolman", systemImage: "record.circle.fill") }
                         .tag(spoolmanTabIndex)
                 }
+                if showSlicerTab {
+                    SlicerView()
+                        .tabItem { Label(lz(en: "PaxxMaker Slicer", de: "PaxxMaker-Slicer", fr: "PaxxMaker Slicer", es: "PaxxMaker Slicer", pt: "PaxxMaker Slicer", it: "PaxxMaker Slicer", zh: "PaxxMaker 切片"), systemImage: "cube.transparent") }
+                        .tag(slicerTabIndex)
+                }
                 SettingsView(settings: settings, onSave: onSettingsSave)
                     .environmentObject(printerServices)
                     .tabItem {
@@ -10074,6 +10286,9 @@ struct ScrollablePrinterTabView: View {
                 .safeAreaInset(edge: .bottom, spacing: 0) { splitTabBar }
         } else if spoolmanEnabled && selectedTab == spoolmanTabIndex {
             SpoolmanView()
+                .safeAreaInset(edge: .bottom, spacing: 0) { splitTabBar }
+        } else if showSlicerTab && selectedTab == slicerTabIndex {
+            SlicerView()
                 .safeAreaInset(edge: .bottom, spacing: 0) { splitTabBar }
         } else {
             SettingsView(settings: settings, onSave: onSettingsSave)
@@ -10116,6 +10331,9 @@ struct ScrollablePrinterTabView: View {
                     if spoolmanEnabled {
                         tabButton(icon: "record.circle.fill", label: "Spoolman", tag: spoolmanTabIndex)
                     }
+                    if showSlicerTab {
+                        tabButton(icon: "cube.transparent", label: lz(en: "PaxxMaker Slicer", de: "PaxxMaker-Slicer", fr: "PaxxMaker Slicer", es: "PaxxMaker Slicer", pt: "PaxxMaker Slicer", it: "PaxxMaker Slicer", zh: "PaxxMaker 切片"), tag: slicerTabIndex)
+                    }
                     tabButton(
                         icon: "gearshape.fill",
                         label: lz(en: "Settings", de: "Einstellungen", fr: "Paramètres", es: "Ajustes", pt: "Configurações", it: "Impostazioni", zh: "设置"),
@@ -10143,6 +10361,8 @@ struct ScrollablePrinterTabView: View {
             NFCView()
         } else if spoolmanEnabled && selectedTab == spoolmanTabIndex {
             SpoolmanView()
+        } else if showSlicerTab && selectedTab == slicerTabIndex {
+            SlicerView()
         } else {
             SettingsView(settings: settings, onSave: onSettingsSave)
                 .environmentObject(printerServices)
@@ -10162,6 +10382,9 @@ struct ScrollablePrinterTabView: View {
                     }
                     if spoolmanEnabled {
                         tabButton(icon: "record.circle.fill", label: "Spoolman", tag: spoolmanTabIndex)
+                    }
+                    if showSlicerTab {
+                        tabButton(icon: "cube.transparent", label: lz(en: "PaxxMaker Slicer", de: "PaxxMaker-Slicer", fr: "PaxxMaker Slicer", es: "PaxxMaker Slicer", pt: "PaxxMaker Slicer", it: "PaxxMaker Slicer", zh: "PaxxMaker 切片"), tag: slicerTabIndex)
                     }
                     tabButton(
                         icon: "gearshape.fill",
@@ -10273,6 +10496,7 @@ struct ContentView: View {
     @StateObject private var printerServices = PrinterServicesManager()
     @StateObject private var langStore = LanguageStore()
     @AppStorage("show_nfc_tab") private var showNFCTab: Bool = true
+    @AppStorage("show_slicer_tab") private var showSlicerTab: Bool = false
     @AppStorage("printers_as_tabs") private var printersAsTabs: Bool = false
     @AppStorage("splitscreen_mode") private var splitscreenMode: Bool = false
     @AppStorage("spoolman_enabled") private var spoolmanEnabled: Bool = false
@@ -10280,7 +10504,7 @@ struct ContentView: View {
     @AppStorage("has_shown_firmware_notice") private var hasShownFirmwareNotice: Bool = false
     @AppStorage("has_selected_language") private var hasSelectedLanguage: Bool = false
     @AppStorage("has_accepted_disclaimer") private var hasAcceptedDisclaimer: Bool = false
-    @AppStorage("has_seen_whatsnew_runout_1") private var hasSeenWhatsNewSL: Bool = false
+    @AppStorage("has_seen_whatsnew_slicer_1") private var hasSeenWhatsNewSL: Bool = false
     @State private var showWhatsNewSL = false
     /// Set when the popup's "Update now" is tapped; SettingsView opens
     /// that printer and clears it again.
@@ -10290,6 +10514,7 @@ struct ContentView: View {
     @State private var showDisclaimer: Bool = false
     // Persisted so relaunching the app returns to the tab that was last open.
     @AppStorage("last_root_tab") private var rootTabSel: String = "main"
+    @State private var pairingMessage: String? = nil
     // Persisted so relaunching returns to the printer that was last swiped to.
     @AppStorage("last_printer_page") private var currentPrinterPage: Int = 0
     @State private var splitCurrentPage: Int = 0
@@ -10329,6 +10554,7 @@ struct ContentView: View {
                             printers: visiblePrinters,
                             allServices: printerServices.services,
                             showNFCTab: showNFCTab,
+                            showSlicerTab: showSlicerTab,
                             onSettingsSave: { printerServices.update(from: settings) }
                         )
                     } else {
@@ -10366,6 +10592,11 @@ struct ContentView: View {
                                     .tabItem { Label("Spoolman", systemImage: "record.circle.fill") }
                                     .tag("spoolman")
                             }
+                            if showSlicerTab {
+                                SlicerView()
+                                    .tabItem { Label(lz(en: "PaxxMaker Slicer", de: "PaxxMaker-Slicer", fr: "PaxxMaker Slicer", es: "PaxxMaker Slicer", pt: "PaxxMaker Slicer", it: "PaxxMaker Slicer", zh: "PaxxMaker 切片"), systemImage: "cube.transparent") }
+                                    .tag("slicer")
+                            }
                             SettingsView(settings: settings) {
                                 printerServices.update(from: settings)
                             }
@@ -10385,10 +10616,23 @@ struct ContentView: View {
         .environmentObject(langStore)
         .environmentObject(settings)
         .environmentObject(printerServices)
+        // paxxmaker://connect?… from PaxxMaker-Connect's QR code, scanned with
+        // the camera app: pair without typing the code.
+        .onOpenURL { url in
+            Task {
+                if let msg = await ConnectPairing.handle(url) {
+                    await MainActor.run { pairingMessage = msg; rootTabSel = "slicer" }
+                }
+            }
+        }
+        .alert(lz(en: "PaxxMaker-Connect", de: "PaxxMaker-Connect", fr: "PaxxMaker-Connect", es: "PaxxMaker-Connect", pt: "PaxxMaker-Connect", it: "PaxxMaker-Connect", zh: "PaxxMaker-Connect"),
+               isPresented: Binding(get: { pairingMessage != nil }, set: { if !$0 { pairingMessage = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(pairingMessage ?? "") }
         .onAppear {
             // Restored tab may no longer exist (its feature was turned off) —
             // fall back to the printer tab so the TabView isn't left blank.
-            if (rootTabSel == "nfc" && !showNFCTab) || (rootTabSel == "spoolman" && !spoolmanEnabled) {
+            if (rootTabSel == "nfc" && !showNFCTab) || (rootTabSel == "spoolman" && !spoolmanEnabled) || (rootTabSel == "slicer" && !showSlicerTab) {
                 rootTabSel = "main"
             }
             // Clamp the restored printer page if a printer was removed/hidden.
@@ -10453,7 +10697,7 @@ struct ContentView: View {
             // The reinstall note only concerns printers actually on Server Push;
             // for everyone else it would be a confusing instruction.
             WhatsNewView(
-                showsServerPushNote: settings.printers.contains { $0.pushMode == .cloudflare },
+                showsServerPushNote: false,   // nothing to reinstall for this release
                 pushPrinterBaseURL: settings.printers.first { $0.pushMode == .cloudflare }?.effectiveBaseURL,
                 onOpenServerPush: {
                     // Remember which printer, switch to Settings, close the popup —
@@ -10603,57 +10847,22 @@ struct WhatsNewView: View {
 
     private var textBlock: some View {
             VStack(spacing: 18) {
-            Image(systemName: "bell.badge.fill")
-                .font(.system(size: 46)).foregroundColor(.orange).padding(.top, 10)
-            Text(lz(en: "New: filament notification, Auto Shutdown & costs", de: "Neu: Filament-Benachrichtigung, Auto-Shutdown & Kosten", fr: "Nouveau : alerte filament, arrêt automatique et coûts", es: "Nuevo: aviso de filamento, apagado automático y costes", pt: "Novo: aviso de filamento, desligamento automático e custos", it: "Novità: avviso filamento, spegnimento automatico e costi", zh: "新功能：耗材通知、自动关机与费用"))
+            Image(systemName: "cube.transparent")
+                .font(.system(size: 46)).foregroundColor(.accentColor).padding(.top, 10)
+            Text(lz(en: "New: PaxxMaker Slicer (Beta)", de: "Neu: PaxxMaker-Slicer (Beta)", fr: "Nouveau : PaxxMaker Slicer (bêta)", es: "Nuevo: PaxxMaker Slicer (beta)", pt: "Novo: PaxxMaker Slicer (beta)", it: "Novità: PaxxMaker Slicer (beta)", zh: "新功能：PaxxMaker 切片（测试版）"))
                 .font(.title2).bold().multilineTextAlignment(.center)
             Text(lz(
-                en: "Push notifications now tell a pause apart from an empty spool — on multi-nozzle printers including which nozzle it is.\n\nSmart plug: the printer switches it off by itself once a print is done — with an adjustable delay, and optionally after a cancel too. It also measures the power consumption of every print and, together with the filament used, works out what it cost — priced from your Spoolman spool or straight from the slicer profile in the G-code. New tile “Last Print Cost” with a tap-through history. Settings › My Printers › Printer › Smart Plug.\n\nYou can also choose which progress the app shows: the slicer’s estimate, or the same number as the printer’s display. Settings › Extra Features › Progress.",
-                de: "Push-Benachrichtigungen unterscheiden jetzt zwischen einer Pause und leerem Filament — beim Multi-Nozzle-Drucker mit Angabe der betroffenen Nozzle.\n\nSmart-Steckdose: Der Drucker schaltet sie nach dem Druck selbst ab — mit einstellbarer Verzögerung und auf Wunsch auch nach einem Abbruch. Außerdem misst er den Stromverbrauch jedes Drucks und rechnet zusammen mit dem verbrauchten Filament aus, was er gekostet hat — bepreist über deine Spoolman-Spule oder direkt aus dem Slicer-Profil im G-Code. Neue Kachel „Kosten letzter Druck“ mit antippbarem Verlauf. Einstellungen › Meine Drucker › Drucker › Smart-Steckdose.\n\nAußerdem kannst du jetzt selbst wählen, welchen Fortschritt die App anzeigt: die Schätzung des Slicers oder dieselbe Zahl wie das Druckerdisplay. Einstellungen › Zusatzfunktionen › Fortschritt.",
-                fr: "Les notifications push distinguent désormais une pause d’une bobine vide — sur les imprimantes multi-buses avec la buse concernée.\n\nPrise intelligente : l'imprimante la coupe elle-même une fois l'impression terminée — avec un délai réglable, et si tu veux aussi après une annulation. Elle mesure aussi la consommation de chaque impression et, avec le filament utilisé, calcule ce qu'elle a coûté — au prix de ta bobine Spoolman ou directement du profil du slicer dans le G-code. Nouvelle tuile « Coût dernière impression » avec historique. Réglages › Mes imprimantes › Imprimante › Prise intelligente.\n\nTu peux aussi choisir la progression affichée : l’estimation du slicer ou le même chiffre que l’écran de l’imprimante. Réglages › Fonctions supplémentaires › Progression.",
-                es: "Las notificaciones push ahora distinguen una pausa de una bobina vacía — en impresoras multiboquilla, indicando la boquilla afectada.\n\nEnchufe inteligente: la impresora lo apaga sola al terminar la impresión, con retardo ajustable y, si quieres, también tras una cancelación. Además mide el consumo de cada impresión y, junto con el filamento usado, calcula lo que costó — con el precio de tu bobina en Spoolman o directamente del perfil del slicer en el G-code. Nueva tarjeta «Coste última impresión» con historial. Ajustes › Mis impresoras › Impresora › Enchufe inteligente.\n\nAdemás puedes elegir qué progreso muestra la app: la estimación del slicer o el mismo número que la pantalla de la impresora. Ajustes › Funciones adicionales › Progreso.",
-                pt: "As notificações push agora distinguem uma pausa de uma bobina vazia — em impressoras multibico, indicando qual bico.\n\nTomada inteligente: a impressora a desliga sozinha ao terminar a impressão, com atraso ajustável e, se quiser, também após um cancelamento. Ela também mede o consumo de cada impressão e, junto com o filamento usado, calcula quanto custou — com o preço da sua bobina no Spoolman ou direto do perfil do fatiador no G-code. Novo bloco “Custo da última impressão” com histórico. Ajustes › Minhas impressoras › Impressora › Tomada inteligente.\n\nVocê também pode escolher qual progresso o app mostra: a estimativa do slicer ou o mesmo número do visor da impressora. Ajustes › Funções adicionais › Progresso.",
-                it: "Le notifiche push ora distinguono una pausa da una bobina esaurita — sulle stampanti multiugello indicando quale ugello.\n\nPresa intelligente: la stampante la spegne da sola a stampa finita, con ritardo regolabile e, se vuoi, anche dopo un annullamento. Misura inoltre il consumo di ogni stampa e, insieme al filamento usato, calcola quanto è costata — al prezzo della tua bobina Spoolman o direttamente dal profilo dello slicer nel G-code. Nuovo riquadro «Costo ultima stampa» con cronologia. Impostazioni › Le mie stampanti › Stampante › Presa intelligente.\n\nPuoi inoltre scegliere quale avanzamento mostra l’app: la stima dello slicer o lo stesso numero del display della stampante. Impostazioni › Funzioni aggiuntive › Avanzamento.",
-                zh: "推送通知现在能区分“暂停”和“耗材用尽”——多喷嘴打印机还会指明是哪个喷嘴。\n\n智能插座：打印完成后，打印机会自行关闭它——延迟时间可调，也可选择在取消打印后关闭。它还会测量每次打印的耗电量，并结合所用耗材算出费用——价格来自你的 Spoolman 料盘或直接来自 G-code 中的切片配置。新增“上次打印费用”磁贴，可点击查看记录。设置 › 我的打印机 › 打印机 › 智能插座。\n\n你还可以自行选择应用显示哪种进度：切片软件的估算，或与打印机屏幕一致的数值。设置 › 附加功能 › 进度。"))
+                en: "You can now slice straight from the app: open an STL, turn it on the plate, scale it, paint faces for the different heads — and print.\n\nThe slicing happens on your Mac or Windows PC: install \"PaxxMaker-Connect\" there, pair it with a QR code, done. It uses the OrcaSlicer installed on that computer with your own profiles; the G-code comes back to the app and goes straight to the printer. The computer has to be switched on while you slice.\n\nBoth are still in beta — I am still working out how it should look and would be glad to hear what you think. Switch it on under Settings › Extra Features › PaxxMaker Slicer (Beta).",
+                de: "Du kannst jetzt direkt aus der App slicen: STL öffnen, auf der Druckplatte drehen, skalieren, Flächen für die einzelnen Köpfe einfärben — und drucken.\n\nGesliced wird auf deinem Mac oder Windows-PC: dort „PaxxMaker-Connect“ installieren, per QR-Code koppeln, fertig. Es benutzt den dort installierten OrcaSlicer mit deinen eigenen Profilen; der G-Code kommt zurück in die App und geht direkt an den Drucker. Der Computer muss dabei laufen.\n\nBeides steckt noch in der Beta — ich bin in der Findungsphase, wie die Oberfläche aussehen soll, und freue mich über deine Rückmeldung. Einschalten: Einstellungen › Zusatzfunktionen › PaxxMaker-Slicer (Beta).",
+                fr: "Tu peux maintenant trancher directement depuis l'app : ouvrir un STL, le tourner sur le plateau, le redimensionner, peindre des faces pour les différentes têtes — et imprimer.\n\nLe tranchage se fait sur ton Mac ou PC Windows : installe « PaxxMaker-Connect », appaire avec un QR code, c'est tout. Il utilise l'OrcaSlicer installé là-bas avec tes propres profils ; le G-code revient dans l'app et part directement à l'imprimante. L'ordinateur doit rester allumé pendant le tranchage.\n\nLe tout est encore en bêta — je cherche encore la bonne présentation et tes retours sont les bienvenus. Active-le dans Réglages › Fonctions supplémentaires › PaxxMaker Slicer (bêta).",
+                es: "Ya puedes laminar directamente desde la app: abre un STL, gíralo en la placa, escálalo, pinta caras para cada cabezal — e imprime.\n\nEl laminado ocurre en tu Mac o PC con Windows: instala allí «PaxxMaker-Connect», vincula con un código QR y listo. Usa el OrcaSlicer instalado en ese ordenador con tus propios perfiles; el G-code vuelve a la app y va directo a la impresora. El ordenador tiene que estar encendido mientras laminas.\n\nTodo ello sigue en beta — aún estoy definiendo cómo debe verse y agradezco tus comentarios. Actívalo en Ajustes › Funciones adicionales › PaxxMaker Slicer (beta).",
+                pt: "Agora você pode fatiar direto do app: abra um STL, gire-o na mesa, redimensione, pinte faces para cada cabeça — e imprima.\n\nO fatiamento acontece no seu Mac ou PC com Windows: instale lá o \"PaxxMaker-Connect\", pareie com um QR code e pronto. Ele usa o OrcaSlicer instalado nesse computador com os seus perfis; o G-code volta para o app e vai direto para a impressora. O computador precisa estar ligado durante o fatiamento.\n\nTudo isso ainda está em beta — ainda estou definindo como deve ficar e fico feliz com o seu retorno. Ative em Ajustes › Recursos Extras › PaxxMaker Slicer (beta).",
+                it: "Ora puoi fare lo slicing direttamente dall'app: apri un STL, ruotalo sul piano, ridimensionalo, colora le facce per le singole teste — e stampa.\n\nLo slicing avviene sul tuo Mac o PC Windows: installa lì «PaxxMaker-Connect», associa con un QR code e basta. Usa l'OrcaSlicer installato su quel computer con i tuoi profili; il G-code torna nell'app e va dritto alla stampante. Il computer deve restare acceso durante lo slicing.\n\nTutto questo è ancora in beta — sto ancora cercando l'aspetto giusto e ogni riscontro è benvenuto. Attivalo in Impostazioni › Funzioni Extra › PaxxMaker Slicer (beta).",
+                zh: "现在可以直接在 App 里切片：打开 STL，在打印板上旋转、缩放、为不同喷头上色——然后打印。\n\n切片在你的 Mac 或 Windows 电脑上进行：在电脑上安装“PaxxMaker-Connect”，用二维码配对即可。它使用那台电脑上安装的 OrcaSlicer 和你自己的配置；生成的 G-code 回到 App 并直接发送到打印机。切片时电脑需保持开机。\n\n这些仍处于测试版——界面该是什么样子我还在摸索，欢迎你的反馈。开启方式：设置 › 附加功能 › PaxxMaker 切片（测试版）。"))
                 .font(.subheadline).foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
 
-            // Only for printers actually running Server Push — the others have
-            // nothing to reinstall and the instruction would only confuse.
-            if showsServerPushNote, pushOutdated != false {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                        Text(lz(en: "Action needed", de: "Aktion nötig", fr: "Action requise", es: "Acción necesaria", pt: "Ação necessária", it: "Azione necessaria", zh: "需要操作"))
-                            .font(.subheadline).bold()
-                    }
-                    Text(lz(
-                        en: "To use this feature, Server Push has to be installed on the printer again.",
-                        de: "Um diese Funktion zu nutzen, muss Server-Push auf dem Drucker neu aufgespielt werden.",
-                        fr: "Pour utiliser cette fonction, le Push serveur doit etre reinstalle sur l'imprimante.",
-                        es: "Para usar esta funcion hay que volver a instalar el Push servidor en la impresora.",
-                        pt: "Para usar este recurso, o Push do Servidor precisa ser instalado novamente na impressora.",
-                        it: "Per usare questa funzione il Push dal Server va reinstallato sulla stampante.",
-                        zh: "要使用此功能，需要在打印机上重新安装服务器推送。"))
-                        .font(.subheadline)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    // A button instead of a route to follow: the user is three
-                    // screens away from the thing they need to tap.
-                    Button { onOpenServerPush() } label: {
-                        Label(lz(en: "Update now", de: "Jetzt updaten", fr: "Mettre a jour", es: "Actualizar ahora", pt: "Atualizar agora", it: "Aggiorna ora", zh: "立即更新"),
-                              systemImage: "arrow.up.circle.fill")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .padding(.top, 2)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(14)
-                .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange.opacity(0.12)))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.orange.opacity(0.45), lineWidth: 1))
-            }
 
             }
             .padding(.horizontal, 28)

@@ -1,14 +1,16 @@
 import SwiftUI
 
 // Shared little helpers
-private func numField(_ title: String, _ text: Binding<String>) -> some View {
+private func numField(_ title: String, _ text: Binding<String>, unit: String? = nil) -> some View {
     HStack {
         Text(title)
         Spacer()
         TextField("—", text: text)
             .keyboardType(.decimalPad)
             .multilineTextAlignment(.trailing)
-            .frame(maxWidth: 120)
+            .frame(maxWidth: unit == nil ? 120 : 90)
+        // Unit next to the value, like the computed rows — not in the label.
+        if let unit { Text(unit).foregroundStyle(.secondary) }
     }
 }
 private func dbl(_ s: String) -> Double? { Double(s.replacingOccurrences(of: ",", with: ".")) }
@@ -24,6 +26,8 @@ struct SpoolDetailView: View {
     @State private var showEdit = false
     @State private var showDeleteConfirm = false
     @State private var busy = false
+    @State private var uidReader = TagUIDReader()
+    @State private var linkStatus: String? = nil
 
     var body: some View {
         Form {
@@ -75,7 +79,45 @@ struct SpoolDetailView: View {
                 }
             }
 
-            Section {
+            Section(footer: linkStatus.map { Text($0) }) {
+                // Same as "Link tag" in SpoolLink, from the spool's side: hold
+                // the spool's tag to the phone and it belongs to THIS spool —
+                // in Spoolman, and on every printer that has the tag loaded.
+                Button {
+                    uidReader.read(prompt: lz(en: "Hold the spool tag to the top of the iPhone", de: "Spulen-Tag an die Oberkante des iPhones halten", fr: "Approche le tag de la bobine du haut de l'iPhone", es: "Acerca la etiqueta de la bobina a la parte superior del iPhone", pt: "Aproxime a etiqueta da bobina do topo do iPhone", it: "Avvicina il tag della bobina alla parte alta dell'iPhone", zh: "将料盘标签靠近 iPhone 顶部")) { uid in
+                        guard let uid else { return }
+                        Task {
+                            busy = true
+                            await store.perform { svc in
+                                // One tag → exactly one spool: take it off the others.
+                                let all = try await svc.spools(includeArchived: true)
+                                for sp in all where sp.cardUIDs.contains(uid) && sp.id != spool.id {
+                                    let rest = sp.cardUIDs.filter { $0 != uid }
+                                    _ = try await svc.updateSpool(sp.id, ["extra": ["card_uids": "\"\(rest.joined(separator: ","))\""]])
+                                }
+                                if !spool.cardUIDs.contains(uid) {
+                                    _ = try await svc.updateSpool(spool.id, ["extra": ["card_uids": "\"\((spool.cardUIDs + [uid]).joined(separator: ","))\""]])
+                                }
+                            }
+                            NotificationCenter.default.post(name: .paxxCardUIDLinked, object: nil,
+                                                            userInfo: ["uid": uid, "spool": spool.id])
+                            busy = false
+                            linkStatus = lz(en: "Tag \(uid) linked to this spool.", de: "Tag \(uid) mit dieser Spule verknüpft.", fr: "Tag \(uid) lié à cette bobine.", es: "Etiqueta \(uid) vinculada a esta bobina.", pt: "Etiqueta \(uid) vinculada a esta bobina.", it: "Tag \(uid) collegato a questa bobina.", zh: "标签 \(uid) 已关联到此料盘。")
+                        }
+                    }
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(lz(en: "Link tag", de: "Mit Tag verknüpfen", fr: "Lier un tag", es: "Vincular etiqueta", pt: "Vincular etiqueta", it: "Collega un tag", zh: "关联标签"))
+                            Text(spool.cardUIDs.isEmpty
+                                 ? lz(en: "on the iPhone, no printer needed", de: "am iPhone, ohne Drucker", fr: "sur l'iPhone, sans imprimante", es: "en el iPhone, sin impresora", pt: "no iPhone, sem impressora", it: "sull'iPhone, senza stampante", zh: "在 iPhone 上，无需打印机")
+                                 : lz(en: "linked: \(spool.cardUIDs.joined(separator: ", "))", de: "verknüpft: \(spool.cardUIDs.joined(separator: ", "))", fr: "lié : \(spool.cardUIDs.joined(separator: ", "))", es: "vinculada: \(spool.cardUIDs.joined(separator: ", "))", pt: "vinculada: \(spool.cardUIDs.joined(separator: ", "))", it: "collegato: \(spool.cardUIDs.joined(separator: ", "))", zh: "已关联：\(spool.cardUIDs.joined(separator: ", "))"))
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    } icon: { Image(systemName: "iphone.radiowaves.left.and.right") }
+                }
+                .disabled(busy || !TagUIDReader.available)
+
                 Button {
                     Task { await store.perform { _ = try await $0.updateSpool(spool.id, ["archived": !spool.archived]) }; dismiss() }
                 } label: {
@@ -121,7 +163,15 @@ struct SpoolEditView: View {
     @State private var filamentID: Int?
     @State private var initialWeight = ""
     @State private var spoolWeight = ""
+    /// Existing spool: what the scale shows (spool + filament).
+    @State private var scaleWeight = ""
     @State private var price = ""
+
+    /// Filament left = scale minus empty spool; nil until both are known.
+    private var netWeight: Double? {
+        guard let g = dbl(scaleWeight), let e = dbl(spoolWeight) else { return nil }
+        return max(0, g - e)
+    }
     @State private var location = ""
     @State private var lotNr = ""
     @State private var comment = ""
@@ -130,16 +180,48 @@ struct SpoolEditView: View {
     var body: some View {
         NavigationView {
             Form {
+                // The filament type is chosen when a spool is created; an
+                // existing spool just shows it.
                 Section(lz(en: "Filament", de: "Filament", fr: "Filament", es: "Filamento", pt: "Filamento", it: "Filamento", zh: "耗材")) {
-                    Picker(lz(en: "Type", de: "Typ", fr: "Type", es: "Tipo", pt: "Tipo", it: "Tipo", zh: "类型"), selection: $filamentID) {
-                        Text("—").tag(Int?.none)
-                        ForEach(store.filaments) { f in Text(f.displayName).tag(Int?.some(f.id)) }
+                    if let s = spool {
+                        HStack {
+                            Text(lz(en: "Type", de: "Typ", fr: "Type", es: "Tipo", pt: "Tipo", it: "Tipo", zh: "类型"))
+                            Spacer()
+                            Text(s.filament.displayName).foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Picker(lz(en: "Type", de: "Typ", fr: "Type", es: "Tipo", pt: "Tipo", it: "Tipo", zh: "类型"), selection: $filamentID) {
+                            Text("—").tag(Int?.none)
+                            ForEach(store.filaments) { f in Text(f.displayName).tag(Int?.some(f.id)) }
+                        }
                     }
                 }
-                Section {
-                    numField(lz(en: "Initial weight (g)", de: "Anfangsgewicht (g)", fr: "Poids initial (g)", es: "Peso inicial (g)", pt: "Peso inicial (g)", it: "Peso iniziale (g)", zh: "初始重量 (g)"), $initialWeight)
-                    numField(lz(en: "Empty spool (g)", de: "Leergewicht (g)", fr: "Bobine vide (g)", es: "Carrete vacío (g)", pt: "Bobina vazia (g)", it: "Bobina vuota (g)", zh: "空盘重 (g)"), $spoolWeight)
-                    numField(lz(en: "Price", de: "Preis", fr: "Prix", es: "Precio", pt: "Preço", it: "Prezzo", zh: "价格"), $price)
+                if spool == nil {
+                    Section {
+                        numField(lz(en: "Initial weight", de: "Anfangsgewicht", fr: "Poids initial", es: "Peso inicial", pt: "Peso inicial", it: "Peso iniziale", zh: "初始重量"), $initialWeight, unit: "g")
+                        numField(lz(en: "Empty spool", de: "Leergewicht", fr: "Bobine vide", es: "Carrete vacío", pt: "Bobina vazia", it: "Bobina vuota", zh: "空盘重"), $spoolWeight, unit: "g")
+                        numField(lz(en: "Price", de: "Preis", fr: "Prix", es: "Precio", pt: "Preço", it: "Prezzo", zh: "价格"), $price)
+                    }
+                } else {
+                    // Existing spool: the scale reading, not the initial weight.
+                    // The app takes the empty spool off and writes the filament
+                    // that is really left into Spoolman.
+                    Section(footer: Text(lz(en: "Put the spool on a scale and enter the total. The empty spool is subtracted; the rest is filament.",
+                                             de: "Spule auf die Waage legen und Gesamtgewicht eintragen. Das Leergewicht wird abgezogen, der Rest ist Filament.",
+                                             fr: "Pose la bobine sur une balance et saisis le total. La bobine vide est déduite, le reste est du filament.",
+                                             es: "Pon la bobina en una báscula e introduce el total. Se resta la bobina vacía; el resto es filamento.",
+                                             pt: "Coloque a bobina numa balança e insira o total. A bobina vazia é subtraída; o resto é filamento.",
+                                             it: "Metti la bobina su una bilancia e inserisci il totale. La bobina vuota viene sottratta, il resto è filamento.",
+                                             zh: "把料盘放到秤上并输入总重。减去空盘重量，剩下的就是耗材。"))) {
+                        numField(lz(en: "Weighed", de: "Gewogen", fr: "Pesé", es: "Pesado", pt: "Pesado", it: "Pesato", zh: "称重"), $scaleWeight, unit: "g")
+                        numField(lz(en: "Empty spool", de: "Leergewicht", fr: "Bobine vide", es: "Carrete vacío", pt: "Bobina vazia", it: "Bobina vuota", zh: "空盘重"), $spoolWeight, unit: "g")
+                        HStack {
+                            Text(lz(en: "Filament left", de: "Filament übrig", fr: "Filament restant", es: "Filamento restante", pt: "Filamento restante", it: "Filamento rimasto", zh: "剩余耗材"))
+                            Spacer()
+                            Text(netWeight.map { "\(Int($0.rounded())) g" } ?? "—").foregroundStyle(.secondary)
+                        }
+                        numField(lz(en: "Price", de: "Preis", fr: "Prix", es: "Precio", pt: "Preço", it: "Prezzo", zh: "价格"), $price)
+                    }
                 }
                 Section {
                     TextField(lz(en: "Location", de: "Standort", fr: "Emplacement", es: "Ubicación", pt: "Localização", it: "Posizione", zh: "位置"), text: $location)
@@ -183,7 +265,11 @@ struct SpoolEditView: View {
         }
         filamentID = s.filament.id
         initialWeight = s.initial_weight.map { String(Int($0)) } ?? ""
-        spoolWeight = s.spool_weight.map { String(Int($0)) } ?? ""
+        spoolWeight = (s.spool_weight ?? s.filament.spool_weight).map { String(Int($0)) } ?? ""
+        // Pre-fill with what the scale would show right now.
+        if let rem = s.remaining_weight, let e = s.spool_weight ?? s.filament.spool_weight {
+            scaleWeight = String(Int((rem + e).rounded()))
+        }
         price = s.price.map { String($0) } ?? ""
         location = s.location ?? ""
         lotNr = s.lot_nr ?? ""
@@ -193,7 +279,12 @@ struct SpoolEditView: View {
     private func save() {
         guard let fid = filamentID else { return }
         var body: [String: Any] = ["filament_id": fid]
-        if let v = dbl(initialWeight) { body["initial_weight"] = v }
+        if spool == nil {
+            if let v = dbl(initialWeight) { body["initial_weight"] = v }
+        } else if let net = netWeight, !scaleWeight.isEmpty {
+            // Spoolman derives used_weight from this itself.
+            body["remaining_weight"] = net
+        }
         if let v = dbl(spoolWeight)  { body["spool_weight"]  = v }
         if let v = dbl(price)        { body["price"]         = v }
         body["location"] = location
@@ -304,7 +395,7 @@ struct FilamentEditView: View {
                     numField(lz(en: "Density (g/cm³)", de: "Dichte (g/cm³)", fr: "Densité (g/cm³)", es: "Densidad (g/cm³)", pt: "Densidade (g/cm³)", it: "Densità (g/cm³)", zh: "密度 (g/cm³)"), $density)
                     numField(lz(en: "Diameter (mm)", de: "Durchmesser (mm)", fr: "Diamètre (mm)", es: "Diámetro (mm)", pt: "Diâmetro (mm)", it: "Diametro (mm)", zh: "直径 (mm)"), $diameter)
                     numField(lz(en: "Full weight (g)", de: "Vollgewicht (g)", fr: "Poids plein (g)", es: "Peso lleno (g)", pt: "Peso cheio (g)", it: "Peso pieno (g)", zh: "满卷重 (g)"), $weight)
-                    numField(lz(en: "Empty spool (g)", de: "Leergewicht (g)", fr: "Bobine vide (g)", es: "Carrete vacío (g)", pt: "Bobina vazia (g)", it: "Bobina vuota (g)", zh: "空盘重 (g)"), $spoolWeight)
+                    numField(lz(en: "Empty spool", de: "Leergewicht", fr: "Bobine vide", es: "Carrete vacío", pt: "Bobina vazia", it: "Bobina vuota", zh: "空盘重"), $spoolWeight, unit: "g")
                     numField(lz(en: "Price", de: "Preis", fr: "Prix", es: "Precio", pt: "Preço", it: "Prezzo", zh: "价格"), $price)
                 }
                 Section(lz(en: "Temperatures", de: "Temperaturen", fr: "Températures", es: "Temperaturas", pt: "Temperaturas", it: "Temperature", zh: "温度")) {

@@ -28,8 +28,13 @@ struct EnergyRecord: Identifiable, Decodable {
     var filamentName: String
     var filamentToolsG: [Double]?
     var filamentToolsMm: [Double]?
-    /// Tool index → Spoolman spool id seen feeding it during the print.
+    /// Channel → FIRST Spoolman spool id seen feeding it during the print.
     var spools: [Int: Int]
+    /// Channel → spool id → mm extruded from that spool. Carries a spool
+    /// swapped mid-print, so both spools get charged at their own price.
+    var spoolUsageMm: [Int: [Int: Double]]
+    /// Spool id → description of every spool seen during the print.
+    var spoolInfos: [Int: FilamentChannel]
     /// U1: what was loaded per channel when the print started.
     var channels: [FilamentChannel]
     /// U1: sliced tool index → channel really used (remapped at print start).
@@ -43,6 +48,10 @@ struct EnergyRecord: Identifiable, Decodable {
     /// price per kg that was applied — so the details can always say so.
     var toolSources: [String?]
     var toolPricesKg: [Double?]
+    var toolParts: [[StoredPart]]
+    struct StoredPart: Decodable, Hashable {
+        var spool: Int; var share: Double; var source: String; var price_kg: Double; var cost: Double
+    }
     /// What the slicer profile said the filament costs per kg (Orca/Prusa
     /// write `; filament_cost = …` per tool into the file), 0 = not set.
     var slicerPricesKg: [Double]
@@ -56,6 +65,8 @@ struct EnergyRecord: Identifiable, Decodable {
 
     enum CodingKeys: String, CodingKey {
         case file, started, ended, seconds, wh, result, samples, failed, spools
+        case spoolUsageMm = "spool_usage_mm"
+        case spoolInfos = "spool_infos"
         case pricePerKWh = "price_per_kwh"
         case filamentMm = "filament_mm"
         case filamentG = "filament_g"
@@ -70,6 +81,7 @@ struct EnergyRecord: Identifiable, Decodable {
         case priceSource = "price_source"
         case toolSources = "filament_tool_sources"
         case toolPricesKg = "filament_tool_price_kg"
+        case toolParts = "filament_tool_parts"
         case slicerPricesKg = "filament_slicer_price_kg"
         case currency
     }
@@ -96,6 +108,12 @@ struct EnergyRecord: Identifiable, Decodable {
         filamentToolsMm = try c.decodeIfPresent([Double].self, forKey: .filamentToolsMm)
         let sp = try c.decodeIfPresent([String: Int].self, forKey: .spools) ?? [:]
         spools = Dictionary(uniqueKeysWithValues: sp.compactMap { k, v in Int(k).map { ($0, v) } })
+        let su = try c.decodeIfPresent([String: [String: Double]].self, forKey: .spoolUsageMm) ?? [:]
+        spoolUsageMm = Dictionary(uniqueKeysWithValues: su.compactMap { k, v in
+            Int(k).map { ($0, Dictionary(uniqueKeysWithValues: v.compactMap { k2, v2 in Int(k2).map { ($0, v2) } })) }
+        })
+        let si = try c.decodeIfPresent([String: FilamentChannel].self, forKey: .spoolInfos) ?? [:]
+        spoolInfos = Dictionary(uniqueKeysWithValues: si.compactMap { k, v in Int(k).map { ($0, v) } })
         channels = try c.decodeIfPresent([FilamentChannel].self, forKey: .channels) ?? []
         extruderMap = try c.decodeIfPresent([Int].self, forKey: .extruderMap) ?? []
         filamentCost = try c.decodeIfPresent(Double.self, forKey: .filamentCost)
@@ -103,6 +121,7 @@ struct EnergyRecord: Identifiable, Decodable {
         priceSource = try c.decodeIfPresent(String.self, forKey: .priceSource)
         toolSources = try c.decodeIfPresent([String?].self, forKey: .toolSources) ?? []
         toolPricesKg = try c.decodeIfPresent([Double?].self, forKey: .toolPricesKg) ?? []
+        toolParts = try c.decodeIfPresent([[StoredPart]].self, forKey: .toolParts) ?? []
         slicerPricesKg = try c.decodeIfPresent([Double].self, forKey: .slicerPricesKg) ?? []
     }
 
@@ -121,6 +140,19 @@ struct EnergyRecord: Identifiable, Decodable {
     }
     /// The channel that really printed sliced tool `i`.
     func channel(forTool i: Int) -> Int { extruderMap[safe: i] ?? i }
+
+    /// Which spools fed sliced tool `i`, with their share of its filament.
+    /// A single spool (or an older record) is one entry with share 1.
+    func spoolShares(forTool i: Int) -> [(spool: Int?, share: Double)] {
+        let ch = channel(forTool: i)
+        if let per = spoolUsageMm[ch] {
+            let total = per.values.reduce(0, +)
+            if total > 0 {
+                return per.sorted { $0.value > $1.value }.map { (spool: $0.key == 0 ? nil : $0.key, share: $0.value / total) }
+            }
+        }
+        return [(spool: spools[ch], share: 1)]
+    }
 }
 
 struct FilamentChannel: Decodable, Hashable {
@@ -197,6 +229,9 @@ enum FilamentPricing {
         var cost: Double?
         var source: String?      // "spoolman" / "slicer"
         var pricePerKg: Double?
+        /// Per spool when more than one fed the tool (spool swapped mid-print).
+        var parts: [Part] = []
+        struct Part { var spool: Int?; var share: Double; var source: String?; var pricePerKg: Double?; var cost: Double? }
     }
 
     /// Real data only. Spoolman first when chosen, and if THAT spool has no
@@ -214,13 +249,29 @@ enum FilamentPricing {
 
     /// Cost per sliced tool; the spool is looked up by the channel that
     /// really printed the tool.
-    static func costPerTool(grams: [Double], spools: [Int: Int], map: [Int], slicerPrices: [Double]) async -> [ToolPrice] {
+    static func costPerTool(grams: [Double], spools: [Int: Int], map: [Int], slicerPrices: [Double],
+                            shares: ((Int) -> [(spool: Int?, share: Double)])? = nil) async -> [ToolPrice] {
         var out: [ToolPrice] = []
         for (tool, g) in grams.enumerated() {
             guard g > 0 else { out.append(ToolPrice(cost: 0)); continue }
-            var tp = await priceFor(tool: tool, spoolID: spools[map[safe: tool] ?? tool], slicer: slicerPrices)
-            tp.cost = tp.pricePerKg.map { g * $0 / 1000 }
-            out.append(tp)
+            let segs = shares?(tool) ?? [(spool: spools[map[safe: tool] ?? tool], share: 1)]
+            if segs.count == 1 {
+                var tp = await priceFor(tool: tool, spoolID: segs[0].spool, slicer: slicerPrices)
+                tp.cost = tp.pricePerKg.map { g * $0 / 1000 }
+                out.append(tp)
+                continue
+            }
+            // Several spools: each share at its own price; the tool's cost is
+            // known only when every share is.
+            var parts: [ToolPrice.Part] = []
+            for seg in segs {
+                let p = await priceFor(tool: tool, spoolID: seg.spool, slicer: slicerPrices)
+                parts.append(.init(spool: seg.spool, share: seg.share, source: p.source, pricePerKg: p.pricePerKg,
+                                   cost: p.pricePerKg.map { g * seg.share * $0 / 1000 }))
+            }
+            let complete = !parts.contains { $0.cost == nil }
+            out.append(ToolPrice(cost: complete ? parts.compactMap(\.cost).reduce(0, +) : nil,
+                                 source: parts.first?.source, pricePerKg: nil, parts: parts))
         }
         return out
     }
@@ -238,8 +289,15 @@ enum FilamentPricing {
     static func price(_ r: EnergyRecord, source: EnergySource) async -> (total: Double?, tools: [ToolPrice]) {
         if let c = r.filamentCost {
             let costs = r.filamentToolCosts ?? [c]
-            return (c, costs.indices.map { ToolPrice(cost: costs[$0], source: r.toolSources[safe: $0] ?? nil,
-                                                     pricePerKg: r.toolPricesKg[safe: $0] ?? nil) })
+            return (c, costs.indices.map { i in
+                ToolPrice(cost: costs[i], source: r.toolSources[safe: i] ?? nil,
+                          pricePerKg: r.toolPricesKg[safe: i] ?? nil,
+                          parts: (r.toolParts[safe: i] ?? []).map {
+                              .init(spool: $0.spool == 0 ? nil : $0.spool, share: $0.share,
+                                    source: $0.source.isEmpty ? nil : $0.source,
+                                    pricePerKg: $0.price_kg > 0 ? $0.price_kg : nil, cost: $0.cost)
+                          })
+            })
         }
         var spools = r.spools
         // A record from the daemon version that only sampled the active spool
@@ -253,7 +311,15 @@ enum FilamentPricing {
                 where spools[ch] == nil { spools[ch] = sid }
             }
         }
-        let parts = await costPerTool(grams: r.gramsPerTool, spools: spools, map: r.extruderMap, slicerPrices: r.slicerPricesKg)
+        let sp = spools
+        let parts = await costPerTool(grams: r.gramsPerTool, spools: sp, map: r.extruderMap, slicerPrices: r.slicerPricesKg,
+                                      shares: { tool in
+                                          // Mid-print swaps from the record; a channel without usage
+                                          // data falls back to the (possibly looked-up) single spool.
+                                          let segs = r.spoolShares(forTool: tool)
+                                          if segs.count == 1, segs[0].spool == nil { return [(spool: sp[r.channel(forTool: tool)], share: 1)] }
+                                          return segs
+                                      })
         let sum = total(of: parts.map(\.cost), grams: r.gramsPerTool)
         if let sum {
             await EnergyLog.storePrice(started: r.started, total: sum, tools: parts,
@@ -361,6 +427,13 @@ enum EnergyLog {
         raw[i]["filament_tool_costs"] = tools.map { t -> Any in t.cost.map { ($0 * 10000).rounded() / 10000 } ?? NSNull() }
         raw[i]["filament_tool_sources"] = tools.map { t -> Any in t.source ?? NSNull() }
         raw[i]["filament_tool_price_kg"] = tools.map { t -> Any in t.pricePerKg.map { ($0 * 100).rounded() / 100 } ?? NSNull() }
+        raw[i]["filament_tool_parts"] = tools.map { t -> Any in
+            t.parts.map { p -> [String: Any] in
+                ["spool": p.spool ?? 0, "share": (p.share * 1000).rounded() / 1000,
+                 "source": p.source ?? "", "price_kg": p.pricePerKg.map { ($0 * 100).rounded() / 100 } ?? 0,
+                 "cost": p.cost.map { ($0 * 10000).rounded() / 10000 } ?? 0]
+            }
+        }
         raw[i]["price_source"] = FilamentPricing.useSpoolman ? "spoolman" : "slicer"
         guard let data = try? JSONSerialization.data(withJSONObject: ["prints": raw],
                                                      options: [.prettyPrinted, .sortedKeys]) else { return }
@@ -467,6 +540,9 @@ enum EnergyLog {
     static func money(_ value: Double, _ code: String) -> String {
         String(format: "%.2f %@", value, symbol(code))
     }
+    /// Money is shown to cents, so every displayed total is built from the
+    /// already-rounded parts — 0.20 + 2.16 must read 2.36, not 2.35.
+    nonisolated static func cents(_ value: Double) -> Double { (value * 100).rounded() / 100 }
 
     static func duration(_ seconds: Int) -> String {
         let h = seconds / 3600, m = (seconds % 3600) / 60
@@ -842,7 +918,7 @@ struct EnergyHistoryView: View {
         /// nil once priced = no real price available for this print.
         var filamentCost: Double? = nil
         var id: String { "\(source.baseURL)|\(record.started)" }
-        var total: Double { record.cost + (filamentCost ?? 0) }
+        var total: Double { EnergyLog.cents(record.cost) + EnergyLog.cents(filamentCost ?? 0) }
         var priceMissing: Bool { priced && filamentCost == nil && record.filamentG > 0 }
     }
 
@@ -855,9 +931,9 @@ struct EnergyHistoryView: View {
     /// The tapped row — carried in the item so the sheet never reads stale state.
     @State private var selected: Row? = nil
 
-    private var total: Double { rows.reduce(0) { $0 + $1.total } }
-    private var totalEnergy: Double { rows.reduce(0) { $0 + $1.record.cost } }
-    private var totalFilament: Double { rows.reduce(0) { $0 + ($1.filamentCost ?? 0) } }
+    private var totalEnergy: Double { rows.reduce(0) { $0 + EnergyLog.cents($1.record.cost) } }
+    private var totalFilament: Double { rows.reduce(0) { $0 + EnergyLog.cents($1.filamentCost ?? 0) } }
+    private var total: Double { totalEnergy + totalFilament }
     private var totalKWh: Double { rows.reduce(0) { $0 + $1.record.kwh } }
     private var totalGrams: Double { rows.reduce(0) { $0 + $1.record.filamentG } }
     private var currency: String { rows.first?.record.currency ?? "EUR" }
@@ -1023,9 +1099,10 @@ struct EnergyDetailView: View {
     /// Priced HERE, not taken from the list row: the row is a snapshot from
     /// the moment it was tapped and may not have been priced yet.
     private var filamentTotal: Double? {
-        priced ? FilamentPricing.total(of: toolCosts, grams: r.gramsPerTool) : row.filamentCost
+        // Sum of the per-head amounts as displayed, so the lines add up.
+        priced ? FilamentPricing.total(of: toolCosts.map { $0.map(EnergyLog.cents) }, grams: r.gramsPerTool) : row.filamentCost
     }
-    private var grandTotal: Double { r.cost + (filamentTotal ?? 0) }
+    private var grandTotal: Double { EnergyLog.cents(r.cost) + EnergyLog.cents(filamentTotal ?? 0) }
     private var totalMissing: Bool { priced && filamentTotal == nil && r.filamentG > 0 }
 
     /// Material per sliced tool, from the channel that REALLY printed it
@@ -1130,7 +1207,21 @@ struct EnergyDetailView: View {
                                                 Text(loaded(tool: i)).foregroundStyle(multi ? .secondary : .primary).lineLimit(1)
                                             }
                                         }
-                                        Text(priced ? priceSource(tool: i) : "…").font(.caption2).foregroundStyle(.tertiary)
+                                        if let parts = self.tools[safe: i]?.parts, parts.count > 1 {
+                                            // Spool swapped mid-print: every spool with its share and price.
+                                            ForEach(parts.indices, id: \.self) { k in
+                                                let p = parts[k]
+                                                HStack(spacing: 5) {
+                                                    Circle().fill(spoolColor(p.spool) ?? Color.secondary.opacity(0.3))
+                                                        .frame(width: 8, height: 8)
+                                                    Text("\(spoolLabel(p.spool)) · \(Int((p.share * 100).rounded())) % · \(partSource(p))")
+                                                        .lineLimit(1)
+                                                }
+                                                .font(.caption2).foregroundStyle(.tertiary)
+                                            }
+                                        } else {
+                                            Text(priced ? priceSource(tool: i) : "…").font(.caption2).foregroundStyle(.tertiary)
+                                        }
                                     }
                                     Spacer()
                                     VStack(alignment: .trailing, spacing: 1) {
@@ -1166,6 +1257,21 @@ struct EnergyDetailView: View {
                 }
             }
         }
+    }
+
+    private func spoolLabel(_ id: Int?) -> String {
+        guard let id else { return priceMissing }
+        if let c = r.spoolInfos[id], !c.label.isEmpty { return c.label }
+        if let c = spoolChannels.values.first(where: { $0.spoolId == id }), !c.label.isEmpty { return c.label }
+        return "Spoolman #\(id)"
+    }
+    private func spoolColor(_ id: Int?) -> Color? {
+        guard let id else { return nil }
+        return (r.spoolInfos[id] ?? spoolChannels.values.first(where: { $0.spoolId == id }))?.swiftUIColor
+    }
+    private func partSource(_ p: FilamentPricing.ToolPrice.Part) -> String {
+        guard let src = p.source, let kg = p.pricePerKg else { return priceMissing }
+        return "\(src == "spoolman" ? "Spoolman" : "Slicer") · \(EnergyLog.money(kg, r.currency))/kg"
     }
 
     /// Where the per-kg price for this tool came from, with the figure.
@@ -1252,7 +1358,7 @@ struct EnergyCostTileView: View {
 
                     if isPrinting, let l = live, l.printing, Date().timeIntervalSince1970 - Double(l.at) < 180 {
                         // Running print: the cost so far, straight from the daemon.
-                        Text(EnergyLog.money(l.cost + (liveFilamentCost ?? 0), l.currency))
+                        Text(EnergyLog.money(EnergyLog.cents(l.cost) + EnergyLog.cents(liveFilamentCost ?? 0), l.currency))
                             .font(.system(size: 30, weight: .bold, design: .rounded))
                             .foregroundColor(.primary)
                             .minimumScaleFactor(0.5).lineLimit(1)
@@ -1271,7 +1377,7 @@ struct EnergyCostTileView: View {
                         Text(lz(en: "Running print", de: "Laufender Druck", fr: "Impression en cours", es: "Impresión en curso", pt: "Impressão em andamento", it: "Stampa in corso", zh: "打印进行中"))
                             .font(.caption2).foregroundColor(.secondary).lineLimit(1)
                     } else if let r = last {
-                        Text(EnergyLog.money(r.cost + (lastFilamentCost ?? 0), r.currency))
+                        Text(EnergyLog.money(EnergyLog.cents(r.cost) + EnergyLog.cents(lastFilamentCost ?? 0), r.currency))
                             .font(.system(size: 30, weight: .bold, design: .rounded))
                             .foregroundColor(.primary)
                             .minimumScaleFactor(0.5).lineLimit(1)

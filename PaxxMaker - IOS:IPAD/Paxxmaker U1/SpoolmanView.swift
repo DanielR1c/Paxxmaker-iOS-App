@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreNFC
 import Combine
 
 // MARK: - Spoolman store (view model)
@@ -128,7 +129,9 @@ struct SpoolmanView: View {
     // ── Spools ──────────────────────────────────────────────────────────────
     private var spoolList: some View {
         List {
-            ForEach(store.spools) { spool in
+            // Active spools first; archived (empty) ones only below the toggle,
+            // never mixed in between the full ones.
+            ForEach(store.spools.filter { !$0.archived }) { spool in
                 NavigationLink { SpoolDetailView(store: store, spool: spool) } label: {
                     SpoolRow(spool: spool)
                 }
@@ -137,6 +140,20 @@ struct SpoolmanView: View {
             Section {
                 Toggle(lz(en: "Show archived", de: "Archivierte anzeigen", fr: "Afficher archivées", es: "Mostrar archivados", pt: "Mostrar arquivados", it: "Mostra archiviate", zh: "显示已归档"), isOn: $store.showArchived)
                     .onChange(of: store.showArchived) { _, _ in Task { await store.reloadAll() } }
+            }
+            if store.showArchived {
+                let archived = store.spools.filter { $0.archived }
+                Section(lz(en: "Archived", de: "Archiviert", fr: "Archivées", es: "Archivados", pt: "Arquivados", it: "Archiviate", zh: "已归档")) {
+                    if archived.isEmpty {
+                        Text(lz(en: "No archived spools", de: "Keine archivierten Spulen", fr: "Aucune bobine archivée", es: "Sin carretes archivados", pt: "Sem bobinas arquivadas", it: "Nessuna bobina archiviata", zh: "没有已归档的料盘"))
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(archived) { spool in
+                        NavigationLink { SpoolDetailView(store: store, spool: spool) } label: {
+                            SpoolRow(spool: spool)
+                        }
+                    }
+                }
             }
         }
         .listStyle(.insetGrouped)
@@ -307,9 +324,12 @@ struct ActiveSpoolTileView: View {
                 }
             } else {
                 Spacer(minLength: 12)
-                Text(printer.activeSpoolId == nil
-                     ? lz(en: "None — tap to choose", de: "Keine — zum Wählen tippen", fr: "Aucune — appuyez", es: "Ninguna — toca", pt: "Nenhuma — toque", it: "Nessuna — tocca", zh: "无 — 点击选择")
-                     : "#\(printer.effectiveActiveSpoolId!)")
+                // No force unwrap: with the U1's Filament Manager the active
+                // channel may have no spool while `activeSpoolId` is still set
+                // — that crashed the app on every printer page switch.
+                let known = printer.effectiveActiveSpoolId ?? printer.activeSpoolId
+                Text(known.map { "#\($0)" }
+                     ?? lz(en: "None — tap to choose", de: "Keine — zum Wählen tippen", fr: "Aucune — appuyez", es: "Ninguna — toca", pt: "Nenhuma — toque", it: "Nessuna — tocca", zh: "无 — 点击选择"))
                     .font(.subheadline).foregroundColor(.secondary).lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Spacer(minLength: 12)
@@ -594,6 +614,57 @@ struct MultiColorSpoolSheet: View {
 // The dashboard's Spools tile turns into the Spoollink tile and opens this
 // sheet; there is no separate Spoollink tile.
 private struct SpoollinkChannelBox: Identifiable { let id: Int }
+private struct SpoollinkUIDBox: Identifiable { let id: String }
+extension Notification.Name {
+    /// userInfo: "uid" (String, upper-case hex), "spool" (Int)
+    static let paxxCardUIDLinked = Notification.Name("paxxmaker.cardUIDLinked")
+}
+
+/// Reads just the chip's UID off an NFC tag with the phone — the same 7-byte
+/// identifier the printer reports as CARD_UID, formatted the same way (upper-
+/// case hex, no separators), so a link made here matches what the printer
+/// sees later.
+final class TagUIDReader: NSObject, NFCTagReaderSessionDelegate {
+    static var available: Bool { NFCTagReaderSession.readingAvailable }
+    private var session: NFCTagReaderSession?
+    private var completion: ((String?) -> Void)?
+
+    func read(prompt: String, completion: @escaping (String?) -> Void) {
+        guard NFCTagReaderSession.readingAvailable else { completion(nil); return }
+        self.completion = completion
+        let s = NFCTagReaderSession(pollingOption: [.iso14443, .iso15693], delegate: self, queue: .main)
+        s?.alertMessage = prompt
+        session = s
+        s?.begin()
+    }
+
+    func tagReaderSessionDidBecomeActive(_ session: NFCTagReaderSession) {}
+
+    func tagReaderSession(_ session: NFCTagReaderSession, didInvalidateWithError error: Error) {
+        let done = completion; completion = nil; self.session = nil
+        DispatchQueue.main.async { done?(nil) }
+    }
+
+    func tagReaderSession(_ session: NFCTagReaderSession, didDetect tags: [NFCTag]) {
+        guard let tag = tags.first else { return }
+        let id: Data?
+        switch tag {
+        case .miFare(let t):   id = t.identifier
+        case .iso15693(let t): id = t.identifier
+        case .iso7816(let t):  id = t.identifier
+        case .feliCa(let t):   id = t.currentIDm
+        @unknown default:      id = nil
+        }
+        guard let id, !id.isEmpty else {
+            session.invalidate(errorMessage: "Tag nicht lesbar"); return
+        }
+        let hex = id.map { String(format: "%02X", $0) }.joined()
+        session.alertMessage = "✓"
+        session.invalidate()
+        let done = completion; completion = nil; self.session = nil
+        DispatchQueue.main.async { done?(hex) }
+    }
+}
 
 struct SpoollinkSheet: View {
     @ObservedObject var printer: PrinterService
@@ -611,6 +682,9 @@ struct SpoollinkSheet: View {
     @State private var linkChannel: SpoollinkChannelBox? = nil
     @State private var busy = false
     @State private var status: String? = nil
+    /// Tag read with the phone, waiting for a spool to be picked.
+    @State private var phoneUID: SpoollinkUIDBox? = nil
+    @State private var uidReader = TagUIDReader()
 
     private func spool(_ id: Int) -> SpoolmanSpool? { spools.first { $0.id == id } }
 
@@ -632,13 +706,39 @@ struct SpoollinkSheet: View {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { busy = false; status = nil }
                     } label: {
                         HStack {
-                            Label(lz(en: "Read spool tags", de: "Spulen-Tags lesen", fr: "Lire les tags", es: "Leer etiquetas", pt: "Ler etiquetas", it: "Leggi i tag", zh: "读取料盘标签"),
-                                  systemImage: "wave.3.right")
+                            Label {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(lz(en: "Read spool tags", de: "Spulen-Tags lesen", fr: "Lire les tags", es: "Leer etiquetas", pt: "Ler etiquetas", it: "Leggi i tag", zh: "读取料盘标签"))
+                                    Text(lz(en: "on the printer: all channels", de: "am Drucker: alle Kanäle", fr: "sur l'imprimante : tous les canaux", es: "en la impresora: todos los canales", pt: "na impressora: todos os canais", it: "sulla stampante: tutti i canali", zh: "在打印机上：所有通道"))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            } icon: { Image(systemName: "printer.fill") }
                             Spacer()
                             if busy { ProgressView() }
                         }
                     }
                     .disabled(busy)
+
+                    // Prepare spools away from the printer: hold a tag to the
+                    // phone, pick the spool it belongs to — Spoolman gets the
+                    // UID, and the printer recognises the spool the moment it
+                    // is loaded.
+                    Button {
+                        uidReader.read(prompt: lz(en: "Hold the spool tag to the top of the iPhone", de: "Spulen-Tag an die Oberkante des iPhones halten", fr: "Approche le tag de la bobine du haut de l'iPhone", es: "Acerca la etiqueta de la bobina a la parte superior del iPhone", pt: "Aproxime a etiqueta da bobina do topo do iPhone", it: "Avvicina il tag della bobina alla parte alta dell'iPhone", zh: "将料盘标签靠近 iPhone 顶部")) { uid in
+                            guard let uid else { return }
+                            phoneUID = SpoollinkUIDBox(id: uid)
+                        }
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(lz(en: "Link tag", de: "Tag verknüpfen", fr: "Lier un tag", es: "Vincular etiqueta", pt: "Vincular etiqueta", it: "Collega un tag", zh: "关联标签"))
+                                Text(lz(en: "on the iPhone, no printer needed", de: "am iPhone, ohne Drucker", fr: "sur l'iPhone, sans imprimante", es: "en el iPhone, sin impresora", pt: "no iPhone, sem impressora", it: "sull'iPhone, senza stampante", zh: "在 iPhone 上，无需打印机"))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        } icon: { Image(systemName: "iphone.radiowaves.left.and.right") }
+                    }
+                    .disabled(!NFCTagReaderSession.readingAvailable || !spoolsLoaded)
+
                     if let s = status { Text(s).font(.caption).foregroundStyle(.secondary) }
                 }
 
@@ -809,6 +909,22 @@ struct SpoollinkSheet: View {
                 }
             }
             .refreshable { printer.fetchSpoollinkState(); await loadSpools() }
+            .sheet(item: $phoneUID) { box in
+                let linked = spools.first { $0.cardUIDs.contains(box.id) }
+                ActiveSpoolPicker(
+                    spools: spools,
+                    activeId: linked?.id,
+                    title: lz(en: "Tag \(box.id)", de: "Tag \(box.id)", fr: "Tag \(box.id)", es: "Etiqueta \(box.id)", pt: "Etiqueta \(box.id)", it: "Tag \(box.id)", zh: "标签 \(box.id)"),
+                    noneLabel: lz(en: "Cancel", de: "Abbrechen", fr: "Annuler", es: "Cancelar", pt: "Cancelar", it: "Annulla", zh: "取消")
+                ) { id in
+                    phoneUID = nil
+                    guard let id else { return }
+                    printer.linkCardUID(box.id, to: id)
+                    status = lz(en: "Tag linked to \(spool(id)?.filament.rowTitle ?? "#\(id)").", de: "Tag mit \(spool(id)?.filament.rowTitle ?? "#\(id)") verknüpft.", fr: "Tag lié à \(spool(id)?.filament.rowTitle ?? "#\(id)").", es: "Etiqueta vinculada a \(spool(id)?.filament.rowTitle ?? "#\(id)").", pt: "Etiqueta vinculada a \(spool(id)?.filament.rowTitle ?? "#\(id)").", it: "Tag collegato a \(spool(id)?.filament.rowTitle ?? "#\(id)").", zh: "标签已关联到 \(spool(id)?.filament.rowTitle ?? "#\(id)")。")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { status = nil }
+                    reloadSoon()
+                }
+            }
             .sheet(item: $linkChannel) { box in
                 ActiveSpoolPicker(
                     spools: spools,

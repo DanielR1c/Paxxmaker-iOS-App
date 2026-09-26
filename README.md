@@ -1,6 +1,12 @@
-## Version 2.4 (Beta)
+## Version 2.4
 
-The beta now includes Paxxmaker-Slicer. If you'd like to try it, install [PaxxMaker-Connect](https://github.com/DanielR1c/PaxxMaker-Connect) and join the beta team in [TestFlight](https://testflight.apple.com/join/buYCzVWP).
+Neu: PaxxMaker-Slicer (Beta)
+
+Du öffnest die STL am Handy, richtest sie auf der Druckplatte aus, skalierst sie und färbst Flächen für die einzelnen Köpfe ein. [PaxxMaker-Connect](https://github.com/DanielR1c/PaxxMaker-Connect)  bildet die Brücke zwischen deinem Handy und OrcaSlicer: Das Slicen übernimmt dein Mac oder Windows-PC mit deinen eigenen OrcaSlicer-Profilen. Der fertige G-Code kommt zurück in die App und geht von dort direkt an den Drucker. Alles bleibt in deinem Netzwerk.
+
+Neu ist auch die G-Code-Vorschau: Sie zeigt den Druck in den Farben der Filamente, die gerade im Drucker geladen sind.
+
+Außerdem: Fehler behoben und kleinere Verbesserungen.
 
 ---
 

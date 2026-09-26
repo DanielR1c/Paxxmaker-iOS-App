@@ -2,11 +2,11 @@
 
 New: PaxxMaker Slicer (Beta)
 
-Open the STL on your phone, place it on the build plate, scale it and paint faces for the individual heads. [PaxxMaker-Connect](https://github.com/DanielR1c/PaxxMaker-Connect) builds the bridge between your phone and OrcaSlicer: your Mac or Windows PC does the slicing with your own OrcaSlicer profiles. The finished G-code comes back to the app and goes straight to the printer from there. Everything stays on your network.
+• Open the STL on your phone, place it on the build plate, scale it and paint faces for the individual heads. [PaxxMaker-Connect](https://github.com/DanielR1c/PaxxMaker-Connect) builds the bridge between your phone and OrcaSlicer: your Mac or Windows PC does the slicing with your own OrcaSlicer profiles. The finished G-code comes back to the app and goes straight to the printer from there. Everything stays on your network.
 
-Also new: the G-code preview shows the print in the colours of the filaments currently loaded in the printer.
+• Also new: the G-code preview shows the print in the colours of the filaments currently loaded in the printer.
 
-Also: bug fixes and smaller improvements.
+• Bug fixes and improvements.
 
 
 ---

@@ -1,4 +1,5 @@
 If you like the app and want to support its development
+
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/paxxmaker)
 
 ## Version 2.4

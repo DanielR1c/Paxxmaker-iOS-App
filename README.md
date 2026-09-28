@@ -22,3 +22,5 @@ New: PaxxMaker Slicer (Beta)
 • Push notifications now tell a pause from an empty spool – on the U1 with the nozzle.
 
   • Bug fixes and improvements.
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/paxxmaker)

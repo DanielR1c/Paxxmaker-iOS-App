@@ -394,6 +394,8 @@ extension ConnectError {
 
 struct ConnectClient {
     let config: ConnectConfig
+    /// On a network failure, look for the computer again (see ConnectRediscovery).
+    var rediscover = true
 
     private func request(_ path: String, method: String = "GET", body: Data? = nil, headers: [String: String] = [:], timeout: TimeInterval = 20) throws -> URLRequest {
         // A Bonjour service name ("MacBook Air von Isabell") is not an address:
@@ -407,10 +409,25 @@ struct ConnectClient {
         return r
     }
 
+    /// Sends a request; if the computer does not answer at the saved address
+    /// (a new IP after sleep, a rotated IPv6 address), it is looked up again
+    /// via Bonjour and the request repeated once at the new address.
+    private func send(_ req: URLRequest) async throws -> (Data, URLResponse) {
+        do { return try await URLSession.shared.data(for: req) }
+        catch {
+            guard rediscover, let fresh = await ConnectRediscovery.refresh(config),
+                  let old = req.url, var c = URLComponents(url: old, resolvingAgainstBaseURL: false),
+                  let base = URLComponents(string: fresh.baseURL) else { throw ConnectError.unreachable }
+            c.scheme = base.scheme; c.host = base.host; c.port = base.port
+            guard let url = c.url else { throw ConnectError.unreachable }
+            var r = req
+            r.url = url
+            do { return try await URLSession.shared.data(for: r) } catch { throw ConnectError.unreachable }
+        }
+    }
+
     private func run<T: Decodable>(_ req: URLRequest, as: T.Type) async throws -> T {
-        let (data, resp): (Data, URLResponse)
-        do { (data, resp) = try await URLSession.shared.data(for: req) }
-        catch { throw ConnectError.unreachable }
+        let (data, resp) = try await send(req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 { throw ConnectError.badCode }
         guard (200..<300).contains(code) else { throw ConnectError.http(code) }
@@ -418,7 +435,9 @@ struct ConnectClient {
         return v
     }
 
-    struct Info: Decodable { var name: String; var version: String; var host: String; var orca: Bool; var apps: [String] }
+    struct Info: Decodable { var name: String; var version: String; var host: String; var orca: Bool; var apps: [String]
+        /// What this Connect can do beyond the basics (e.g. "ranges"); older ones send none.
+        var features: [String]? = nil }
     func info() async throws -> Info { try await run(try request("/v1/info", timeout: 6), as: Info.self) }
 
     func profiles(app: String) async throws -> SlicerProfiles {
@@ -428,9 +447,7 @@ struct ConnectClient {
     /// One preset flattened through its inheritance chain (Orca's own keys and string values).
     func profile(app: String, kind: String, name: String) async throws -> [String: Any] {
         let n = name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? name
-        let (data, resp): (Data, URLResponse)
-        do { (data, resp) = try await URLSession.shared.data(for: try request("/v1/profile?app=\(app)&kind=\(kind)&name=\(n)")) }
-        catch { throw ConnectError.unreachable }
+        let (data, resp) = try await send(try request("/v1/profile?app=\(app)&kind=\(kind)&name=\(n)"))
         guard (200..<300).contains((resp as? HTTPURLResponse)?.statusCode ?? 0),
               let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw ConnectError.decode }
         return d
@@ -449,7 +466,7 @@ struct ConnectClient {
     func job(_ id: String) async throws -> SliceJob { try await run(try request("/v1/jobs/\(id)", timeout: 10), as: SliceJob.self) }
 
     func gcode(_ id: String) async throws -> Data {
-        let (data, resp) = try await URLSession.shared.data(for: try request("/v1/jobs/\(id)/gcode", timeout: 120))
+        let (data, resp) = try await send(try request("/v1/jobs/\(id)/gcode", timeout: 120))
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw ConnectError.http((resp as? HTTPURLResponse)?.statusCode ?? 0) }
         return data
     }
@@ -479,10 +496,19 @@ final class ConnectBrowser: ObservableObject {
 
     /// Bonjour hands out a service endpoint; the HTTP client needs host:port.
     /// A short TCP connect resolves it.
+    /// IPv4 first: at home it stays the same across sleep, while macOS keeps
+    /// swapping its temporary IPv6 addresses — a saved one stops working.
     static func resolve(_ endpoint: NWEndpoint) async -> (String, Int)? {
+        if let v4 = await resolve(endpoint, v4Only: true) { return v4 }
+        return await resolve(endpoint, v4Only: false)
+    }
+
+    private static func resolve(_ endpoint: NWEndpoint, v4Only: Bool) async -> (String, Int)? {
         final class Flag: @unchecked Sendable { nonisolated(unsafe) var done = false }
+        let params = NWParameters.tcp
+        if v4Only, let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options { ip.version = .v4 }
         return await withCheckedContinuation { cont in
-            let c = NWConnection(to: endpoint, using: .tcp)
+            let c = NWConnection(to: endpoint, using: params)
             let q = DispatchQueue(label: "paxxmaker.resolve")
             let flag = Flag()
             c.stateUpdateHandler = { st in
@@ -505,6 +531,70 @@ final class ConnectBrowser: ObservableObject {
             q.asyncAfter(deadline: .now() + 5) {
                 if !flag.done { flag.done = true; c.cancel(); cont.resume(returning: nil) }
             }
+        }
+    }
+}
+
+// MARK: Finding the computer again
+
+/// The paired computer answers no more at its saved address: browse Bonjour
+/// for PaxxMaker-Connect, take the one with the saved name (or the only one),
+/// check the saved code there and keep the new address. Several requests
+/// failing at once share one search.
+enum ConnectRediscovery {
+    private static var running: Task<ConnectConfig?, Never>? = nil
+
+    // MainActor-isolated, so the running-task bookkeeping is already serialized
+    // (the synchronous prologue runs atomically up to the first await) — no lock
+    // needed, and NSLock isn't usable across awaits anyway.
+    static func refresh(_ cfg: ConnectConfig) async -> ConnectConfig? {
+        let task: Task<ConnectConfig?, Never>
+        if let r = running { task = r } else {
+            task = Task { await search(cfg) }
+            running = task
+        }
+        let result = await task.value
+        if running == task { running = nil }
+        return result
+    }
+
+    private static func search(_ cfg: ConnectConfig) async -> ConnectConfig? {
+        let found = await browse(seconds: 3)
+        guard !found.isEmpty else { return nil }
+        let name = cfg.name.lowercased()
+        let matching = found.filter { f in
+            let n = f.name.lowercased()
+            return !name.isEmpty && (n == name || n.contains(name) || name.contains(n))
+        }
+        for f in (matching.isEmpty && found.count == 1 ? found : matching) {
+            guard let (host, port) = await ConnectBrowser.resolve(f.endpoint) else { continue }
+            let fresh = ConnectConfig(host: host, port: port, token: cfg.token, name: cfg.name)
+            let probe = ConnectClient(config: fresh, rediscover: false)
+            guard (try? await probe.info()) != nil else { continue }
+            // The saved code must still be valid there.
+            if case ConnectError.badCode? = await { () async -> Error? in
+                do { _ = try await probe.job("check"); return nil } catch { return error }
+            }() { continue }
+            if fresh.host != cfg.host || fresh.port != cfg.port { fresh.save() }
+            return fresh
+        }
+        return nil
+    }
+
+    private static func browse(seconds: Double) async -> [ConnectBrowser.Found] {
+        final class Box: @unchecked Sendable { nonisolated(unsafe) var list: [ConnectBrowser.Found] = [] }
+        return await withCheckedContinuation { cont in
+            let b = NWBrowser(for: .bonjour(type: "_paxxconnect._tcp", domain: nil), using: .tcp)
+            let box = Box()
+            let q = DispatchQueue(label: "paxxmaker.rediscover")
+            b.browseResultsChangedHandler = { results, _ in
+                box.list = results.compactMap { r in
+                    if case let .service(name, _, _, _) = r.endpoint { return ConnectBrowser.Found(id: name, name: name, endpoint: r.endpoint) }
+                    return nil
+                }
+            }
+            b.start(queue: q)
+            q.asyncAfter(deadline: .now() + seconds) { b.cancel(); cont.resume(returning: box.list) }
         }
     }
 }
@@ -1050,6 +1140,11 @@ struct SliceSettingsSheet: View {
     /// Every value the chosen process profile holds, for the settings that
     /// have no row of their own.
     @State private var profileValues: [String: String] = [:]
+    /// Version of the paired PaxxMaker-Connect ("" until known).
+    @State private var connectVersion = ""
+    @State private var connectFeatures: [String]? = nil
+    /// The machine profile's machine_pause_gcode (U1: M600), else Klipper's PAUSE.
+    @State private var pauseGcode = "PAUSE"
     /// What was changed on top of the profile, by Orca key.
     @State private var edits: [String: String] = [:]
     /// The profile's own values, to tell a changed setting from an untouched
@@ -1092,6 +1187,7 @@ struct SliceSettingsSheet: View {
         guard isU1 else { return [1] }
         var set = Set<Int>()
         for o in plate.objects { set.insert(o.extruder); set.formUnion(o.paintedHeads) }
+        set.formUnion(plate.activeBands.map(\.head))
         return set.isEmpty ? [1] : set.sorted()
     }
     private var multi: Bool { usedHeads.count > 1 }
@@ -1138,6 +1234,35 @@ struct SliceSettingsSheet: View {
                     profileSection(p)
                     layoutSections
                     perObjectSection
+                }
+                // Layer colours need a Connect that writes height ranges.
+                if !plate.activeBands.isEmpty, let f = connectFeatures, !f.contains("ranges") {
+                    Section {
+                        Label(lz(en: "Layer colours need the latest PaxxMaker-Connect on the computer — this one leaves them out.",
+                                 de: "Schichtfarben brauchen das neueste PaxxMaker-Connect auf dem Computer — dieses lässt sie weg.",
+                                 fr: "Les couleurs par couche nécessitent le dernier PaxxMaker-Connect sur l'ordinateur — celui-ci les ignore.",
+                                 es: "Los colores por capa necesitan el PaxxMaker-Connect más reciente en el ordenador; este los omite.",
+                                 pt: "As cores por camada precisam do PaxxMaker-Connect mais recente no computador — este as ignora.",
+                                 it: "I colori per strato richiedono l'ultimo PaxxMaker-Connect sul computer — questo li ignora.",
+                                 zh: "分层颜色需要电脑上最新的 PaxxMaker-Connect——当前版本会忽略它们。"),
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote).foregroundColor(.orange)
+                    }
+                }
+                // Older Connect versions drop painted fuzzy skin without a word.
+                if plate.objects.contains(where: \.hasFuzzy), !connectVersion.isEmpty,
+                   ConnectUpdate.compare("1.4", connectVersion) > 0 {
+                    Section {
+                        Label(lz(en: "Painted fuzzy skin needs PaxxMaker-Connect 1.4 on the computer — version \(connectVersion) leaves it out.",
+                                 de: "Gemaltes Fuzzy Skin braucht PaxxMaker-Connect 1.4 auf dem Computer — Version \(connectVersion) lässt es weg.",
+                                 fr: "Le fuzzy skin peint nécessite PaxxMaker-Connect 1.4 sur l'ordinateur — la version \(connectVersion) l'ignore.",
+                                 es: "El fuzzy skin pintado necesita PaxxMaker-Connect 1.4 en el ordenador — la versión \(connectVersion) lo omite.",
+                                 pt: "O fuzzy skin pintado precisa do PaxxMaker-Connect 1.4 no computador — a versão \(connectVersion) o ignora.",
+                                 it: "Il fuzzy skin dipinto richiede PaxxMaker-Connect 1.4 sul computer — la versione \(connectVersion) lo ignora.",
+                                 zh: "绘制的 Fuzzy Skin 需要电脑上的 PaxxMaker-Connect 1.4——版本 \(connectVersion) 会忽略它。"),
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote).foregroundColor(.orange)
+                    }
                 }
                 resultSection
                 bottomBar
@@ -1200,6 +1325,18 @@ struct SliceSettingsSheet: View {
                             Picker(isU1 ? lz(en: "Filament head \(e)", de: "Filament Kopf \(e)", fr: "Filament tête \(e)", es: "Filamento cabezal \(e)", pt: "Filamento cabeça \(e)", it: "Filamento testa \(e)", zh: "喷头 \(e) 耗材") : lz(en: "Filament", de: "Filament", fr: "Filament", es: "Filamento", pt: "Filamento", it: "Filamento", zh: "耗材"),
                                    selection: $filaments[e - 1]) {
                                 ForEach(compatible(p.filament)) { m in Text(m.name).tag(m.name) }
+                            }
+                            if isU1, filamentMismatch(e) {
+                                // The printer only maps a filament to heads with the same material.
+                                Label(lz(en: "Head \(e) has \(loadedMaterial(e)) loaded — the printer won't use it for this profile.",
+                                         de: "In Kopf \(e) ist \(loadedMaterial(e)) geladen — der Drucker nimmt ihn für dieses Profil nicht.",
+                                         fr: "La tête \(e) contient du \(loadedMaterial(e)) — l'imprimante ne l'utilisera pas pour ce profil.",
+                                         es: "El cabezal \(e) tiene \(loadedMaterial(e)) — la impresora no lo usará con este perfil.",
+                                         pt: "A cabeça \(e) tem \(loadedMaterial(e)) — a impressora não a usará com este perfil.",
+                                         it: "La testa \(e) ha \(loadedMaterial(e)) — la stampante non la userà con questo profilo.",
+                                         zh: "喷头 \(e) 装的是 \(loadedMaterial(e))——打印机不会为此配置使用它。"),
+                                      systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption).foregroundColor(.orange)
                             }
                             tempRow(lz(en: "Nozzle", de: "Düse", fr: "Buse", es: "Boquilla", pt: "Bico", it: "Ugello", zh: "喷嘴")
                                     + (isU1 && usedExtruders.count > 1 ? " \(e)" : ""),
@@ -1619,18 +1756,23 @@ struct SliceSettingsSheet: View {
                                         NotificationCenter.default.post(name: .paxxShowPrinter, object: printer.id.uuidString)
                                     }
                                 } label: {
-                                    HStack {
-                                        Spacer()
+                                    VStack(spacing: 2) {
                                         Label(lz(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo", pt: "Concluído", it: "Fine", zh: "完成"),
                                               systemImage: "checkmark.circle.fill")
-                                            .fontWeight(.semibold)
-                                        Spacer()
+                                            .font(.headline)
+                                        Text(lz(en: "Takes you to \(printer.name)", de: "Bringt dich zu \(printer.name)", fr: "T'amène à \(printer.name)", es: "Te lleva a \(printer.name)", pt: "Leva você a \(printer.name)", it: "Ti porta a \(printer.name)", zh: "带你前往 \(printer.name)"))
+                                            .font(.caption2).opacity(0.85)
                                     }
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 4)
                                 }
-                                Text(lz(en: "Takes you to \(printer.name).", de: "Bringt dich zu \(printer.name).", fr: "T'amène à \(printer.name).", es: "Te lleva a \(printer.name).", pt: "Leva você a \(printer.name).", it: "Ti porta a \(printer.name).", zh: "带你前往 \(printer.name)。"))
-                                    .font(.caption2).foregroundStyle(.secondary)
-                                    .frame(maxWidth: .infinity, alignment: .center)
-                                    .listRowSeparator(.hidden)
+                                // A real filled button, not a list row with text.
+                                .buttonStyle(.borderedProminent)
+                                .buttonBorderShape(.capsule)
+                                .controlSize(.large)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 2, trailing: 0))
+                                .listRowSeparator(.hidden)
                             }
                         }
                     }
@@ -1676,6 +1818,8 @@ struct SliceSettingsSheet: View {
         do {
             let info = try await client.info()
             app = info.apps.first ?? "orca"
+            connectVersion = info.version
+            connectFeatures = info.features ?? []
             let p = try await client.profiles(app: app)
             profiles = p
             // Last choice for this printer, else the first fitting preset.
@@ -1690,6 +1834,10 @@ struct SliceSettingsSheet: View {
             if !compatible(p.process).contains(where: { $0.name == process }) { process = compatible(p.process).first?.name ?? "" }
             let fil = compatible(p.filament)
             for i in 0..<4 where !fil.contains(where: { $0.name == filaments[i] }) { filaments[i] = fil.first?.name ?? "" }
+            // Each head gets the profile of what is loaded in it — at least
+            // the same material. A wrong material can not even be mapped on
+            // the printer (a PETG print is offered only PETG heads).
+            if isU1 { for i in 0..<4 { matchLoadedFilament(head: i + 1, presets: fil) } }
             // Remembered tweaks belong to the preset they were made on. On the
             // same preset they stay; the profile is still read, because the
             // rows without a field of their own start from its values.
@@ -1759,7 +1907,12 @@ struct SliceSettingsSheet: View {
     private func loadBedType() async {
         guard let cfg = config, !machine.isEmpty else { return }
         if let d = try? await ConnectClient(config: cfg).profile(app: app, kind: "machine", name: machine),
-           let t = d["default_bed_type"] as? String { bedTypeName = t }
+           let t = d["default_bed_type"] as? String {
+            bedTypeName = t
+            // The printer's own pause command, as Orca would use it.
+            let pg = (d["machine_pause_gcode"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            pauseGcode = pg.isEmpty ? "PAUSE" : pg
+        }
     }
 
     private func fillFromProfile(keepTweaks: Bool = false) async {
@@ -1778,6 +1931,9 @@ struct SliceSettingsSheet: View {
                 if let n = v as? NSNumber { return n.stringValue }
                 return nil
             }
+            // The tower on the plate takes its width and brim from the profile.
+            if let w = Double(profileValues["prime_tower_width"] ?? ""), w > 5 { UserDefaults.standard.set(w, forKey: "prime_tower_width") }
+            if let b = Double(profileValues["prime_tower_brim_width"] ?? ""), b >= 0 { UserDefaults.standard.set(b, forKey: "prime_tower_brim_width") }
             if !keepTweaks { edits.removeAll() }
         } else if !keepTweaks {
             q.process = process
@@ -1812,7 +1968,20 @@ struct SliceSettingsSheet: View {
             // in the editor rides along as its Orca key.
             var overrides = q.overrides
             for (k, v) in edits where !SliceCatalog.builtInKeys.contains(k) && !v.isEmpty { overrides[k] = v }
+            // Painted fuzzy skin only shows when Fuzzy Skin is not "Disabled";
+            // Orca's "Painted only" (none) then roughens just those faces.
+            if plate.objects.contains(where: \.hasFuzzy),
+               ((overrides["fuzzy_skin"] as? String) ?? profileValues["fuzzy_skin"] ?? "disabled_fuzzy") == "disabled_fuzzy" {
+                overrides["fuzzy_skin"] = "none"
+            }
             spec["overrides"] = overrides
+            // Each height range needs a layer height of its own (Orca crashes
+            // without one) — the one this slice uses.
+            if !plate.activeBands.isEmpty {
+                let lh = (overrides["layer_height"] as? Double) ?? (overrides["layer_height"] as? Float).map(Double.init)
+                    ?? Double(profileValues["layer_height"] ?? "") ?? 0.2
+                spec["range_layer_height"] = lh
+            }
             // Temperatures as shown in the sheet (0 = leave the profile alone).
             spec["nozzle_temps"] = (0..<4).map { usedHeads.contains($0 + 1) ? nozzleTemps[$0] : 0 }
             spec["bed_temp"] = bedTemp
@@ -1823,15 +1992,31 @@ struct SliceSettingsSheet: View {
             // both sides) with its placement, head and painted faces.
             var objs: [[String: Any]] = []
             for o in plate.objects {
-                let mid = try await client.upload(o.mesh.stlData, ext: "stl")
-                let m = o.matrix
+                // Lowered into the bed: the part above it, already cut on the
+                // phone — OrcaSlicer would put a sunk object back on the bed.
+                let part = o.printedPart()
+                let mid = try await client.upload(part.mesh.stlData, ext: "stl")
+                let m = part.transform
                 let flat: [Double] = (0..<4).flatMap { c in (0..<4).map { r in Double(m[c][r]) } }
                 var d: [String: Any] = ["name": o.name, "model": mid, "transform": flat, "extruder": multi ? o.extruder : 1]
                 if let own = o.settings { d["settings"] = own.objectOverrides }
                 if multi {
-                    let strings = o.paintStrings
+                    let strings = part.paint
                     if !strings.isEmpty { d["paint"] = Dictionary(uniqueKeysWithValues: strings.map { (String($0.key), $0.value) }) }
                 }
+                // Layer colours: the plate's height ranges, cut to this
+                // object's height — Orca's height range modifiers with an
+                // extruder of their own (Connect writes layer_config_ranges).
+                if multi {
+                    let objTop = o.placedSize.z - o.sink
+                    let ranges: [[Double]] = plate.activeBands.compactMap { b in
+                        guard b.from < objTop else { return nil }
+                        return [Double(b.from), Double(min(b.to, objTop)), Double(b.head)]
+                    }
+                    if !ranges.isEmpty { d["ranges"] = ranges }
+                }
+                // Painted fuzzy skin works with one head as well (Connect 1.4+).
+                if !part.fuzzy.isEmpty { d["fuzzy"] = Dictionary(uniqueKeysWithValues: part.fuzzy.map { (String($0.key), $0.value) }) }
                 objs.append(d)
             }
             spec["objects"] = objs
@@ -1867,12 +2052,91 @@ struct SliceSettingsSheet: View {
         printerServices.services.first(where: { $0.name == printer.name })?.slotColorHexes ?? []
     }
 
+    // MARK: filament per head from what is loaded
+
+    private static let materialWords = ["pla", "petg", "abs", "asa", "tpu", "pa", "pc", "pet", "pva", "hips", "pp", "pctg", "tpe", "flex", "nylon"]
+
+    /// The material a profile name speaks of ("eSUN - PLA Schwarz" → "pla").
+    private static func material(inName name: String) -> String? {
+        let tokens = name.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        return materialWords.first { w in tokens.contains { $0 == w } }
+    }
+
+    /// "PLA+" and "PLA" are the same material for this purpose.
+    private static func baseMaterial(_ t: String) -> String {
+        var s = t.lowercased().trimmingCharacters(in: .whitespaces)
+        while s.hasSuffix("+") { s.removeLast() }
+        if let dash = s.firstIndex(of: "-") { s = String(s[..<dash]) }      // PLA-CF → pla
+        return s
+    }
+
+    /// Colour words in profile names, per rough colour.
+    private static func colourWords(_ hex: String) -> [String] {
+        guard hex.count >= 6, let v = Int(hex.prefix(6), radix: 16) else { return [] }
+        let r = Double((v >> 16) & 255), g = Double((v >> 8) & 255), b = Double(v & 255)
+        let mx = max(r, g, b), mn = min(r, g, b)
+        if mx < 60 { return ["schwarz", "black", "noir", "negro", "nero"] }
+        if mn > 200 { return ["weiß", "weiss", "white", "blanc", "blanco", "bianco"] }
+        if mx - mn < 30 { return ["grau", "grey", "gray", "silber", "silver"] }
+        if r > 180 && g > 110 && b < 90 { return ["gold", "orange", "gelb", "yellow"] }
+        if r > 150 && g < 90 { return ["rot", "red", "feuerrot", "rouge", "rojo"] }
+        if g > r && g > b { return ["grün", "gruen", "green", "vert", "verde"] }
+        if b > r && b > g { return ["blau", "blue", "bleu", "azul"] }
+        return []
+    }
+
+    /// Material loaded in a head (as the printer reports it), "" if unknown.
+    private func loadedMaterial(_ head: Int) -> String {
+        printerServices.services.first(where: { $0.name == printer.name })?.slotMaterials[safe: head - 1] ?? ""
+    }
+
+    /// The chosen profile's material does not fit what is loaded in the head.
+    private func filamentMismatch(_ head: Int) -> Bool {
+        let loaded = baseMaterialOrEmpty(loadedMaterial(head))
+        guard !loaded.isEmpty, let own = Self.material(inName: filaments[head - 1]) else { return false }
+        return own != loaded
+    }
+
+    private func baseMaterialOrEmpty(_ t: String) -> String {
+        let b = Self.baseMaterial(t)
+        return b == "none" ? "" : b
+    }
+
+    /// Picks the best profile for a head when none fits its loaded material:
+    /// same material required, then the same maker, then the same colour.
+    private func matchLoadedFilament(head: Int, presets: [SlicerProfiles.Preset]) {
+        let svc = printerServices.services.first(where: { $0.name == printer.name })
+        let loaded = baseMaterialOrEmpty(svc?.slotMaterials[safe: head - 1] ?? "")
+        guard !loaded.isEmpty else { return }
+        let current = filaments[head - 1]
+        if !current.isEmpty, Self.material(inName: current) == loaded { return }      // already fits
+        let vendor = (svc?.slotVendors[safe: head - 1] ?? "").lowercased()
+        let colours = Self.colourWords(svc?.slotColorHexes[safe: head - 1] ?? "")
+        var best: (name: String, score: Int)? = nil
+        for p in presets {
+            guard Self.material(inName: p.name) == loaded else { continue }
+            let n = p.name.lowercased()
+            var score = 10
+            if !vendor.isEmpty, vendor != "none", n.contains(vendor) { score += 5 }
+            if colours.contains(where: { n.contains($0) }) { score += 3 }
+            if best == nil || score > best!.score { best = (p.name, score) }
+        }
+        if let b = best { filaments[head - 1] = b.name }
+    }
+
     /// The G-code is fetched once and shared by preview and print.
     private func fetchGcode() async throws -> Data {
         if let d = gcodeData { return d }
         guard let cfg = config, let j = job, j.state == "done" else { throw ConnectError.decode }
         let d = try await ConnectClient(config: cfg).gcode(j.id)
         gcodeData = d
+        // The real tower of this slice, for the plate next time.
+        if multi {
+            let heads = usedHeads.count
+            Task.detached(priority: .utility) {
+                if let t = Self.measureTower(d) { await MainActor.run { PlateModel.rememberTower(width: t.x, depth: t.y, heads: heads) } }
+            }
+        }
         return d
     }
 
@@ -1880,6 +2144,95 @@ struct SliceSettingsSheet: View {
         fetchingPreview = true; jobError = nil
         defer { fetchingPreview = false }
         do { _ = try await fetchGcode(); showPreview = true } catch { jobError = error.localizedDescription }
+    }
+
+    /// Pauses at heights: the pause command goes right before the first layer
+    /// above each height (";LAYER_CHANGE" with its ";Z:"), so everything up to
+    /// that height is printed, then the printer waits. OrcaSlicer's own way
+    /// (pause entries in the 3MF) is ignored by its command line — tested.
+    static func insertPauses(_ data: Data, at heights: [Float], command: String) -> Data {
+        guard !heights.isEmpty, let text = String(data: data, encoding: .utf8) else { return data }
+        var pending = heights.sorted()
+        var out = ""
+        out.reserveCapacity(text.utf8.count + 256)
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)[...]
+        while let line = lines.popFirst() {
+            if !pending.isEmpty, line.hasPrefix(";LAYER_CHANGE"),
+               let zLine = lines.first, zLine.hasPrefix(";Z:"), let z = Float(zLine.dropFirst(3).trimmingCharacters(in: .whitespaces)) {
+                var hit: [Float] = []
+                while let p = pending.first, z > p + 0.001 { hit.append(p); pending.removeFirst() }
+                if let p = hit.last {
+                    out += "; PAXXMAKER PAUSE at \(String(format: "%.2f", p)) mm\n" + command + "\n"
+                }
+            }
+            out += line
+            if !lines.isEmpty { out += "\n" }
+        }
+        return Data(out.utf8)
+    }
+
+    /// Width and depth of the prime tower in a G-code: the extrusions marked
+    /// ";TYPE:Prime tower" (not its brim), from the 1st to the 99th percentile
+    /// — the few wipe moves that run off the tower are left out.
+    static func measureTower(_ data: Data) -> SIMD2<Float>? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        var xs: [Float] = [], ys: [Float] = []
+        var inTower = false, inBrim = false
+        var x: Float? = nil, y: Float? = nil
+        text.enumerateLines { line, _ in
+            if line.hasPrefix(";TYPE:") { inTower = line.hasPrefix(";TYPE:Prime tower"); return }
+            if line.hasPrefix("; WIPE_TOWER_BRIM_START") { inBrim = true; return }
+            if line.hasPrefix("; WIPE_TOWER_BRIM_END") { inBrim = false; return }
+            guard line.hasPrefix("G1 ") else { return }
+            var nx = x, ny = y, e: Float = 0
+            for part in line.split(separator: " ") {
+                guard let c = part.first else { continue }
+                if c == "X" { nx = Float(part.dropFirst()) }
+                else if c == "Y" { ny = Float(part.dropFirst()) }
+                else if c == "E" { e = Float(part.dropFirst()) ?? 0 }
+                else if c == ";" { break }
+            }
+            if inTower, !inBrim, e > 0, let px = x, let py = y, let qx = nx, let qy = ny {
+                xs.append(px); xs.append(qx); ys.append(py); ys.append(qy)
+            }
+            x = nx; y = ny
+        }
+        guard xs.count > 50 else { return nil }
+        xs.sort(); ys.sort()
+        func p(_ a: [Float], _ q: Double) -> Float { a[Int(q * Double(a.count - 1))] }
+        return SIMD2(p(xs, 0.99) - p(xs, 0.01), p(ys, 0.99) - p(ys, 0.01))
+    }
+
+    /// The U1 only lets a filament of the G-code go to a head with exactly
+    /// the same material type. OrcaSlicer has no "PLA+" (its own PLA+
+    /// profiles say PLA), but the printer registers e.g. eSun PLA+ as "PLA+"
+    /// — so such a head could never be chosen. Where the two differ only by
+    /// that "+", the printer's spelling goes into the G-code header; any other
+    /// difference (PLA against PETG) is left for the printer to point out.
+    static func matchFilamentTypes(_ data: Data, printerTypes: [String]) -> Data {
+        let key = Data("; filament_type = ".utf8)
+        guard let r = data.range(of: key),
+              let end = data[r.upperBound...].firstIndex(of: UInt8(ascii: "\n")),
+              let line = String(data: data[r.upperBound..<end], encoding: .utf8) else { return data }
+        var types = line.trimmingCharacters(in: .whitespaces).components(separatedBy: ";")
+        func base(_ s: String) -> String {
+            var t = s.trimmingCharacters(in: .whitespaces).uppercased()
+            while t.hasSuffix("+") { t.removeLast() }
+            return t
+        }
+        var changed = false
+        for i in types.indices {
+            let own = types[i].trimmingCharacters(in: .whitespaces)
+            let loaded = (printerTypes[safe: i] ?? "").trimmingCharacters(in: .whitespaces)
+            guard !loaded.isEmpty, !own.isEmpty, own.uppercased() != loaded.uppercased(),
+                  base(own) == base(loaded) else { continue }
+            types[i] = loaded
+            changed = true
+        }
+        guard changed else { return data }
+        var out = data
+        out.replaceSubrange(r.upperBound..<end, with: Data(types.joined(separator: ";").utf8))
+        return out
     }
 
     /// Upload the G-code to the printer; `start` also begins the print
@@ -1903,6 +2256,8 @@ struct SliceSettingsSheet: View {
                                                 accent: UIColor(Color(hex: printer.themeColor) ?? .blue)) {
                 data = PlateThumbnail.inject(into: data, image: shot)
             }
+            data = Self.matchFilamentTypes(data, printerTypes: svc.slotMaterials)
+            data = Self.insertPauses(data, at: plate.pauseHeights, command: pauseGcode)
             // Named like a normal upload: model, material and print time —
             // e.g. "laptop_stand_PETG_3h52m". A number is only added when the
             // printer already holds a file of that name.

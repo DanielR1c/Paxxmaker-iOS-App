@@ -218,6 +218,16 @@ private let bgPrinterTaskID = "com.paxxmaker.u1.statuscheck"
 
 // MARK: - AppDelegate for APNs token handling
 class AppDelegate: NSObject, UIApplicationDelegate {
+    /// Set while a screen needs the interface to stay put (the object scan:
+    /// the camera view must not be rebuilt mid-capture). nil = as in the
+    /// Info.plist.
+    @MainActor static var orientationOverride: UIInterfaceOrientationMask? = nil
+
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        if let o = Self.orientationOverride { return o }
+        return UIDevice.current.userInterfaceIdiom == .pad ? .all : .allButUpsideDown
+    }
+
     func application(
         _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data

@@ -30,6 +30,8 @@ final class PaintSelector {
     private var midpoints: [UInt64: Int32] = [:]  // edge → midpoint vertex, shared by both sides
     private var freeTris: [Int32] = []
     private var touched = Set<Int32>()            // originals changed by the current stroke
+    private var visitMark: [UInt32] = []          // per original: last dab that looked at it
+    private var visitStamp: UInt32 = 0
     /// Subtrees as they were before the current action, for undo.
     private var actionSnaps: [Int32: Snap] = [:]
 
@@ -97,11 +99,42 @@ final class PaintSelector {
 
     var isEmpty: Bool { !tris.prefix(origCount).contains { $0.isSplit || $0.state != 0 } }
 
+    /// Was this original triangle subdivided by the brush? An undivided one
+    /// has one head for all of it — that survives being cut into pieces.
+    func isSplit(original i: Int) -> Bool { i >= 0 && i < origCount && tris[i].isSplit }
+
     var usedStates: Set<Int> {
         var s = Set<Int>()
         for t in tris where t.valid && !t.isSplit && t.state != 0 { s.insert(Int(t.state)) }
         return s
     }
+
+    /// The painting as it is now, for a background thread: the arrays are
+    /// copy-on-write, so this costs nothing until the painting changes again.
+    struct Frozen {
+        let vertices: [SIMD3<Float>]
+        let tris: [Tri]
+        let origCount: Int
+        func forEachLeaf(_ body: (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, UInt8, Int32) -> Void) {
+            for o in 0..<origCount { visit(Int32(o), source: Int32(o), body) }
+        }
+        /// Only the pieces of these original triangles.
+        func forEachLeaf<S: Sequence>(of originals: S, _ body: (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, UInt8, Int32) -> Void) where S.Element == Int32 {
+            for o in originals where o >= 0 && Int(o) < origCount { visit(o, source: o, body) }
+        }
+        private func visit(_ i: Int32, source: Int32, _ body: (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, UInt8, Int32) -> Void) {
+            let t = tris[Int(i)]
+            if t.isSplit {
+                for c in 0..<t.childCount { visit(t.children[c], source: source, body) }
+            } else {
+                body(vertices[Int(t.v.x)], vertices[Int(t.v.y)], vertices[Int(t.v.z)], t.state, source)
+            }
+        }
+    }
+    var frozen: Frozen { Frozen(vertices: vertices, tris: tris, origCount: origCount) }
+
+    /// Original triangles the running brush stroke has changed so far.
+    var strokeTouched: Set<Int32> { touched }
 
     /// Every leaf with its vertices, head and original triangle, in original order.
     func forEachLeaf(_ body: (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, UInt8, Int32) -> Void) {
@@ -192,19 +225,24 @@ final class PaintSelector {
     func dab(at centre: SIMD3<Float>, radius: Float, dir: SIMD3<Float>, startOrig: Int, state: UInt8) {
         guard startOrig >= 0, startOrig < origCount else { return }
         let r2 = radius * radius
-        var visited = [Bool](repeating: false, count: origCount)
+        // A mark per triangle, reused across dabs: a fresh 1.5-million-entry
+        // array for every dab was a noticeable part of the brush's cost.
+        if visitMark.count != origCount { visitMark = [UInt32](repeating: 0, count: origCount); visitStamp = 0 }
+        visitStamp &+= 1
+        if visitStamp == 0 { for i in visitMark.indices { visitMark[i] = 0 }; visitStamp = 1 }
+        let stamp = visitStamp
         var queue = [Int32(startOrig)]
         var head = 0
         while head < queue.count {
             let f = queue[head]; head += 1
-            if visited[Int(f)] { continue }
-            visited[Int(f)] = true
+            if visitMark[Int(f)] == stamp { continue }
+            visitMark[Int(f)] = stamp
             record(f)
             if selectRecursive(f, state: state, centre: centre, r2: r2, radius: radius) {
                 touched.insert(f)
                 for side in 0..<3 {
                     let n = neighbors[Int(f)][side]
-                    if n >= 0, !visited[Int(n)], simd_dot(faceNormals[Int(n)], dir) < 0 { queue.append(n) }
+                    if n >= 0, visitMark[Int(n)] != stamp, simd_dot(faceNormals[Int(n)], dir) < 0 { queue.append(n) }
                 }
             }
         }

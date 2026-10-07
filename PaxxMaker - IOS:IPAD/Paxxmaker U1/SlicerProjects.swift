@@ -11,7 +11,7 @@ import simd
 //   <Application Support>/PaxxMakerPlates/<id>/project.json
 //                                             /obj_0.stl …
 
-struct PlateProject: Codable, Identifiable {
+nonisolated struct PlateProject: Codable, Identifiable {
     struct Object: Codable {
         var file: String
         var name: String
@@ -20,8 +20,12 @@ struct PlateProject: Codable, Identifiable {
         var offset: [Float]
         var extruder: Int
         var settings: QuickSettings?
+        /// Lowered into the bed (mm); missing in plates saved before.
+        var sink: Float?
         /// Painted faces, as the undo snapshots hold them.
         var paint: [String: PaintSelector.Snap]?
+        /// Painted fuzzy skin, the same way; missing in older plates.
+        var fuzzy: [String: PaintSelector.Snap]? = nil
     }
     var id: String
     var name: String
@@ -30,12 +34,16 @@ struct PlateProject: Codable, Identifiable {
     var towerEnabled: Bool
     var towerPos: [Float]?
     var objects: [Object]
+    /// Layer colours (height ranges in another head); missing in older plates.
+    var layerBands: [LayerBand]? = nil
+    /// Pause heights (mm); missing in older plates.
+    var pauseHeights: [Float]? = nil
 
     var objectCount: Int { objects.count }
 }
 
 enum PlateStore {
-    static var root: URL {
+    nonisolated static var root: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PaxxMakerPlates", isDirectory: true)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
@@ -101,30 +109,46 @@ enum PlateStore {
             var paint: [String: PaintSelector.Snap]? = nil
             let snaps = o.paintSnapshot
             if !snaps.isEmpty { paint = Dictionary(uniqueKeysWithValues: snaps.map { (String($0.key), $0.value) }) }
+            let fz = o.fuzzySnapshot
+            let fuzzy = fz.isEmpty ? nil : Dictionary(uniqueKeysWithValues: fz.map { (String($0.key), $0.value) })
             objects.append(.init(file: file, name: o.name,
                                  rotation: [r.x, r.y, r.z, r.w],
                                  scale: [o.scale.x, o.scale.y, o.scale.z],
                                  offset: [o.offset.x, o.offset.y],
-                                 extruder: o.extruder, settings: o.settings, paint: paint))
+                                 extruder: o.extruder, settings: o.settings, sink: o.sink > 0 ? o.sink : nil, paint: paint, fuzzy: fuzzy))
         }
         let project = PlateProject(id: pid, name: name, printerID: printerID, modified: Date(),
                                    towerEnabled: plate.towerEnabled,
                                    towerPos: plate.towerPos.map { [$0.x, $0.y] },
-                                   objects: objects)
+                                   objects: objects,
+                                   layerBands: plate.layerBands.isEmpty ? nil : plate.layerBands,
+                                   pauseHeights: plate.pauseHeights.isEmpty ? nil : plate.pauseHeights)
         try write(project)
         return project
     }
 
-    /// Rebuilds the plate from a saved project.
-    static func load(_ project: PlateProject, bed: BedSize) -> PlateModel? {
+    /// Reading and parsing the STLs is the slow part and touches no main-actor
+    /// state, so it runs off the main thread. The parsed meshes are paired with
+    /// their saved object description and handed to `placements` on the main
+    /// actor, which builds the (main-actor) ModelPlacements.
+    nonisolated static func loadMeshes(_ project: PlateProject) -> [(mesh: TriMesh, object: PlateProject.Object)] {
         let dir = root.appendingPathComponent(project.id, isDirectory: true)
-        let plate = PlateModel(bed: bed)
+        var out: [(mesh: TriMesh, object: PlateProject.Object)] = []
         for o in project.objects {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent(o.file)),
                   var mesh = try? STLParser.parse(data), mesh.triangleCount > 0 else { continue }
             mesh.name = o.name
-            plate.add(mesh)
-            guard let placed = plate.objects.last else { continue }
+            out.append((mesh, o))
+        }
+        return out
+    }
+
+    /// Builds the fully set-up placements (head, settings, both paintings) from
+    /// pre-parsed meshes. Runs on the main actor — ModelPlacement is one.
+    static func placements(_ parsed: [(mesh: TriMesh, object: PlateProject.Object)], bed: BedSize) -> [ModelPlacement] {
+        var out: [ModelPlacement] = []
+        for (mesh, o) in parsed {
+            let placed = ModelPlacement(mesh: mesh, bed: bed)
             if o.rotation.count == 4 {
                 placed.rotation = simd_quatf(ix: o.rotation[0], iy: o.rotation[1], iz: o.rotation[2], r: o.rotation[3])
             }
@@ -132,17 +156,20 @@ enum PlateStore {
             if o.offset.count == 2 { placed.offset = SIMD2(o.offset[0], o.offset[1]) }
             placed.extruder = o.extruder
             placed.settings = o.settings
+            placed.sink = o.sink ?? 0
             if let paint = o.paint, !paint.isEmpty {
                 placed.restorePaint(Dictionary(uniqueKeysWithValues: paint.compactMap { k, v in
                     Int32(k).map { ($0, v) }
                 }))
             }
+            if let fuzzy = o.fuzzy, !fuzzy.isEmpty {
+                placed.restorePaint(Dictionary(uniqueKeysWithValues: fuzzy.compactMap { k, v in
+                    Int32(k).map { ($0, v) }
+                }), layer: .fuzzy)
+            }
+            out.append(placed)
         }
-        guard !plate.objects.isEmpty else { return nil }
-        plate.towerEnabled = project.towerEnabled
-        if let t = project.towerPos, t.count == 2 { plate.towerPos = SIMD2(t[0], t[1]) }
-        plate.selectedID = plate.objects.first?.id
-        return plate
+        return out
     }
 
     /// A name to offer when saving for the first time: the first model.
@@ -217,7 +244,7 @@ extension View {
 
 enum ConnectUpdate {
     /// The newest PaxxMaker-Connect this app knows about.
-    static let current = "1.3"
+    static let current = "1.4"
     static let releasesURL = "https://github.com/DanielR1c/PaxxMaker-Connect/releases/latest"
 
     struct Release { let version: String; let url: String }

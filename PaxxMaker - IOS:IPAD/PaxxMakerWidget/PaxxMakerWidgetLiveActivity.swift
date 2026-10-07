@@ -6,6 +6,8 @@ struct PaxxMakerWidgetLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: PaxxMakerWidgetAttributes.self) { context in
             LiveActivityBannerView(context: context)
+                // A tap opens the app on this printer, not on the last tab.
+                .widgetURL(Self.printerURL(context.attributes.printerName))
         } dynamicIsland: { context in
             // Minimal Dynamic Island — only a tiny progress arc + % shown
             DynamicIsland {
@@ -50,7 +52,16 @@ struct PaxxMakerWidgetLiveActivity: Widget {
                     .font(.system(size: 9))
                     .foregroundStyle(stateColor(context.state.printState))
             }
+            .widgetURL(Self.printerURL(context.attributes.printerName))
         }
+    }
+
+    /// paxxmaker://printer?name=… — handled by the app's onOpenURL.
+    static func printerURL(_ name: String) -> URL? {
+        var c = URLComponents()
+        c.scheme = "paxxmaker"; c.host = "printer"
+        c.queryItems = [URLQueryItem(name: "name", value: name)]
+        return c.url
     }
 
     func stateColor(_ state: String) -> Color {

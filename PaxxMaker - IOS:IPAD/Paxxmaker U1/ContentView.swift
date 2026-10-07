@@ -10222,11 +10222,15 @@ struct ScrollablePrinterTabView: View {
             .onReceive(NotificationCenter.default.publisher(for: .paxxShowPrinter)) { note in
                 guard let id = note.object as? String,
                       let idx = printers.firstIndex(where: { $0.0.id.uuidString == id }) else { return }
-                // The plate view is still closing at this moment; switching
-                // underneath it would fight that animation.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                    selectedTab = idx
-                    if isSplitscreenInTabMode { splitCurrentPage = min(idx, max(printers.count - 1, 0)) }
+                // The slice sheet and the plate view are still closing (one
+                // after the other); a switch during that is dropped by iOS and
+                // one ended up on the slicer tab. So it is set again until
+                // both are surely gone.
+                for delay in [0.4, 0.9, 1.5] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        if selectedTab != idx { selectedTab = idx }
+                        if isSplitscreenInTabMode { splitCurrentPage = min(idx, max(printers.count - 1, 0)) }
+                    }
                 }
             }
     }
@@ -10504,7 +10508,7 @@ struct ContentView: View {
     @AppStorage("has_shown_firmware_notice") private var hasShownFirmwareNotice: Bool = false
     @AppStorage("has_selected_language") private var hasSelectedLanguage: Bool = false
     @AppStorage("has_accepted_disclaimer") private var hasAcceptedDisclaimer: Bool = false
-    @AppStorage("has_seen_whatsnew_slicer_1") private var hasSeenWhatsNewSL: Bool = false
+    @AppStorage("has_seen_whatsnew_scan_1") private var hasSeenWhatsNewSL: Bool = false
     @State private var showWhatsNewSL = false
     /// Set when the popup's "Update now" is tapped; SettingsView opens
     /// that printer and clears it again.
@@ -10607,6 +10611,20 @@ struct ContentView: View {
                     }
                 }
                 .onAppear { printerServices.update(from: settings) }
+                // "Done" after sending a slice: the printer tab with the
+                // printer that got the file. (With printers as tabs,
+                // ScrollablePrinterTabView does this itself.) Set again while
+                // the slice sheet and the plate view are still closing.
+                .onReceive(NotificationCenter.default.publisher(for: .paxxShowPrinter)) { note in
+                    guard !printersAsTabs else { return }
+                    let idx = (note.object as? String).flatMap { id in visiblePrinters.firstIndex { $0.0.id.uuidString == id } }
+                    for delay in [0.4, 0.9, 1.5] {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            if rootTabSel != "main" { rootTabSel = "main" }
+                            if let idx, currentPrinterPage != idx { currentPrinterPage = idx }
+                        }
+                    }
+                }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
                     printerServices.services.forEach { $0.writeWidgetData() }
                     WidgetCenter.shared.reloadAllTimelines()
@@ -10619,6 +10637,16 @@ struct ContentView: View {
         // paxxmaker://connect?… from PaxxMaker-Connect's QR code, scanned with
         // the camera app: pair without typing the code.
         .onOpenURL { url in
+            // paxxmaker://printer?name=… from the Live Activity: show that printer.
+            if url.host == "printer" {
+                let name = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "name" }?.value
+                let target = visiblePrinters.first { $0.0.name == name }?.0 ?? visiblePrinters.first?.0
+                if let target {
+                    if !printersAsTabs { rootTabSel = "main" }
+                    NotificationCenter.default.post(name: .paxxShowPrinter, object: target.id.uuidString)
+                }
+                return
+            }
             Task {
                 if let msg = await ConnectPairing.handle(url) {
                     await MainActor.run { pairingMessage = msg; rootTabSel = "slicer" }
@@ -10847,18 +10875,18 @@ struct WhatsNewView: View {
 
     private var textBlock: some View {
             VStack(spacing: 18) {
-            Image(systemName: "cube.transparent")
+            Image(systemName: "camera.viewfinder")
                 .font(.system(size: 46)).foregroundColor(.accentColor).padding(.top, 10)
-            Text(lz(en: "New: PaxxMaker Slicer (Beta)", de: "Neu: PaxxMaker-Slicer (Beta)", fr: "Nouveau : PaxxMaker Slicer (bêta)", es: "Nuevo: PaxxMaker Slicer (beta)", pt: "Novo: PaxxMaker Slicer (beta)", it: "Novità: PaxxMaker Slicer (beta)", zh: "新功能：PaxxMaker 切片（测试版）"))
+            Text("Scan to Duplicate")
                 .font(.title2).bold().multilineTextAlignment(.center)
             Text(lz(
-                en: "You can now slice straight from the app: open an STL, turn it on the plate, scale it, paint faces for the different heads — and print.\n\nThe slicing happens on your Mac or Windows PC: install \"PaxxMaker-Connect\" there, pair it with a QR code, done. It uses the OrcaSlicer installed on that computer with your own profiles; the G-code comes back to the app and goes straight to the printer. The computer has to be switched on while you slice.\n\nBoth are still in beta — I am still working out how it should look and would be glad to hear what you think. Switch it on under Settings › Extra Features › PaxxMaker Slicer (Beta).",
-                de: "Du kannst jetzt direkt aus der App slicen: STL öffnen, auf der Druckplatte drehen, skalieren, Flächen für die einzelnen Köpfe einfärben — und drucken.\n\nGesliced wird auf deinem Mac oder Windows-PC: dort „PaxxMaker-Connect“ installieren, per QR-Code koppeln, fertig. Es benutzt den dort installierten OrcaSlicer mit deinen eigenen Profilen; der G-Code kommt zurück in die App und geht direkt an den Drucker. Der Computer muss dabei laufen.\n\nBeides steckt noch in der Beta — ich bin in der Findungsphase, wie die Oberfläche aussehen soll, und freue mich über deine Rückmeldung. Einschalten: Einstellungen › Zusatzfunktionen › PaxxMaker-Slicer (Beta).",
-                fr: "Tu peux maintenant trancher directement depuis l'app : ouvrir un STL, le tourner sur le plateau, le redimensionner, peindre des faces pour les différentes têtes — et imprimer.\n\nLe tranchage se fait sur ton Mac ou PC Windows : installe « PaxxMaker-Connect », appaire avec un QR code, c'est tout. Il utilise l'OrcaSlicer installé là-bas avec tes propres profils ; le G-code revient dans l'app et part directement à l'imprimante. L'ordinateur doit rester allumé pendant le tranchage.\n\nLe tout est encore en bêta — je cherche encore la bonne présentation et tes retours sont les bienvenus. Active-le dans Réglages › Fonctions supplémentaires › PaxxMaker Slicer (bêta).",
-                es: "Ya puedes laminar directamente desde la app: abre un STL, gíralo en la placa, escálalo, pinta caras para cada cabezal — e imprime.\n\nEl laminado ocurre en tu Mac o PC con Windows: instala allí «PaxxMaker-Connect», vincula con un código QR y listo. Usa el OrcaSlicer instalado en ese ordenador con tus propios perfiles; el G-code vuelve a la app y va directo a la impresora. El ordenador tiene que estar encendido mientras laminas.\n\nTodo ello sigue en beta — aún estoy definiendo cómo debe verse y agradezco tus comentarios. Actívalo en Ajustes › Funciones adicionales › PaxxMaker Slicer (beta).",
-                pt: "Agora você pode fatiar direto do app: abra um STL, gire-o na mesa, redimensione, pinte faces para cada cabeça — e imprima.\n\nO fatiamento acontece no seu Mac ou PC com Windows: instale lá o \"PaxxMaker-Connect\", pareie com um QR code e pronto. Ele usa o OrcaSlicer instalado nesse computador com os seus perfis; o G-code volta para o app e vai direto para a impressora. O computador precisa estar ligado durante o fatiamento.\n\nTudo isso ainda está em beta — ainda estou definindo como deve ficar e fico feliz com o seu retorno. Ative em Ajustes › Recursos Extras › PaxxMaker Slicer (beta).",
-                it: "Ora puoi fare lo slicing direttamente dall'app: apri un STL, ruotalo sul piano, ridimensionalo, colora le facce per le singole teste — e stampa.\n\nLo slicing avviene sul tuo Mac o PC Windows: installa lì «PaxxMaker-Connect», associa con un QR code e basta. Usa l'OrcaSlicer installato su quel computer con i tuoi profili; il G-code torna nell'app e va dritto alla stampante. Il computer deve restare acceso durante lo slicing.\n\nTutto questo è ancora in beta — sto ancora cercando l'aspetto giusto e ogni riscontro è benvenuto. Attivalo in Impostazioni › Funzioni Extra › PaxxMaker Slicer (beta).",
-                zh: "现在可以直接在 App 里切片：打开 STL，在打印板上旋转、缩放、为不同喷头上色——然后打印。\n\n切片在你的 Mac 或 Windows 电脑上进行：在电脑上安装“PaxxMaker-Connect”，用二维码配对即可。它使用那台电脑上安装的 OrcaSlicer 和你自己的配置；生成的 G-code 回到 App 并直接发送到打印机。切片时电脑需保持开机。\n\n这些仍处于测试版——界面该是什么样子我还在摸索，欢迎你的反馈。开启方式：设置 › 附加功能 › PaxxMaker 切片（测试版）。"))
+                en: "New in the PaxxMaker Slicer: scan an object with your iPhone or iPad and print it again.\n\nWalk around the object, turn it over for the underside, and the 3D model is built right on the device — the camera supplies the detail, the LiDAR sensor the real size. The app then makes it printable by itself: loose bits removed, holes closed, the base cut flat. Straight onto the build plate, or export it as an STL.\n\nAccurate to roughly half a millimetre to a millimetre — ideal for figures, decoration and shaped parts. Needs an iPhone or iPad with LiDAR (Pro models).\n\nAlso new: find models on Thingiverse right in the app — sign in with your own account, browse by popularity, downloads or category, and put an STL on the plate with one tap.",
+                de: "Neu im PaxxMaker-Slicer: Ein Objekt mit dem iPhone oder iPad scannen und einfach nachdrucken.\n\nDu gehst um das Objekt herum, drehst es für die Unterseite, und das 3D-Modell entsteht direkt auf dem Gerät — die Kamera liefert die Details, der LiDAR-Sensor die echte Größe. Danach macht die App es selbst druckfertig: lose Teile weg, Löcher zu, Boden plan geschnitten. Direkt auf die Druckplatte oder als STL exportieren.\n\nGenau auf etwa einen halben bis einen Millimeter — ideal für Figuren, Deko und Formteile. Braucht ein iPhone oder iPad mit LiDAR (Pro-Modelle).\n\nAußerdem neu: Modelle direkt in der App auf Thingiverse suchen — mit deinem eigenen Konto anmelden, nach Beliebtheit, Downloads oder Kategorie stöbern und eine STL mit einem Tipp auf die Druckplatte legen.",
+                fr: "Nouveau dans PaxxMaker Slicer : scanne un objet avec ton iPhone ou iPad et imprime-le à nouveau.\n\nFais le tour de l'objet, retourne-le pour le dessous, et le modèle 3D est calculé directement sur l'appareil — la caméra apporte les détails, le capteur LiDAR la taille réelle. L'app le rend ensuite imprimable toute seule : fragments retirés, trous fermés, base aplanie. Directement sur le plateau ou en export STL.\n\nPrécis à environ un demi-millimètre à un millimètre — idéal pour figurines, déco et pièces de forme. Nécessite un iPhone ou iPad avec LiDAR (modèles Pro).\n\nAutre nouveauté : cherche des modèles sur Thingiverse directement dans l'app — connecte-toi avec ton propre compte, parcours par popularité, téléchargements ou catégorie, et pose un STL sur le plateau d'un geste.",
+                es: "Nuevo en PaxxMaker Slicer: escanea un objeto con tu iPhone o iPad y vuelve a imprimirlo.\n\nRodea el objeto, gíralo para la base y el modelo 3D se calcula en el propio dispositivo: la cámara aporta el detalle y el sensor LiDAR el tamaño real. Luego la app lo deja listo para imprimir sola: fragmentos fuera, agujeros cerrados, base aplanada. Directo a la placa o exportado como STL.\n\nPrecisión de medio a un milímetro: ideal para figuras, decoración y piezas de forma. Requiere un iPhone o iPad con LiDAR (modelos Pro).\n\nTambién nuevo: busca modelos en Thingiverse directamente en la app: inicia sesión con tu propia cuenta, explora por popularidad, descargas o categoría y pon un STL en la placa con un toque.",
+                pt: "Novo no PaxxMaker Slicer: escaneie um objeto com o iPhone ou iPad e imprima-o de novo.\n\nDê a volta no objeto, vire-o para a parte de baixo e o modelo 3D é calculado no próprio aparelho — a câmera fornece os detalhes, o sensor LiDAR o tamanho real. Depois o app o deixa pronto para imprimir sozinho: fragmentos removidos, furos fechados, base aplanada. Direto na mesa ou exportado como STL.\n\nPrecisão de meio a um milímetro — ideal para figuras, decoração e peças de forma. Requer iPhone ou iPad com LiDAR (modelos Pro).\n\nTambém novo: procure modelos no Thingiverse direto no app — entre com sua própria conta, navegue por popularidade, downloads ou categoria e coloque um STL na mesa com um toque.",
+                it: "Novità nel PaxxMaker Slicer: scansiona un oggetto con iPhone o iPad e stampalo di nuovo.\n\nGira intorno all'oggetto, capovolgilo per il fondo e il modello 3D viene calcolato direttamente sul dispositivo — la fotocamera fornisce i dettagli, il sensore LiDAR le dimensioni reali. Poi l'app lo rende stampabile da sola: frammenti rimossi, fori chiusi, base spianata. Direttamente sul piano o esportato come STL.\n\nPreciso da mezzo a un millimetro circa — ideale per figure, decorazioni e pezzi sagomati. Richiede iPhone o iPad con LiDAR (modelli Pro).\n\nNovità anche: cerca modelli su Thingiverse direttamente nell'app — accedi con il tuo account, sfoglia per popolarità, download o categoria e metti un STL sul piano con un tocco.",
+                zh: "PaxxMaker 切片新增：用 iPhone 或 iPad 扫描物体，然后直接复制打印。\n\n绕物体走一圈，翻过来扫底面，3D 模型就在设备上生成——相机提供细节，LiDAR 传感器提供真实尺寸。随后 App 会自动处理为可打印模型：去除碎片、补洞、底部切平。可直接放到打印板上，或导出为 STL。\n\n精度约 0.5–1 毫米——非常适合手办、装饰和造型件。需要带 LiDAR 的 iPhone 或 iPad（Pro 机型）。\n\n另外新增：直接在 App 中搜索 Thingiverse 模型——用你自己的账号登录，按热门、下载量或分类浏览，一点即可把 STL 放到打印板上。"))
                 .font(.subheadline).foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)

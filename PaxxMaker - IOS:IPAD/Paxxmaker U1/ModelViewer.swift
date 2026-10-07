@@ -168,6 +168,20 @@ struct BedSize {
 
 // MARK: Placement of one object
 
+/// The two things that can be painted on an object, as in Orca: colour
+/// (which head prints a face) and fuzzy skin.
+enum PaintLayer: Hashable { case color, fuzzy }
+
+/// A height range of the whole plate printed with another head — Orca's
+/// height range modifier with its own extruder (sent per object as
+/// layer_config_ranges). Heights in mm above the bed.
+struct LayerBand: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var head: Int
+    var from: Float
+    var to: Float
+}
+
 /// One object's placement: rotation and scale about its own centre, then a
 /// position on the bed. Recomputed into one matrix for the slicer.
 final class ModelPlacement: ObservableObject, Identifiable {
@@ -178,6 +192,9 @@ final class ModelPlacement: ObservableObject, Identifiable {
     /// object is turned afterwards.
     @Published var scale = SIMD3<Float>(repeating: 1)
     @Published var offset = SIMD2<Float>(0, 0)       // XY shift from bed centre
+    /// How far the object is lowered into the bed (mm). What ends up below
+    /// the bed is cut off when slicing — a flat face to stand on.
+    @Published var sink: Float = 0
     /// Which head prints this object (1-based, U1 only).
     @Published var extruder: Int = 1
     /// The object's own process settings; nil = the general ones.
@@ -185,11 +202,18 @@ final class ModelPlacement: ObservableObject, Identifiable {
     /// Colour painting (heads per face, with Orca-style subdivision); nil
     /// until the first fill or brush stroke.
     private(set) var selector: PaintSelector? = nil
+    /// Painted fuzzy skin — Orca's second painting on the same triangles
+    /// (state 1 = fuzzy), written as paint_fuzzy_skin. With "Fuzzy Skin:
+    /// Painted only" Orca roughens exactly these faces.
+    private(set) var fuzzySelector: PaintSelector? = nil
     @Published private(set) var paintedHeads: Set<Int> = []
+    @Published private(set) var hasFuzzy = false
     private(set) var paintVersion = 0
-    /// One entry per fill, brush stroke or clear: the touched subtrees as they were.
-    private var undoStack: [[Int32: PaintSelector.Snap]] = []
-    @Published private(set) var undoCount = 0
+    /// One entry per fill, brush stroke or clear: the touched subtrees as
+    /// they were — one history per painting.
+    private var undoStacks: [PaintLayer: [[Int32: PaintSelector.Snap]]] = [:]
+    @Published private(set) var undoCounts: [PaintLayer: Int] = [:]
+    func undoCount(_ layer: PaintLayer = .color) -> Int { undoCounts[layer] ?? 0 }
     private var strokeOpen = false
     let mesh: TriMesh
     var bed: BedSize
@@ -258,7 +282,66 @@ final class ModelPlacement: ObservableObject, Identifiable {
 
     var fitsBed: Bool {
         let b = placedBounds
-        return b.min.x >= -0.01 && b.min.y >= -0.01 && b.max.x <= bed.x + 0.01 && b.max.y <= bed.y + 0.01 && b.max.z <= bed.z + 0.01
+        return b.min.x >= -0.01 && b.min.y >= -0.01 && b.max.x <= bed.x + 0.01 && b.max.y <= bed.y + 0.01 && b.max.z - sink <= bed.z + 0.01
+    }
+
+    /// The deepest the object may go: half a millimetre of it must stay.
+    var maxSink: Float { max(0, placedSize.z - 0.5) }
+
+    /// Area the object stands on at the current depth (mm²). Straight from
+    /// the triangles, no copy of the mesh: each one crossing the plane adds
+    /// its piece of the outline.
+    func contactArea(at depth: Float? = nil) -> Float {
+        let z = depth ?? sink
+        let m = matrix(offset: .zero)
+        let c0 = m.columns.0, c1 = m.columns.1, c2 = m.columns.2, c3 = m.columns.3
+        let v = mesh.vertices
+        var s: Double = 0
+        var i = 0
+        while i + 2 < v.count {
+            @inline(__always) func w(_ u: SIMD3<Float>) -> SIMD3<Float> { let q = c0 * u.x + c1 * u.y + c2 * u.z + c3; return SIMD3(q.x, q.y, q.z) }
+            let p = (w(v[i]), w(v[i + 1]), w(v[i + 2]))
+            @inline(__always) func at(_ k: Int) -> SIMD3<Float> { k == 0 ? p.0 : (k == 1 ? p.1 : p.2) }
+            var down: SIMD3<Float>? = nil, up: SIMD3<Float>? = nil
+            for k in 0..<3 {
+                let a = at(k), b = at((k + 1) % 3)
+                let ia = a.z > z, ib = b.z > z
+                guard ia != ib else { continue }
+                let x = a + (b - a) * ((z - a.z) / (b.z - a.z))
+                if ia { down = x } else { up = x }
+            }
+            if let d = down, let u = up { s += Double(d.x) * Double(u.y) - Double(u.x) * Double(d.y) }
+            i += 3
+        }
+        return abs(Float(s / 2))
+    }
+
+    /// What goes to the slicer: the mesh with its transform and painting —
+    /// or, when lowered into the bed, the part above it, cut and closed on
+    /// the phone. OrcaSlicer would lift a sunk object back onto the bed
+    /// (tested), so the cut cannot be left to it. The painting follows the
+    /// pieces: whole triangles keep theirs, cut ones keep a single head, the
+    /// new bottom face gets the object's own.
+    func printedPart() -> (mesh: TriMesh, transform: simd_float4x4, paint: [Int: String], fuzzy: [Int: String]) {
+        let paint = paintStrings, fuzzy = fuzzyStrings
+        guard sink > 0.001 else { return (mesh, matrix, paint, fuzzy) }
+        var world = matrix
+        world.columns.3.z -= sink
+        let c0 = world.columns.0, c1 = world.columns.1, c2 = world.columns.2, c3 = world.columns.3
+        let soup = mesh.vertices.map { v -> SIMD3<Float> in let q = c0 * v.x + c1 * v.y + c2 * v.z + c3; return SIMD3(q.x, q.y, q.z) }
+        let cut = ScanMesh.cutAtBed(soup)
+        var m = TriMesh()
+        m.vertices = cut.vertices
+        m.name = mesh.name
+        func remap(_ strings: [Int: String], _ sel: PaintSelector?) -> [Int: String] {
+            var out: [Int: String] = [:]
+            for (j, src) in cut.source.enumerated() where src >= 0 {
+                guard let str = strings[Int(src)] else { continue }
+                if !cut.clipped[j] || !(sel?.isSplit(original: Int(src)) ?? false) { out[j] = str }
+            }
+            return out
+        }
+        return (m, matrix_identity_float4x4, remap(paint, selector), remap(fuzzy, fuzzySelector))
     }
 
     /// Size of the placed object along the bed axes.
@@ -322,7 +405,78 @@ final class ModelPlacement: ObservableObject, Identifiable {
         rotation = simd_normalize(q * rotation)
     }
 
-    func reset() { rotation = simd_quatf(angle: 0, axis: SIMD3(0, 0, 1)); scale = SIMD3(repeating: 1); offset = .zero }
+    func reset() { rotation = simd_quatf(angle: 0, axis: SIMD3(0, 0, 1)); scale = SIMD3(repeating: 1); offset = .zero; sink = 0 }
+
+    // MARK: smallest footprint
+
+    /// Turns the object about the vertical axis so the rectangle around its
+    /// outline seen from above is as small as possible (minimum-area bounding
+    /// rectangle: one side of it always lies along an edge of the convex
+    /// hull), then puts the long side along X.
+    func turnToSmallestFootprint() {
+        let (m, _) = base()
+        let c0 = m.columns.0, c1 = m.columns.1, c2 = m.columns.2, c3 = m.columns.3
+        // Outline at 0.5 mm: per column of the grid only the front- and
+        // backmost point — the hull of those is the hull of the object.
+        let cell: Float = 0.5
+        var lo: [Int: Float] = [:], hi: [Int: Float] = [:]
+        for v in mesh.vertices {
+            let p = c0 * v.x + c1 * v.y + c2 * v.z + c3
+            guard p.x.isFinite, p.y.isFinite else { continue }
+            let k = Int((p.x / cell).rounded(.down))
+            lo[k] = min(lo[k] ?? .greatestFiniteMagnitude, p.y)
+            hi[k] = max(hi[k] ?? -.greatestFiniteMagnitude, p.y)
+        }
+        var pts: [SIMD2<Float>] = []
+        for (k, y) in lo { let x = (Float(k) + 0.5) * cell; pts.append(SIMD2(x, y)); pts.append(SIMD2(x, hi[k] ?? y)) }
+        let hull = Self.convexHull(pts)
+        guard hull.count >= 3 else { return }
+        func extent(_ a: Float) -> (w: Float, d: Float) {
+            let ca = cos(a), sa = sin(a)
+            var x0 = Float.greatestFiniteMagnitude, x1 = -Float.greatestFiniteMagnitude, y0 = x0, y1 = x1
+            for p in hull {
+                let x = p.x * ca - p.y * sa, y = p.x * sa + p.y * ca
+                x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y)
+            }
+            return (x1 - x0, y1 - y0)
+        }
+        let now = extent(0)
+        var best: (a: Float, area: Float) = (0, now.w * now.d)
+        for i in 0..<hull.count {
+            let e = hull[(i + 1) % hull.count] - hull[i]
+            guard simd_length(e) > 1e-4 else { continue }
+            let a = -atan2(e.y, e.x)                       // turns this edge onto the X axis
+            let r = extent(a)
+            if r.w * r.d < best.area - 1e-3 { best = (a, r.w * r.d) }
+        }
+        var angle = best.a
+        // Only worth a turn when it really saves room (more than 1 %).
+        if best.area > now.w * now.d * 0.99 { angle = 0 }
+        let r = extent(angle)
+        if r.d > r.w + 0.01 { angle += .pi / 2 }
+        // Smallest equivalent turn, so nothing flips around for no reason.
+        while angle > .pi / 2 + 1e-4 { angle -= .pi }
+        while angle < -.pi / 2 - 1e-4 { angle += .pi }
+        guard abs(angle) > 1e-3 else { return }
+        rotation = simd_normalize(simd_quatf(angle: angle, axis: SIMD3(0, 0, 1)) * rotation)
+    }
+
+    /// Andrew's monotone chain, counter-clockwise.
+    private static func convexHull(_ points: [SIMD2<Float>]) -> [SIMD2<Float>] {
+        let p = points.sorted { $0.x != $1.x ? $0.x < $1.x : $0.y < $1.y }
+        guard p.count > 2 else { return p }
+        func cross(_ o: SIMD2<Float>, _ a: SIMD2<Float>, _ b: SIMD2<Float>) -> Float { (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x) }
+        var lower: [SIMD2<Float>] = [], upper: [SIMD2<Float>] = []
+        for q in p {
+            while lower.count >= 2 && cross(lower[lower.count - 2], lower[lower.count - 1], q) <= 0 { lower.removeLast() }
+            lower.append(q)
+        }
+        for q in p.reversed() {
+            while upper.count >= 2 && cross(upper[upper.count - 2], upper[upper.count - 1], q) <= 0 { upper.removeLast() }
+            upper.append(q)
+        }
+        return Array(lower.dropLast() + upper.dropLast())
+    }
 
     // MARK: footprint
 
@@ -408,107 +562,132 @@ final class ModelPlacement: ObservableObject, Identifiable {
 
     // MARK: painting
 
-    private func selectorOrCreate() -> PaintSelector {
-        if let s = selector { return s }
+    private func selector(_ layer: PaintLayer) -> PaintSelector? { layer == .color ? selector : fuzzySelector }
+    func paintSelector(_ layer: PaintLayer) -> PaintSelector? { selector(layer) }
+    /// Original triangles the last fill changed — drawn at once as an overlay.
+    private(set) var lastChanged: Set<Int32> = []
+    /// Original triangles the running brush stroke has changed.
+    var strokeTouched: Set<Int32> { selector(strokeLayer)?.strokeTouched ?? [] }
+
+    private func selectorOrCreate(_ layer: PaintLayer = .color) -> PaintSelector {
+        if let s = selector(layer) { return s }
         let s = PaintSelector(raw: mesh.vertices)
-        selector = s
+        if layer == .color { selector = s } else { fuzzySelector = s }
         return s
     }
 
     /// Orca's paint_color strings per original triangle, for the slicer.
     var paintStrings: [Int: String] { selector?.serialize() ?? [:] }
+    /// Orca's paint_fuzzy_skin strings per original triangle.
+    var fuzzyStrings: [Int: String] { fuzzySelector?.serialize() ?? [:] }
 
-    private func state(for head: Int) -> UInt8 { head == extruder ? 0 : UInt8(max(1, min(4, head))) }
+    /// Colour: the head (the object's own one erases). Fuzzy skin: anything
+    /// above 0 paints it, 0 erases.
+    private func state(for head: Int, _ layer: PaintLayer) -> UInt8 {
+        if layer == .fuzzy { return head > 0 ? 1 : 0 }
+        return head == extruder ? 0 : UInt8(max(1, min(4, head)))
+    }
 
     /// Fills the face (or the rounding) the tap landed on with `head`;
     /// `angle` is how far a neighbouring facet may tilt and still belong to it.
     /// Painting with the object's own head is the eraser.
-    func fill(from tri: Int, head: Int, angle: Float = 5) {
-        let sel = selectorOrCreate()
+    func fill(from tri: Int, head: Int, angle: Float = 5, layer: PaintLayer = .color) {
+        let sel = selectorOrCreate(layer)
         sel.beginAction()
-        sel.fill(from: tri, state: state(for: head), angle: angle)
+        sel.fill(from: tri, state: state(for: head, layer), angle: angle)
         let snaps = sel.endAction()
-        push(snaps)
-        lastFill = snaps.isEmpty ? nil : (tri, head)
+        push(snaps, layer)
+        lastChanged = Set(snaps.keys)
+        lastFill = snaps.isEmpty ? nil : (tri, head, layer)
         paintChanged()
     }
 
     /// The last fill, so moving the angle slider can redo it right away
     /// instead of making people undo and tap again.
-    private(set) var lastFill: (tri: Int, head: Int)? = nil
+    private(set) var lastFill: (tri: Int, head: Int, layer: PaintLayer)? = nil
 
     /// Runs the last fill again with a different angle.
     func refill(angle: Float) {
-        guard let f = lastFill, let sel = selector, let snaps = undoStack.popLast() else { return }
+        guard let f = lastFill, let sel = selector(f.layer), let snaps = undoStacks[f.layer]?.popLast() else { return }
         sel.restore(snaps)
-        undoCount = undoStack.count
-        fill(from: f.tri, head: f.head, angle: angle)
+        undoCounts[f.layer] = undoStacks[f.layer]?.count ?? 0
+        fill(from: f.tri, head: f.head, angle: angle, layer: f.layer)
     }
 
     /// The painting as saved with the project, and the way back in.
     var paintSnapshot: [Int32: PaintSelector.Snap] { selector?.fullSnapshot() ?? [:] }
+    var fuzzySnapshot: [Int32: PaintSelector.Snap] { fuzzySelector?.fullSnapshot() ?? [:] }
 
-    func restorePaint(_ snaps: [Int32: PaintSelector.Snap]) {
+    func restorePaint(_ snaps: [Int32: PaintSelector.Snap], layer: PaintLayer = .color) {
         guard !snaps.isEmpty else { return }
-        let sel = selectorOrCreate()
+        let sel = selectorOrCreate(layer)
         sel.restore(snaps)
-        undoStack.removeAll(); undoCount = 0
+        undoStacks[layer] = []; undoCounts[layer] = 0
         paintChanged()
     }
 
-    private func push(_ snaps: [Int32: PaintSelector.Snap]) {
+    private func push(_ snaps: [Int32: PaintSelector.Snap], _ layer: PaintLayer) {
         guard !snaps.isEmpty else { return }
-        undoStack.append(snaps)
-        if undoStack.count > 30 { undoStack.removeFirst() }
-        undoCount = undoStack.count
+        var st = undoStacks[layer] ?? []
+        st.append(snaps)
+        if st.count > 30 { st.removeFirst() }
+        undoStacks[layer] = st
+        undoCounts[layer] = st.count
     }
 
-    /// Takes back the last fill, stroke or clear.
-    func undoPaint() {
+    /// Takes back the last fill, stroke or clear of that painting.
+    func undoPaint(_ layer: PaintLayer = .color) {
         lastFill = nil
-        guard let sel = selector, let snaps = undoStack.popLast() else { return }
+        guard let sel = selector(layer), let snaps = undoStacks[layer]?.popLast() else { return }
         sel.restore(snaps)
-        undoCount = undoStack.count
+        undoCounts[layer] = undoStacks[layer]?.count ?? 0
         paintChanged()
     }
 
     var hasPaint: Bool { !(selector?.isEmpty ?? true) }
+    func hasPaint(_ layer: PaintLayer) -> Bool { !(selector(layer)?.isEmpty ?? true) }
 
     /// One brush dab at a point on the placed object (bed coordinates, mm),
     /// seen along `viewDir`. The stroke publishes nothing until `endStroke`;
     /// the scene refreshes itself meanwhile.
-    func dab(atBed p: SIMD3<Float>, radius: Float, viewDir: SIMD3<Float>, orig: Int, head: Int) {
+    private var strokeLayer: PaintLayer = .color
+    func dab(atBed p: SIMD3<Float>, radius: Float, viewDir: SIMD3<Float>, orig: Int, head: Int, layer: PaintLayer = .color) {
         lastFill = nil
-        let sel = selectorOrCreate()
-        if !strokeOpen { sel.beginAction(); strokeOpen = true }
+        let sel = selectorOrCreate(layer)
+        if !strokeOpen { sel.beginAction(); strokeOpen = true; strokeLayer = layer }
         let inv = matrix.inverse
         let c4 = inv * SIMD4<Float>(p, 1)
         let s = max((scale.x + scale.y + scale.z) / 3, 1e-4)
         let r = radius / s
         sel.edgeLimitSqr = pow(max(r / 5, 0.35 / s), 2)
         sel.dab(at: SIMD3(c4.x, c4.y, c4.z), radius: r, dir: simd_normalize(rotation.inverse.act(viewDir)),
-                startOrig: orig, state: state(for: head))
+                startOrig: orig, state: state(for: head, layer))
     }
 
     func endStroke() {
-        selector?.finishStroke()
-        if strokeOpen, let sel = selector { push(sel.endAction()); strokeOpen = false }
+        let sel = selector(strokeLayer)
+        sel?.finishStroke()
+        if strokeOpen, let sel { push(sel.endAction(), strokeLayer); strokeOpen = false }
         paintChanged()
     }
 
     private func paintChanged() {
         paintVersion += 1
         paintedHeads = Set(selector?.usedStates ?? [])
+        hasFuzzy = !(fuzzySelector?.isEmpty ?? true)
     }
 
-    func clearPaint() {
+    func clearPaint(_ layer: PaintLayer = .color) {
         lastFill = nil
-        guard let sel = selector, !sel.isEmpty else { return }
+        guard let sel = selector(layer), !sel.isEmpty else { return }
         sel.beginAction()
         sel.clearAll()
-        push(sel.endAction())
+        push(sel.endAction(), layer)
         paintChanged()
     }
+
+    /// Both paintings, e.g. for Reset.
+    func clearAllPaint() { clearPaint(.color); clearPaint(.fuzzy) }
 
     /// Per-face overhang flags for the current placement: a face counts when
     /// it points down more than `threshold` degrees past horizontal, unless it
@@ -543,7 +722,101 @@ final class PlateModel: ObservableObject {
     private(set) var bed: BedSize
     private var subs: [UUID: AnyCancellable] = [:]
 
-    init(bed: BedSize) { self.bed = bed }
+    init(bed: BedSize) {
+        self.bed = bed
+        committed = snapshot()
+        // Every change to the plate or an object passes through here; once
+        // things have been still for a moment the state before counts as one
+        // step — a slider drag or a drag on the bed is one undo, not hundreds.
+        historySub = objectWillChange.sink { [weak self] _ in self?.scheduleCommit() }
+    }
+
+    // MARK: undo (one step per settled change)
+
+    /// Everything a step can change, with the objects themselves kept alive
+    /// so a removed one comes back with its mesh and painting.
+    private struct PlateState {
+        struct Obj { let o: ModelPlacement; let rotation: SIMD4<Float>; let scale: SIMD3<Float>; let offset: SIMD2<Float>; let sink: Float; let extruder: Int }
+        var objects: [Obj]
+        var towerPos: SIMD2<Float>?
+        var bands: [LayerBand]
+        var pauses: [Float]
+        func same(as other: PlateState) -> Bool {
+            guard objects.count == other.objects.count, towerPos == other.towerPos, bands == other.bands, pauses == other.pauses else { return false }
+            for (a, b) in zip(objects, other.objects) {
+                if a.o !== b.o || a.rotation != b.rotation || a.scale != b.scale || a.offset != b.offset || a.sink != b.sink || a.extruder != b.extruder { return false }
+            }
+            return true
+        }
+    }
+    private var history: [PlateState] = []
+    private var committed: PlateState! = nil
+    private var historySub: AnyCancellable? = nil
+    private var pendingCommit: DispatchWorkItem? = nil
+    private var restoring = false
+    @Published private(set) var undoSteps = 0
+
+    private func snapshot() -> PlateState {
+        PlateState(objects: objects.map { .init(o: $0, rotation: $0.rotation.vector, scale: $0.scale, offset: $0.offset, sink: $0.sink, extruder: $0.extruder) },
+                   towerPos: towerPos, bands: layerBands, pauses: pauseHeights)
+    }
+
+    private func scheduleCommit() {
+        guard !restoring else { return }
+        pendingCommit?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.commit() }
+        pendingCommit = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
+    }
+
+    private func commit() {
+        let now = snapshot()
+        guard !now.same(as: committed) else { return }
+        history.append(committed)
+        if history.count > 50 { history.removeFirst() }
+        committed = now
+        undoSteps = history.count
+    }
+
+    /// Back one step.
+    func undo() {
+        pendingCommit?.cancel()
+        commit()                                  // a change still settling counts first
+        guard let prev = history.popLast() else { return }
+        restoring = true
+        for id in Set(objects.map(\.id)).subtracting(prev.objects.map(\.o.id)) { subs[id] = nil }
+        for s in prev.objects {
+            let o = s.o
+            if subs[o.id] == nil { attach(o) }
+            o.rotation = simd_quatf(vector: s.rotation)
+            o.scale = s.scale
+            o.offset = s.offset
+            o.sink = s.sink
+            o.extruder = s.extruder
+        }
+        objects = prev.objects.map(\.o)
+        towerPos = prev.towerPos
+        layerBands = prev.bands
+        pauseHeights = prev.pauses
+        if !objects.contains(where: { $0.id == selectedID }) { selectedID = objects.last?.id }
+        committed = snapshot()
+        undoSteps = history.count
+        // Let the published changes of the restore pass before listening again.
+        DispatchQueue.main.async { self.restoring = false }
+    }
+
+    /// A freshly opened plate starts without history.
+    func resetHistory() {
+        pendingCommit?.cancel()
+        history.removeAll()
+        committed = snapshot()
+        undoSteps = 0
+    }
+
+    private func attach(_ p: ModelPlacement) {
+        // Forward the object's changes so views observing the plate redraw.
+        subs[p.id] = p.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+    }
 
     /// Another printer was picked while the plate stayed: keep the objects and
     /// put them on the new bed rather than starting over.
@@ -558,13 +831,61 @@ final class PlateModel: ObservableObject {
 
     var selected: ModelPlacement? { objects.first { $0.id == selectedID } }
 
-    func add(_ mesh: TriMesh) {
+    /// Objects prepared elsewhere (a saved plate, loaded in the background)
+    /// go onto the plate as they are — no arranging, no history.
+    func adopt(_ placements: [ModelPlacement]) {
+        for p in placements {
+            p.bed = bed
+            attach(p)
+            objects.append(p)
+        }
+        selectedID = objects.first?.id
+        resetHistory()
+    }
+
+    /// `arrange: false` when a saved plate is rebuilt — its objects come with
+    /// their own positions, which a re-arrange per added object would undo.
+    func add(_ mesh: TriMesh, arrange rearrange: Bool = true) {
         let p = ModelPlacement(mesh: mesh, bed: bed)
-        // Forward the object's changes so views observing the plate redraw.
-        subs[p.id] = p.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+        attach(p)
         objects.append(p)
         selectedID = p.id
-        if objects.count > 1 { arrange() }
+        if rearrange && objects.count > 1 { arrange() }
+    }
+
+    /// A second copy of an object with everything done to it — turn, size,
+    /// sinking, head, own settings and both paintings — set down beside it.
+    func duplicate(_ id: UUID) {
+        guard let i = objects.firstIndex(where: { $0.id == id }) else { return }
+        let src = objects[i]
+        let p = ModelPlacement(mesh: src.mesh, bed: bed)
+        p.rotation = src.rotation
+        p.scale = src.scale
+        p.sink = src.sink
+        p.extruder = src.extruder
+        p.settings = src.settings
+        p.restorePaint(src.paintSnapshot, layer: .color)
+        p.restorePaint(src.fuzzySnapshot, layer: .fuzzy)
+        attach(p)
+        objects.insert(p, at: i + 1)
+        selectedID = p.id
+        // Right beside the original if there is room, else pack the plate.
+        let b = src.placedBounds
+        let w = b.max.x - b.min.x, d = b.max.y - b.min.y, gap = Self.arrangeGap
+        var others = objects.filter { $0.id != p.id }.map(\.placedBounds)
+        if showsTower {
+            let t = towerRect
+            others.append((SIMD3(t.min.x - towerBrim, t.min.y - towerBrim, 0), SIMD3(t.max.x + towerBrim, t.max.y + towerBrim, 0)))
+        }
+        for step in [SIMD2<Float>(w + gap, 0), SIMD2(-(w + gap), 0), SIMD2(0, d + gap), SIMD2(0, -(d + gap))] {
+            p.offset = src.offset + step
+            let pb = p.placedBounds
+            let free = !others.contains { o in
+                pb.min.x < o.max.x + gap / 2 && pb.max.x > o.min.x - gap / 2 && pb.min.y < o.max.y + gap / 2 && pb.max.y > o.min.y - gap / 2
+            }
+            if p.fitsBed && free { return }
+        }
+        arrange()
     }
 
     func remove(_ id: UUID) {
@@ -573,29 +894,114 @@ final class PlateModel: ObservableObject {
         if selectedID == id { selectedID = objects.last?.id }
     }
 
-    /// Row-wise packing with a gap, then the whole group is centred on the
-    /// bed — like Orca, which never leaves parts hugging the front-left corner.
-    func arrange(gap: Float = 6) {
-        struct Slot { let o: ModelPlacement; var x: Float; var y: Float; let w: Float; let d: Float }
-        var slots: [Slot] = []
-        var x: Float = 0, y: Float = 0, rowH: Float = 0
-        for o in objects {
+    /// Minimum distance between objects (mm), set in the Arrange panel.
+    static var arrangeGap: Float {
+        let v = UserDefaults.standard.double(forKey: "arrange_gap")
+        return v > 0 ? Float(v) : 6
+    }
+
+    /// Arranging: the rectangle around all objects together — the area the
+    /// printer probes before printing — as small as possible. Objects are set
+    /// one by one right against the ones already placed, each where that
+    /// rectangle grows least (then squarer, then nearer the middle). Several
+    /// orders (and, with `minimizeFootprint`, quarter turns) are tried and
+    /// the smallest rectangle wins; at the end the group is centred on the
+    /// bed. `minimizeFootprint` first also turns every object about the
+    /// vertical axis to its own smallest rectangle; how it stands stays.
+    func arrange(gap: Float = PlateModel.arrangeGap, minimizeFootprint: Bool = false) {
+        if minimizeFootprint { for o in objects { o.turnToSmallestFootprint() } }
+        guard !objects.isEmpty else { return }
+        let sizes = objects.map { o -> SIMD2<Float> in
             o.offset = .zero
             let b = o.placedBounds
-            let w = b.max.x - b.min.x, d = b.max.y - b.min.y
-            if x + w > bed.x && x > 0 { x = 0; y += rowH + gap; rowH = 0 }
-            slots.append(Slot(o: o, x: x, y: y, w: w, d: d))
-            x += w + gap
-            rowH = max(rowH, d)
+            return SIMD2(b.max.x - b.min.x, b.max.y - b.min.y)
         }
-        guard !slots.isEmpty else { return }
-        let totalW = slots.map { $0.x + $0.w }.max() ?? 0
-        let totalD = slots.map { $0.y + $0.d }.max() ?? 0
-        // Shift so the group's centre sits on the bed centre; offsets are
-        // relative to the bed centre, so that is (slot centre − group centre).
-        for sl in slots {
-            sl.o.offset = SIMD2(sl.x + sl.w / 2 - totalW / 2, sl.y + sl.d / 2 - totalD / 2)
+        // The prime tower gets the back of the plate — close to the tool
+        // docks — and the objects the room in front of it.
+        let tower = showsTower
+        let towerInset = towerBrim + 2
+        let usableDepth = tower ? max(bed.y - (towerSize.y + 2 * towerBrim + gap + 2), bed.y * 0.3) : bed.y
+        let idx = Array(sizes.indices)
+        let orders: [[Int]] = [
+            idx.sorted { sizes[$0].x * sizes[$0].y > sizes[$1].x * sizes[$1].y },
+            idx.sorted { max(sizes[$0].x, sizes[$0].y) > max(sizes[$1].x, sizes[$1].y) },
+            idx.sorted { sizes[$0].x > sizes[$1].x },
+            idx.sorted { sizes[$0].y > sizes[$1].y },
+        ]
+        var best: ArrangeResult? = nil
+        for order in orders {
+            for turns in minimizeFootprint ? [false, true] : [false] {
+                let r = Self.greedyArrange(sizes, order: order, bed: SIMD2(bed.x, usableDepth), gap: gap, allowTurn: turns)
+                // Clearly smaller wins; about equal: fewer turns, then squarer.
+                if best == nil || r.area < best!.area * 0.995
+                    || (r.area < best!.area * 1.005 && (r.turns, r.squareness) < (best!.turns, best!.squareness)) { best = r }
+            }
         }
+        guard let res = best else { return }
+        let lo = res.centres.enumerated().map { $0.element - res.sizes[$0.offset] / 2 }.reduce(SIMD2<Float>(repeating: .greatestFiniteMagnitude)) { simd_min($0, $1) }
+        let hi = res.centres.enumerated().map { $0.element + res.sizes[$0.offset] / 2 }.reduce(SIMD2<Float>(repeating: -.greatestFiniteMagnitude)) { simd_max($0, $1) }
+        // Centred across the bed, and in the depth in front of the tower.
+        let shift = SIMD2(bed.x / 2, usableDepth / 2) - (lo + hi) / 2
+        for (i, o) in objects.enumerated() {
+            if res.turned[i] { o.rotate(axis: SIMD3(0, 0, 1), degrees: 90) }
+            // Offset 0 = the object's box centred on the bed centre.
+            o.offset = res.centres[i] + shift - SIMD2(bed.x / 2, bed.y / 2)
+        }
+        if tower {
+            // Behind the middle of the group, at the back edge, never turned.
+            let w = towerSize.x, d = towerSize.y
+            let midX = (lo.x + hi.x) / 2 + shift.x
+            towerPos = SIMD2(min(max(midX - w / 2, towerInset), bed.x - w - towerInset), bed.y - towerInset - d)
+        }
+    }
+
+    private struct ArrangeResult {
+        var centres: [SIMD2<Float>]; var sizes: [SIMD2<Float>]; var turned: [Bool]
+        var area: Float; var turns: Int; var squareness: Float
+    }
+
+    /// One placing pass in the given order (see `arrange`).
+    private static func greedyArrange(_ sizes: [SIMD2<Float>], order: [Int], bed: SIMD2<Float>, gap: Float, allowTurn: Bool) -> ArrangeResult {
+        struct Rect { var lo: SIMD2<Float>; var hi: SIMD2<Float> }
+        let centre = bed / 2, margin: Float = 2
+        var centres = [SIMD2<Float>](repeating: .zero, count: sizes.count)
+        var used = sizes, turned = [Bool](repeating: false, count: sizes.count)
+        var placed: [Rect] = []
+        var pile: Rect? = nil
+        for i in order {
+            var best: (score: Float, c: SIMD2<Float>, turn: Bool)? = nil
+            for turn in allowTurn ? [false, true] : [false] {
+                let s = turn ? SIMD2(sizes[i].y, sizes[i].x) : sizes[i]
+                let h = s / 2
+                // Touching positions: beside each placed box, flush with its edges.
+                var xs: Set<Float> = [centre.x], ys: Set<Float> = [centre.y]
+                for r in placed {
+                    xs.formUnion([r.hi.x + gap + h.x, r.lo.x - gap - h.x, r.lo.x + h.x, r.hi.x - h.x])
+                    ys.formUnion([r.hi.y + gap + h.y, r.lo.y - gap - h.y, r.lo.y + h.y, r.hi.y - h.y])
+                }
+                for x in xs {
+                    for y in ys {
+                        let c = SIMD2(x, y)
+                        let lo = c - h, hi = c + h
+                        if placed.contains(where: { lo.x < $0.hi.x + gap - 0.01 && hi.x > $0.lo.x - gap + 0.01 && lo.y < $0.hi.y + gap - 0.01 && hi.y > $0.lo.y - gap + 0.01 }) { continue }
+                        let plo = pile.map { simd_min($0.lo, lo) } ?? lo, phi = pile.map { simd_max($0.hi, hi) } ?? hi
+                        let p = phi - plo
+                        var score = p.x * p.y + 0.05 * abs(p.x - p.y) * max(p.x, p.y) + 0.01 * simd_distance(c, centre)
+                        if p.x > bed.x - 2 * margin || p.y > bed.y - 2 * margin { score += 1e9 }     // must fit the bed
+                        if best == nil || score < best!.score { best = (score, c, turn) }
+                    }
+                }
+            }
+            guard let b = best else { continue }
+            let s = b.turn ? SIMD2(sizes[i].y, sizes[i].x) : sizes[i]
+            let r = Rect(lo: b.c - s / 2, hi: b.c + s / 2)
+            placed.append(r)
+            centres[i] = b.c; used[i] = s; turned[i] = b.turn
+            pile = pile.map { Rect(lo: simd_min($0.lo, r.lo), hi: simd_max($0.hi, r.hi)) } ?? r
+        }
+        let p = (pile?.hi ?? .zero) - (pile?.lo ?? .zero)
+        return ArrangeResult(centres: centres, sizes: used, turned: turned, area: p.x * p.y,
+                             turns: turned.filter { $0 }.count, squareness: abs(p.x - p.y))
     }
 
     var allFit: Bool { objects.allSatisfy(\.fitsBed) }
@@ -613,15 +1019,101 @@ final class PlateModel: ObservableObject {
     /// nil = automatic corner; set once the user drags it.
     @Published var towerPos: SIMD2<Float>? = nil
     @Published var towerSelected = false
-    /// Orca's default prime_tower_width by the depth the tower reaches with
-    /// several colours (it grows with the purges; Orca's own default spot
-    /// leaves 50 mm) — so the block on the plate is what the slice needs.
-    let towerSize = SIMD2<Float>(30, 50)
+    /// The prime tower as Orca prints it: the profile's prime_tower_width
+    /// across, and as deep as the purges need — Orca does not state that, it
+    /// follows from the purge volume per layer. Measured: 2 colours ≈ 6–13 mm
+    /// (with a 5 mm brim around). Until a slice told the real depth (see
+    /// `rememberTower`), an estimate by the number of heads is shown.
+    var towerSize: SIMD2<Float> { SIMD2(Self.towerWidth, Self.towerDepth(heads: usedHeads.count)) }
+
+    static var towerWidth: Float {
+        let v = UserDefaults.standard.double(forKey: "prime_tower_width")
+        return v > 5 ? Float(v) : 35
+    }
+    static func towerDepth(heads: Int) -> Float {
+        let learned = UserDefaults.standard.double(forKey: "prime_tower_depth_\(max(heads, 2))")
+        if learned > 2 { return Float(learned) }
+        return 6 + 7 * Float(max(heads, 2) - 1)
+    }
+    /// Orca's prime_tower_brim_width — the room kept free around the tower.
+    static var towerBrimWidth: Float {
+        let v = UserDefaults.standard.object(forKey: "prime_tower_brim_width") as? Double ?? 5
+        return Float(max(0, v))
+    }
+
+    /// What a slice showed: width and depth of the tower actually printed
+    /// for this many heads — from then on the plate shows that.
+    static func rememberTower(width: Float, depth: Float, heads: Int) {
+        if width > 5 { UserDefaults.standard.set(Double(width), forKey: "prime_tower_width") }
+        if depth > 2 { UserDefaults.standard.set(Double(depth), forKey: "prime_tower_depth_\(max(heads, 2))") }
+    }
 
     var usedHeads: Set<Int> {
         var s = Set<Int>()
         for o in objects { s.insert(o.extruder); s.formUnion(o.paintedHeads) }
+        s.formUnion(activeBands.map(\.head))
         return s
+    }
+
+    // MARK: pauses
+
+    /// Heights (mm) at which the printer pauses — before the first layer
+    /// above each one. Inserted into the G-code when it is sent.
+    @Published var pauseHeights: [Float] = []
+
+    /// A new pause in the middle of the largest stretch without one.
+    func addPause() {
+        let h = printHeight
+        guard h > 0.6 else { return }
+        let marks = [0] + pauseHeights.sorted() + [h]
+        var best: (Float, Float) = (0, h)
+        for i in 0..<(marks.count - 1) where marks[i + 1] - marks[i] > best.1 - best.0 || (best == (0, h) && i == 0) {
+            best = (marks[i], marks[i + 1])
+        }
+        let z = ((best.0 + best.1) / 2 * 10).rounded() / 10
+        guard z > 0.2, z < h - 0.1, !pauseHeights.contains(where: { abs($0 - z) < 0.15 }) else { return }
+        pauseHeights.append(z)
+        pauseHeights.sort()
+    }
+
+    // MARK: layer colours
+
+    /// Height ranges in another colour (several heads only), lowest first.
+    @Published var layerBands: [LayerBand] = []
+
+    /// The highest printed point on the plate (mm).
+    var printHeight: Float { objects.map { $0.placedSize.z - $0.sink }.max() ?? 0 }
+
+    /// Bands that reach into something printed.
+    var activeBands: [LayerBand] { layerBands.filter { $0.to > $0.from && $0.from < printHeight } }
+
+    /// A new band: the upper half of the largest free stretch of height —
+    /// or, when everything is coloured already, the upper half of the largest
+    /// band. In a head not yet used for a band. Up to four bands.
+    func addBand(heads: [Int]) {
+        let h = printHeight
+        guard h > 0.4, layerBands.count < 4 else { return }
+        let taken = Set(layerBands.map(\.head))
+        let own = Set(objects.map(\.extruder))
+        let head = heads.first { !taken.contains($0) && !own.contains($0) } ?? heads.first { !taken.contains($0) } ?? 1
+        let sorted = layerBands.sorted { $0.from < $1.from }
+        var gaps: [(Float, Float)] = []
+        var z: Float = 0
+        for b in sorted {
+            if b.from - z > 0.4 { gaps.append((z, b.from)) }
+            z = max(z, b.to)
+        }
+        if h - z > 0.4 { gaps.append((z, h)) }
+        func snap(_ v: Float) -> Float { (v * 10).rounded() / 10 }
+        if let g = gaps.max(by: { $0.1 - $0.0 < $1.1 - $1.0 }) {
+            layerBands.append(LayerBand(head: head, from: snap((g.0 + g.1) / 2), to: snap(g.1)))
+        } else if let big = sorted.max(by: { $0.to - $0.from < $1.to - $1.from }), big.to - big.from > 0.8,
+                  let i = layerBands.firstIndex(where: { $0.id == big.id }) {
+            let mid = snap((big.from + big.to) / 2)
+            layerBands[i].to = mid
+            layerBands.append(LayerBand(head: head, from: mid, to: big.to))
+        }
+        layerBands.sort { $0.from < $1.from }
     }
     var showsTower: Bool { towerEnabled && usedHeads.count > 1 }
 
@@ -656,7 +1148,7 @@ final class PlateModel: ObservableObject {
     }
 
     /// Room the tower's brim needs around it.
-    private let towerBrim: Float = 3
+    private var towerBrim: Float { Self.towerBrimWidth }
 
     /// The tower (with brim) must not touch an object's real footprint —
     /// standing in a hole of a part is fine, Orca slices that.
@@ -700,6 +1192,10 @@ struct ModelSceneView: UIViewRepresentable {
     var brushRadius: Float? = nil
     /// How far a facet may tilt against the tapped one and still be filled.
     var fillAngle: Float = 5
+    /// Which painting is edited and shown: colour or fuzzy skin.
+    var paintLayer: PaintLayer = .color
+    /// A long press on an object (outside painting): offer duplicate/remove.
+    var onLongPress: (ModelPlacement) -> Void = { _ in }
     var onFaceTap: (ModelPlacement, SIMD3<Float>) -> Void
 
     func makeUIView(context: Context) -> SCNView {
@@ -725,6 +1221,10 @@ struct ModelSceneView: UIViewRepresentable {
         pan.delegate = context.coordinator
         pan.maximumNumberOfTouches = 1
         v.addGestureRecognizer(pan)
+        let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.held(_:)))
+        hold.delegate = context.coordinator
+        hold.minimumPressDuration = 0.5
+        v.addGestureRecognizer(hold)
         context.coordinator.view = v
         context.coordinator.sync()
         return v
@@ -854,10 +1354,14 @@ struct ModelSceneView: UIViewRepresentable {
             fill.position = toScene(SIMD3(-bed.x * 0.5, bed.y * 1.5, bed.z))
             fill.look(at: toScene(SIMD3(bed.x / 2, bed.y / 2, 0)))
             root.addChildNode(fill)
-            let amb = SCNNode(); amb.light = SCNLight(); amb.light?.type = .ambient; amb.light?.intensity = 400
+            let amb = SCNNode(); amb.light = SCNLight(); amb.light?.type = .ambient; amb.light?.intensity = 250   // less flat light: more shape
             root.addChildNode(amb)
 
             camera.camera = SCNCamera()
+            // A light that travels with the view: whichever side one looks at,
+            // faces turned away get darker — relief stays readable.
+            let head = SCNNode(); head.light = SCNLight(); head.light?.type = .directional; head.light?.intensity = 520
+            camera.addChildNode(head)
             camera.camera?.zFar = 5000
             camera.camera?.fieldOfView = 45
             camera.position = toScene(SIMD3(bed.x / 2, -bed.y * 1.2, bed.z * 1.0))
@@ -887,21 +1391,46 @@ struct ModelSceneView: UIViewRepresentable {
         func sync() {
             let plate = parent.plate
             let live = Set(plate.objects.map(\.id))
-            for (id, n) in nodes where !live.contains(id) { n.removeFromParentNode(); nodes[id] = nil; keys[id] = nil; leafSources[id] = nil }
+            for (id, n) in nodes where !live.contains(id) { n.removeFromParentNode(); nodes[id] = nil; keys[id] = nil; leafSources[id] = nil; overlays[id] = nil }
             for o in plate.objects {
                 let node = nodes[o.id] ?? { let n = SCNNode(); n.name = o.id.uuidString; objectsNode.addChildNode(n); nodes[o.id] = n; return n }()
                 let selected = o.id == plate.selectedID
                 // The shift is only the node's position: a drag moves the
                 // object at frame rate instead of rebuilding its mesh each time.
-                node.position = SCNVector3(o.offset.x, 0, -o.offset.y)
+                node.position = SCNVector3(o.offset.x, -o.sink, -o.offset.y)
                 // Selecting only tints the material — no rebuild for that.
                 Self.tint(node, selected: selected)
-                let key = "\(o.rotation.vector)|\(o.scale)|\(o.fitsBed)|\(o.extruder)|\(o.paintVersion)|\(parent.headColors.count)"
+                applyBands(node)
+                let key = "\(o.rotation.vector)|\(o.scale)|\(o.fitsBed)|\(o.extruder)|\(o.paintVersion)|\(parent.headColors.count)|\(o.sink)|\(parent.paintLayer)"
                 guard keys[o.id] != key else { continue }
                 keys[o.id] = key
                 buildAsync(o)
             }
             syncTower()
+            syncPauses()
+        }
+
+        /// A thin yellow sheet across the bed at every pause height.
+        private var pauseNodes: [SCNNode] = []
+        private var pauseKey = ""
+        private func syncPauses() {
+            let plate = parent.plate
+            let key = plate.pauseHeights.map { String(format: "%.2f", $0) }.joined(separator: ",") + "|\(plate.bed.x)"
+            guard key != pauseKey else { return }
+            pauseKey = key
+            pauseNodes.forEach { $0.removeFromParentNode() }
+            pauseNodes = plate.pauseHeights.map { z in
+                let box = SCNBox(width: CGFloat(plate.bed.x), height: 0.25, length: CGFloat(plate.bed.y), chamferRadius: 0)
+                box.firstMaterial?.diffuse.contents = UIColor.systemYellow.withAlphaComponent(0.28)
+                box.firstMaterial?.lightingModel = .constant
+                box.firstMaterial?.isDoubleSided = true
+                box.firstMaterial?.writesToDepthBuffer = false
+                let n = SCNNode(geometry: box)
+                n.categoryBitMask = 2                     // never picked
+                n.position = toScene(SIMD3(plate.bed.x / 2, plate.bed.y / 2, z))
+                root.addChildNode(n)
+                return n
+            }
         }
 
         /// Unselected objects are dimmed a little so the active one stands out.
@@ -920,7 +1449,7 @@ struct ModelSceneView: UIViewRepresentable {
             let r = plate.towerRect
             let height = max(plate.objects.map { $0.placedBounds.max.z }.max() ?? 20, 20)
             let collides = plate.towerCollides || plate.towerNearEdge
-            let key = "\(r.min)|\(height)|\(collides)|\(plate.towerSelected)"
+            let key = "\(r.min)|\(r.max)|\(height)|\(collides)|\(plate.towerSelected)"
             guard key != towerKey else { return }
             towerKey = key
             let node = towerNode ?? { let n = SCNNode(); n.name = "tower"; n.categoryBitMask = 1; root.addChildNode(n); towerNode = n; return n }()
@@ -938,11 +1467,87 @@ struct ModelSceneView: UIViewRepresentable {
         struct GeometryJob {
             var matrix: simd_float4x4
             var raw: [SIMD3<Float>]
-            var leaves: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, UInt8, Int32)]?
+            /// The painting, frozen (no copy) — walked in the background.
+            var painting: PaintSelector.Frozen?
             var base: SIMD4<Float>
             var headCols: [SIMD4<Float>]
             var fits: Bool
+            /// Lowered into the bed by this much: the part below is not drawn.
+            var sink: Float = 0
+            /// Showing the fuzzy-skin painting: its faces in their own colour.
+            var fuzzyView = false
         }
+
+        /// Filament colours are drawn as they are.
+        static func shade(_ c: SIMD4<Float>) -> SIMD4<Float> { c }
+
+        /// Layer colours drawn by height on the GPU: moving a slider only
+        /// changes these values, the object is not rebuilt. World Y is the
+        /// height above the bed (the node is already lowered by its sink).
+        static let bandShader = """
+        #pragma arguments
+        float4 bandFrom;
+        float4 bandTo;
+        float4 bandC0;
+        float4 bandC1;
+        float4 bandC2;
+        float4 bandC3;
+        #pragma body
+        if (_surface.diffuse.a > 0.995) {
+            float z = (scn_frame.inverseViewTransform * float4(_surface.position, 1.0)).y;
+            if (z >= bandFrom.x && z < bandTo.x) { _surface.diffuse = bandC0; }
+            else if (z >= bandFrom.y && z < bandTo.y) { _surface.diffuse = bandC1; }
+            else if (z >= bandFrom.z && z < bandTo.z) { _surface.diffuse = bandC2; }
+            else if (z >= bandFrom.w && z < bandTo.w) { _surface.diffuse = bandC3; }
+        }
+        _surface.diffuse.a = 1.0;
+        """
+
+        /// Puts the plate's layer colours into an object's material.
+        private func applyBands(_ node: SCNNode) {
+            guard let m = node.geometry?.firstMaterial else { return }
+            let bands = parent.paintLayer == .fuzzy ? [] : Array(parent.plate.activeBands.prefix(4))
+            var from = [Float](repeating: -1, count: 4), to = [Float](repeating: -1, count: 4)
+            var cols = [SIMD4<Float>](repeating: .zero, count: 4)
+            for (i, b) in bands.enumerated() {
+                from[i] = b.from; to[i] = b.to
+                var r: CGFloat = 0, g: CGFloat = 0, bl: CGFloat = 0, a: CGFloat = 0
+                (parent.headColors[safe: b.head - 1] ?? parent.accent).getRed(&r, green: &g, blue: &bl, alpha: &a)
+                cols[i] = Self.shade(SIMD4(Float(r), Float(g), Float(bl), 1))
+            }
+            m.setValue(SCNVector4(from[0], from[1], from[2], from[3]), forKey: "bandFrom")
+            m.setValue(SCNVector4(to[0], to[1], to[2], to[3]), forKey: "bandTo")
+            for i in 0..<4 { m.setValue(SCNVector4(cols[i].x, cols[i].y, cols[i].z, 1), forKey: "bandC\(i)") }
+        }
+
+        /// OrcaSlicer's own look (its gouraud shader): two lights fixed to the
+        /// view — top-left and front-right — over a 0.3 ambient, never brighter
+        /// than 0.96, so white keeps its shading and every colour stays true;
+        /// plus a fine highlight. On top, a little of what plastic mirrors at
+        /// grazing angles (brighter above, darker below): rounded edges and
+        /// steps of dark parts stay readable without greying the colour.
+        static let lookShader = """
+        float3 n = normalize(_surface.normal);
+        float3 v = normalize(-_surface.position);
+        if (dot(n, v) < 0.0) { n = -n; }
+        float3 lt = float3(-0.4574957, 0.4574957, 0.7624929);
+        float3 lf = float3(0.6985074, 0.1397015, 0.6985074);
+        float diff = 0.3 + 0.48 * max(dot(n, lt), 0.0) + 0.18 * max(dot(n, lf), 0.0);
+        float spec = 0.12 * pow(max(dot(v, reflect(-lt, n)), 0.0), 20.0);
+        float fres = 0.02 + 0.32 * pow(1.0 - max(dot(n, v), 0.0), 4.0);
+        float env = mix(0.12, 0.85, 0.5 + 0.5 * n.y);
+        float3 col = mix(_surface.diffuse.rgb * diff, float3(env), fres) + spec;
+        _output.color.rgb = col * _surface.multiply.rgb;
+        """
+
+        /// The material every object is drawn with (with or without layer colours).
+        static func gloss(_ m: SCNMaterial?, bands: Bool = false) {
+            m?.lightingModel = .constant
+            m?.shaderModifiers = bands ? [.surface: bandShader, .fragment: lookShader] : [.fragment: lookShader]
+        }
+
+        /// Painted fuzzy skin on screen — a colour no filament is likely to have.
+        static let fuzzyColour = SIMD4<Float>(0.93, 0.36, 0.86, 1)
 
         private func job(for o: ModelPlacement) -> GeometryJob {
             var ar: CGFloat = 0, ag: CGFloat = 0, ab: CGFloat = 0, aa: CGFloat = 0
@@ -950,18 +1555,15 @@ struct ModelSceneView: UIViewRepresentable {
             let headCols: [SIMD4<Float>] = (0..<4).map { i in
                 var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
                 (parent.headColors[safe: i] ?? parent.accent).getRed(&r, green: &g, blue: &b, alpha: &a)
-                return SIMD4(Float(r), Float(g), Float(b), 1)
+                return Self.shade(SIMD4(Float(r), Float(g), Float(b), 1))
             }
-            var leaves: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, UInt8, Int32)]? = nil
-            if let sel = o.selector {
-                var l: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, UInt8, Int32)] = []
-                l.reserveCapacity(o.mesh.triangleCount + o.mesh.triangleCount / 4)
-                sel.forEachLeaf { a, b, c, st, src in l.append((a, b, c, st, src)) }
-                leaves = l
-            }
-            return GeometryJob(matrix: o.matrix(offset: .zero), raw: o.mesh.vertices, leaves: leaves,
-                               base: SIMD4(Float(ar), Float(ag), Float(ab), 1), headCols: headCols,
-                               fits: o.fitsBed)
+            let fuzzyView = parent.paintLayer == .fuzzy
+            // Collecting 1.5 million pieces here used to stall the main
+            // thread; the frozen painting is handed over as it is.
+            let painting = (fuzzyView ? o.fuzzySelector : o.selector)?.frozen
+            return GeometryJob(matrix: o.matrix(offset: .zero), raw: o.mesh.vertices, painting: painting,
+                               base: Self.shade(SIMD4(Float(ar), Float(ag), Float(ab), 1)), headCols: headCols,
+                               fits: o.fitsBed, sink: o.sink, fuzzyView: fuzzyView)
         }
 
         /// Placed triangles with normals, overhang colouring and paint —
@@ -969,35 +1571,62 @@ struct ModelSceneView: UIViewRepresentable {
         static func build(_ j: GeometryJob) -> (SCNGeometry, [Int32]?) {
             let c0 = j.matrix.columns.0, c1 = j.matrix.columns.1, c2 = j.matrix.columns.2, c3 = j.matrix.columns.3
             @inline(__always) func place(_ v: SIMD3<Float>) -> SIMD3<Float> { let p = c0 * v.x + c1 * v.y + c2 * v.z + c3; return SIMD3(p.x, p.y, p.z) }
-            let n = j.leaves.map { $0.count * 3 } ?? j.raw.count
+            let n = j.painting != nil ? j.raw.count + j.raw.count / 4 : j.raw.count
             let overhangLimit: Float = -sin(45 * Float.pi / 180)
             var pos = [SCNVector3](); pos.reserveCapacity(n)
             var nor = [SCNVector3](); nor.reserveCapacity(n)
             var col = [SIMD4<Float>](); col.reserveCapacity(n)
             let red = SIMD4<Float>(0.95, 0.25, 0.2, 1)
             let outside = SIMD4<Float>(0.95, 0.6, 0.1, 1)
-            @inline(__always) func add(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>, painted: SIMD4<Float>?) {
+            let marked = SIMD4<Float>(1, 1, 1, 0.99)
+            let floor = j.sink
+            @inline(__always) func put(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>, painted: SIMD4<Float>?) {
                 var nn = simd_cross(b - a, c - a)
                 let len = simd_length(nn); if len > 0 { nn /= len }
-                let overhang = nn.z < overhangLimit && !(a.z < 0.05 && b.z < 0.05 && c.z < 0.05)
-                let colour = !j.fits ? outside : (painted ?? (overhang ? red : j.base))
+                let overhang = nn.z < overhangLimit && !(a.z < floor + 0.05 && b.z < floor + 0.05 && c.z < floor + 0.05)
+                // Alpha 0.99 marks colours of their own (painting, overhang,
+                // outside): the layer-colour shader leaves those alone.
+                let colour = !j.fits ? outside * marked : (painted.map { $0 * marked } ?? (overhang ? red * marked : j.base))
                 pos.append(toScene(a)); pos.append(toScene(b)); pos.append(toScene(c))
                 let sn = toScene(nn); nor.append(sn); nor.append(sn); nor.append(sn)
                 col.append(colour); col.append(colour); col.append(colour)
             }
+            /// Only what stands above the bed is drawn; a triangle crossing it
+            /// is cut there. Returns how many pieces were drawn.
+            @inline(__always) func add(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>, painted: SIMD4<Float>?) -> Int {
+                if floor <= 0 || (a.z >= floor && b.z >= floor && c.z >= floor) { put(a, b, c, painted: painted); return 1 }
+                if a.z < floor && b.z < floor && c.z < floor { return 0 }
+                var poly: [SIMD3<Float>] = []
+                let v = [a, b, c]
+                for k in 0..<3 {
+                    let p = v[k], q = v[(k + 1) % 3]
+                    let ip = p.z >= floor, iq = q.z >= floor
+                    if ip { poly.append(p) }
+                    if ip != iq { var x = p + (q - p) * ((floor - p.z) / (q.z - p.z)); x.z = floor; poly.append(x) }
+                }
+                guard poly.count >= 3 else { return 0 }
+                for k in 1..<(poly.count - 1) { put(poly[0], poly[k], poly[k + 1], painted: painted) }
+                return poly.count - 2
+            }
             var sources: [Int32]? = nil
-            if let leaves = j.leaves {
-                var src: [Int32] = []; src.reserveCapacity(leaves.count)
-                for (a, b, c, st, s) in leaves {
-                    add(place(a), place(b), place(c), painted: st > 0 ? j.headCols[Int(st) - 1] : nil)
-                    src.append(s)
+            if let painting = j.painting {
+                var src: [Int32] = []; src.reserveCapacity(n / 3)
+                painting.forEachLeaf { a, b, c, st, s in
+                    let n = add(place(a), place(b), place(c), painted: st > 0 ? (j.fuzzyView ? fuzzyColour : j.headCols[Int(st) - 1]) : nil)
+                    for _ in 0..<n { src.append(s) }
                 }
                 sources = src
             } else {
                 let raw = j.raw
+                // Without painting, picking maps drawn triangles back to the
+                // mesh through this list as soon as a cut changes the count.
+                var src: [Int32] = []
+                if floor > 0 { src.reserveCapacity(raw.count / 3) }
                 for i in 0..<(raw.count / 3) {
-                    add(place(raw[i * 3]), place(raw[i * 3 + 1]), place(raw[i * 3 + 2]), painted: nil)
+                    let n = add(place(raw[i * 3]), place(raw[i * 3 + 1]), place(raw[i * 3 + 2]), painted: nil)
+                    if floor > 0 { for _ in 0..<n { src.append(Int32(i)) } }
                 }
+                if floor > 0 { sources = src }
             }
             let count = pos.count
             let colData = col.withUnsafeBufferPointer { Data(buffer: $0) }
@@ -1006,17 +1635,60 @@ struct ModelSceneView: UIViewRepresentable {
             let idx = (0..<count).map { Int32($0) }
             let g = SCNGeometry(sources: [SCNGeometrySource(vertices: pos), SCNGeometrySource(normals: nor), colSrc],
                                 elements: [SCNGeometryElement(indices: idx, primitiveType: .triangles)])
-            g.firstMaterial?.lightingModel = .blinn
+            gloss(g.firstMaterial, bands: true)
             g.firstMaterial?.isDoubleSided = true
             return (g, sources)
         }
 
-        /// Synchronous build (brush strokes refresh in place).
-        private func geometry(for o: ModelPlacement) -> SCNGeometry {
-            generation[o.id, default: 0] += 1                    // a slower background build must not overwrite this
-            let (g, src) = Self.build(job(for: o))
-            leafSources[o.id] = src
-            return g
+        /// While painting, only the changed pieces are drawn — as a thin
+        /// layer just above the surface — instead of rebuilding the whole
+        /// object on every dab (1.5 million triangles made that lag). The
+        /// full rebuild then runs in the background and replaces the layer.
+        private var overlays: [UUID: SCNNode] = [:]
+
+        private func showOverlay(_ o: ModelPlacement, originals: Set<Int32>) {
+            guard !originals.isEmpty, let node = nodes[o.id],
+                  let sel = o.paintSelector(parent.paintLayer) else { return }
+            let j = job(for: o)
+            let painting = sel.frozen
+            let c0 = j.matrix.columns.0, c1 = j.matrix.columns.1, c2 = j.matrix.columns.2, c3 = j.matrix.columns.3
+            @inline(__always) func place(_ v: SIMD3<Float>) -> SIMD3<Float> { let p = c0 * v.x + c1 * v.y + c2 * v.z + c3; return SIMD3(p.x, p.y, p.z) }
+            var pos: [SCNVector3] = [], nor: [SCNVector3] = [], col: [SIMD4<Float>] = []
+            painting.forEachLeaf(of: originals) { a0, b0, c0v, st, _ in
+                var a = place(a0), b = place(b0), c = place(c0v)
+                if j.sink > 0, a.z < j.sink, b.z < j.sink, c.z < j.sink { return }
+                var n = simd_cross(b - a, c - a)
+                let len = simd_length(n); guard len > 0 else { return }
+                n /= len
+                // Lifted a hair along the face so it covers the old colour.
+                let lift = n * 0.04
+                a += lift; b += lift; c += lift
+                let colour = st > 0 ? (j.fuzzyView ? Self.fuzzyColour : j.headCols[Int(st) - 1]) : j.base
+                pos.append(toScene(a)); pos.append(toScene(b)); pos.append(toScene(c))
+                let sn = toScene(n); nor.append(sn); nor.append(sn); nor.append(sn)
+                col.append(colour); col.append(colour); col.append(colour)
+            }
+            guard !pos.isEmpty else { return }
+            let colData = col.withUnsafeBufferPointer { Data(buffer: $0) }
+            let colSrc = SCNGeometrySource(data: colData, semantic: .color, vectorCount: col.count, usesFloatComponents: true,
+                                           componentsPerVector: 4, bytesPerComponent: 4, dataOffset: 0, dataStride: 16)
+            let g = SCNGeometry(sources: [SCNGeometrySource(vertices: pos), SCNGeometrySource(normals: nor), colSrc],
+                                elements: [SCNGeometryElement(indices: (0..<Int32(pos.count)).map { $0 }, primitiveType: .triangles)])
+            Self.gloss(g.firstMaterial)
+            g.firstMaterial?.isDoubleSided = true
+            let layer = overlays[o.id] ?? {
+                let n = SCNNode()
+                n.categoryBitMask = 4                  // never picked: hits map to the object's own triangles
+                node.addChildNode(n)
+                overlays[o.id] = n
+                return n
+            }()
+            layer.geometry = g
+        }
+
+        private func dropOverlay(_ id: UUID) {
+            overlays[id]?.removeFromParentNode()
+            overlays[id] = nil
         }
 
         /// Background build; the result lands on the node only if nothing
@@ -1036,7 +1708,11 @@ struct ModelSceneView: UIViewRepresentable {
                     guard let self, self.generation[id] == gen, let node = self.nodes[id] else { return }
                     node.geometry = g
                     Self.tint(node, selected: plate.selectedID == id)
+                    self.applyBands(node)
                     self.leafSources[id] = src
+                    // The new geometry has the painting: the overlay can go —
+                    // unless a stroke is running on this object right now.
+                    if self.painting?.id != id { self.dropOverlay(id) }
                 }
             }
         }
@@ -1088,7 +1764,10 @@ struct ModelSceneView: UIViewRepresentable {
             if let head = parent.paintHead {
                 parent.plate.selectedID = obj.id
                 let orig = Int(leafSources[obj.id]?[safe: hit.faceIndex] ?? Int32(hit.faceIndex))
-                if parent.brushRadius == nil { obj.fill(from: orig, head: head, angle: parent.fillAngle) }
+                if parent.brushRadius == nil {
+                    obj.fill(from: orig, head: head, angle: parent.fillAngle, layer: parent.paintLayer)
+                    showOverlay(obj, originals: obj.lastChanged)
+                }
             } else if parent.faceMode {
                 let sn = hit.localNormal
                 var n = SIMD3<Float>(sn.x, -sn.z, sn.y)
@@ -1102,6 +1781,18 @@ struct ModelSceneView: UIViewRepresentable {
             } else {
                 parent.plate.selectedID = obj.id
             }
+        }
+
+        /// Long press on an object: select it and let the screen offer
+        /// duplicate / remove. Not while painting — there a press is a dab.
+        @objc func held(_ gr: UILongPressGestureRecognizer) {
+            guard gr.state == .began, let view, parent.paintHead == nil, !parent.faceMode,
+                  dragging == nil, painting == nil,
+                  let obj = object(at: gr.location(in: view)) else { return }
+            parent.plate.towerSelected = false
+            parent.plate.selectedID = obj.id
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            parent.onLongPress(obj)
         }
 
         @objc func panned(_ gr: UIPanGestureRecognizer) {
@@ -1122,6 +1813,7 @@ struct ModelSceneView: UIViewRepresentable {
                 case .changed:
                     brush(at: gr.location(in: view))
                 case .ended, .cancelled, .failed:
+                    showOverlay(obj, originals: obj.strokeTouched)
                     painting = nil
                     view.allowsCameraControl = true
                     obj.endStroke()
@@ -1145,18 +1837,21 @@ struct ModelSceneView: UIViewRepresentable {
         /// is refreshed a few times a second while the stroke runs.
         private func brush(at point: CGPoint) {
             guard let view, let obj = painting, let head = parent.paintHead, let radius = parent.brushRadius else { return }
-            let hits = view.hitTest(point, options: [.searchMode: NSNumber(value: SCNHitTestSearchMode.all.rawValue),
+            // Only this object, nearest hit — not every triangle of the plate.
+            guard let objNode = nodes[obj.id] else { return }
+            let hits = view.hitTest(point, options: [.searchMode: NSNumber(value: SCNHitTestSearchMode.closest.rawValue),
+                                                     .rootNode: objNode,
                                                      .categoryBitMask: NSNumber(value: 1)])
-            guard let hit = hits.first(where: { $0.node.name == obj.id.uuidString }) else { return }
+            guard let hit = hits.first(where: { $0.node === objNode }) else { return }
             let w = hit.worldCoordinates
             let cam = view.pointOfView?.worldPosition ?? SCNVector3(0, 0, 0)
             let d = SIMD3<Float>(w.x - cam.x, w.y - cam.y, w.z - cam.z)
             let orig = Int(leafSources[obj.id]?[safe: hit.faceIndex] ?? Int32(hit.faceIndex))
-            obj.dab(atBed: SIMD3(w.x, -w.z, w.y), radius: radius, viewDir: SIMD3(d.x, -d.z, d.y), orig: orig, head: head)
+            // The node sits lower by the sink; the mesh maths does not.
+            obj.dab(atBed: SIMD3(w.x, -w.z, w.y + obj.sink), radius: radius, viewDir: SIMD3(d.x, -d.z, d.y), orig: orig, head: head, layer: parent.paintLayer)
             let now = CACurrentMediaTime()
-            if now - lastPaintRefresh > 0.07, let node = nodes[obj.id] {
-                node.geometry = geometry(for: obj)
-                Self.tint(node, selected: true)
+            if now - lastPaintRefresh > 0.04 {
+                showOverlay(obj, originals: obj.strokeTouched)
                 lastPaintRefresh = now
             }
         }
@@ -1182,6 +1877,7 @@ final class SlicerSession: ObservableObject {
         p.towerEnabled = printer.type == .snapmakerU1
         applyTowerPosition(p, printer: printer)
         p.add(mesh)
+        p.resetHistory()
         printerID = printer.id.uuidString
         projectID = nil
         projectName = ""
@@ -1189,13 +1885,28 @@ final class SlicerSession: ObservableObject {
     }
 
     /// Opens a saved plate, with everything on it.
+    /// The plate view opens right away with a "loading" badge; the models
+    /// (and their painting) are read in the background and appear when ready.
     @discardableResult
     func open(_ project: PlateProject, printer: PrinterConfig) -> Bool {
-        guard let p = PlateStore.load(project, bed: BedSize.for(printer)) else { return false }
+        let bed = BedSize.for(printer)
+        let p = PlateModel(bed: bed)
+        p.towerEnabled = project.towerEnabled
+        if let t = project.towerPos, t.count == 2 { p.towerPos = SIMD2(t[0], t[1]) }
+        p.layerBands = project.layerBands ?? []
+        p.pauseHeights = project.pauseHeights ?? []
+        p.loading = true
         plate = p
         printerID = printer.id.uuidString
         projectID = project.id
         projectName = project.name
+        Task.detached(priority: .userInitiated) {
+            let parsed = PlateStore.loadMeshes(project)
+            await MainActor.run {
+                p.adopt(PlateStore.placements(parsed, bed: bed))
+                p.loading = false
+            }
+        }
         return true
     }
 
@@ -1241,19 +1952,30 @@ struct ModelOrientView: View {
     @State private var paintMode = false
     @State private var paintHead = 1
     @State private var paintBrush = false
+    /// Which painting the brush works on; single-nozzle printers only have fuzzy skin.
+    @State private var chosenPaintLayer: PaintLayer = .color
+    /// What the brush works on. Without several heads there is no colour
+    /// painting at all — only fuzzy skin.
+    private var paintLayer: PaintLayer { printerType == .snapmakerU1 ? chosenPaintLayer : .fuzzy }
+    /// Fuzzy skin: erase instead of paint.
+    @State private var fuzzyErase = false
+    /// Long-pressed object: offer duplicate / remove.
+    @State private var pressed: ModelPlacement? = nil
     @State private var brushSize: Double = 6
     /// Fill tool: how far a facet may tilt against the tapped one and still be
     /// filled. Small keeps a face and the radius beside it apart.
     @AppStorage("paint_fill_angle") private var fillAngle: Double = 5
     @State private var confirmClear = false
     /// The tool whose panel is open above the icon row.
-    enum Tool: Hashable { case head, rotate, face, scale, paint, arrange, reset }
+    enum Tool: Hashable { case undo, head, rotate, face, sink, scale, paint, layers, pause, arrange, reset }
     @State private var activeTool: Tool? = nil
     @State private var showPicker = false
     @State private var loadError: String? = nil
     @State private var showSlice = false
     /// Saving the plate as a project.
     @ObservedObject private var session = SlicerSession.shared
+    @State private var showScan = false
+    @State private var showLibrary = false
     @State private var askName = false
     @State private var nameText = ""
     @State private var savedFlash = false
@@ -1270,6 +1992,9 @@ struct ModelOrientView: View {
     @AppStorage("scale_uniform") private var uniformScale = true
     /// How far one tap on a rotate arrow turns the object.
     @AppStorage("rotate_step") private var rotateStep: Double = 90
+    /// Arrange panel, as in Orca: turn objects to save room, and the gap.
+    @AppStorage("arrange_rotate") private var arrangeRotate = true
+    @AppStorage("arrange_gap") private var arrangeGap: Double = 6
     var printerConfig: PrinterConfig? = nil
 
     init(plate: PlateModel, printerType: PrinterConfig.PrinterType, accentHex: String = "3B82F6", printerConfig: PrinterConfig? = nil) {
@@ -1304,14 +2029,28 @@ struct ModelOrientView: View {
                 ZStack(alignment: .topLeading) {
                     ModelSceneView(plate: plate, accent: UIColor(Color(hex: accentHex) ?? .blue),
                                    headColors: printerType == .snapmakerU1 ? headUIColors : [], faceMode: faceMode,
-                                   paintHead: paintMode ? paintHead : nil, brushRadius: paintMode && paintBrush ? Float(brushSize) : nil,
-                                   fillAngle: Float(fillAngle)) { obj, normal in
+                                   paintHead: paintMode ? (paintLayer == .fuzzy ? (fuzzyErase ? 0 : 1) : paintHead) : nil,
+                                   brushRadius: paintMode && paintBrush ? Float(brushSize) : nil,
+                                   fillAngle: Float(fillAngle), paintLayer: paintMode ? paintLayer : .color,
+                                   onLongPress: { o in pressed = o }) { obj, normal in
                         haptic(.light)
                         plate.selectedID = obj.id
                         withAnimation { obj.layOnFace(normal: normal) }
                         faceMode = false
                     }
                     .background(Color.black.opacity(0.85))
+                    .confirmationDialog(pressed?.name ?? "", isPresented: Binding(get: { pressed != nil }, set: { if !$0 { pressed = nil } }),
+                                        titleVisibility: .visible) {
+                        if let o = pressed {
+                            Button(lz(en: "Duplicate", de: "Duplizieren", fr: "Dupliquer", es: "Duplicar", pt: "Duplicar", it: "Duplica", zh: "复制")) {
+                                haptic(.light); withAnimation { plate.duplicate(o.id) }
+                            }
+                            Button(lz(en: "Remove", de: "Entfernen", fr: "Supprimer", es: "Quitar", pt: "Remover", it: "Rimuovi", zh: "移除"), role: .destructive) {
+                                haptic(.light); plate.remove(o.id)
+                            }
+                        }
+                        Button(lz(en: "Cancel", de: "Abbrechen", fr: "Annuler", es: "Cancelar", pt: "Cancelar", it: "Annulla", zh: "取消"), role: .cancel) {}
+                    }
 
                     VStack(alignment: .leading, spacing: 4) {
                         if let s = sel {
@@ -1364,6 +2103,18 @@ struct ModelOrientView: View {
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
                     .padding(10)
 
+                    if activeTool == .pause {
+                        PauseSlider(plate: plate)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                            .padding(.trailing, 10).padding(.top, 70).padding(.bottom, 12)
+                    }
+                    if activeTool == .layers {
+                        // Heights on the right, like the layer slider of the preview.
+                        LayerBandSlider(plate: plate, color: { headColor($0 - 1) ?? Color.secondary })
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                            .padding(.trailing, 10).padding(.top, 70).padding(.bottom, 12)
+                    }
+
                     if plate.loading || showBuilding {
                         LoadingBadge(text: plate.loading
                                      ? lz(en: "Loading model…", de: "Modell wird geladen…", fr: "Chargement du modèle…", es: "Cargando modelo…", pt: "Carregando modelo…", it: "Carico il modello…", zh: "正在加载模型…")
@@ -1404,7 +2155,25 @@ struct ModelOrientView: View {
                         Image(systemName: "ellipsis.circle")
                     }
                     .disabled(plate.objects.isEmpty)
-                    Button { showPicker = true } label: { Image(systemName: "plus") }
+                    if ScanSupport.available || LibraryConfig.entryVisible {
+                        Menu {
+                            Button { showPicker = true } label: {
+                                Label(lz(en: "Open model (STL)", de: "Modell öffnen (STL)", fr: "Ouvrir un modèle (STL)", es: "Abrir modelo (STL)", pt: "Abrir modelo (STL)", it: "Apri modello (STL)", zh: "打开模型（STL）"), systemImage: "doc")
+                            }
+                            if LibraryConfig.entryVisible {
+                                Button { showLibrary = true } label: {
+                                    Label(lz(en: "Find models", de: "Modelle suchen", fr: "Trouver des modèles", es: "Buscar modelos", pt: "Procurar modelos", it: "Cerca modelli", zh: "查找模型"), systemImage: "magnifyingglass")
+                                }
+                            }
+                            if ScanSupport.available {
+                                Button { showScan = true } label: {
+                                    Label("Scan to Duplicate", systemImage: "camera.viewfinder")
+                                }
+                            }
+                        } label: { Image(systemName: "plus") }
+                    } else {
+                        Button { showPicker = true } label: { Image(systemName: "plus") }
+                    }
                     Button(lz(en: "Next", de: "Weiter", fr: "Suivant", es: "Siguiente", pt: "Avançar", it: "Avanti", zh: "继续")) { showSlice = true }
                         .disabled(plate.objects.isEmpty)
                 }
@@ -1437,6 +2206,24 @@ struct ModelOrientView: View {
                    isPresented: Binding(get: { loadError != nil }, set: { if !$0 { loadError = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: { Text(loadError ?? "") }
+            .fullScreenCover(isPresented: $showScan) {
+                ScanFlowView { mesh in plate.add(mesh) }
+            }
+            .fullScreenCover(isPresented: $showLibrary) {
+                LibraryView { url in
+                    plate.loading = true
+                    Task.detached(priority: .userInitiated) {
+                        let r = Result { try ModelLoader.load(url: url) }
+                        await MainActor.run {
+                            plate.loading = false
+                            switch r {
+                            case .success(let m): plate.add(m)
+                            case .failure(let e): loadError = e.localizedDescription
+                            }
+                        }
+                    }
+                }
+            }
             .plateNameAlert(lz(en: "Save plate", de: "Druckplatte speichern", fr: "Enregistrer le plateau", es: "Guardar la placa", pt: "Guardar a mesa", it: "Salva il piano", zh: "保存打印板"),
                             isPresented: $askName, text: $nameText) { name in
                 // "Save as" starts a project of its own.
@@ -1499,6 +2286,14 @@ struct ModelOrientView: View {
                             .background(Capsule().fill(active ? Color.accentColor.opacity(0.85) : Color.secondary.opacity(0.15)))
                             .foregroundColor(active ? .white : .primary)
                             .onTapGesture { plate.selectedID = o.id }
+                            .contextMenu {
+                                Button { withAnimation { plate.duplicate(o.id) } } label: {
+                                    Label(lz(en: "Duplicate", de: "Duplizieren", fr: "Dupliquer", es: "Duplicar", pt: "Duplicar", it: "Duplica", zh: "复制"), systemImage: "plus.square.on.square")
+                                }
+                                Button(role: .destructive) { plate.remove(o.id) } label: {
+                                    Label(lz(en: "Remove", de: "Entfernen", fr: "Supprimer", es: "Quitar", pt: "Remover", it: "Rimuovi", zh: "移除"), systemImage: "trash")
+                                }
+                            }
                         }
                     }
                 }
@@ -1517,47 +2312,71 @@ struct ModelOrientView: View {
     }
 
     private var tools: [Tool] {
-        printerType == .snapmakerU1 ? [.head, .rotate, .face, .scale, .paint, .arrange, .reset] : [.rotate, .face, .scale, .arrange, .reset]
+        printerType == .snapmakerU1 ? [.undo, .head, .rotate, .face, .sink, .scale, .paint, .layers, .pause, .arrange, .reset] : [.undo, .rotate, .face, .sink, .scale, .paint, .pause, .arrange, .reset]
     }
 
     /// One big icon per tool; a tap opens its panel (or acts at once).
+    /// With this many tools a row of equal shares got small on a phone, so
+    /// they keep a comfortable size and the row scrolls sideways like a
+    /// ribbon; where they all fit (iPad) they share the width as before.
     private var toolRow: some View {
-        HStack(spacing: 6) {
-            ForEach(tools, id: \.self) { tool in
-                let active = activeTool == tool || (tool == .face && faceMode) || (tool == .paint && paintMode)
-                Button { haptic(.light); tap(tool) } label: {
-                    VStack(spacing: 4) {
-                        ZStack {
-                            if tool == .head, let sel {
-                                Circle().fill(headColor(sel.extruder - 1) ?? Color.secondary.opacity(0.35))
-                                    .overlay(Circle().strokeBorder(Color.primary.opacity(0.35), lineWidth: 0.5))
-                                    .frame(width: 24, height: 24)
-                                Text("\(sel.extruder)").font(.system(size: 12, weight: .bold))
-                                    .foregroundColor((headColor(sel.extruder - 1).map { UIColor($0).isLight } ?? true) ? .black : .white)
-                            } else {
-                                Image(systemName: icon(for: tool)).font(.system(size: 22, weight: .medium))
-                            }
-                        }
-                        .frame(height: 26)
-                        Text(title(for: tool)).font(.system(size: 9, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.7)
-                    }
-                    .frame(maxWidth: .infinity).frame(height: 58)
-                    .background(RoundedRectangle(cornerRadius: 14).fill(active ? Color.accentColor.opacity(0.85) : Color.secondary.opacity(0.15)))
-                    .foregroundColor(active ? .white : .primary)
-                }
-                .buttonStyle(.plain)
-                .disabled(sel == nil && tool != .arrange)
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) { toolButtons(width: nil) }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) { toolButtons(width: 74) }
+                    .padding(.horizontal, 2)
             }
+            .scrollClipDisabled()
         }
+    }
+
+    @ViewBuilder private func toolButtons(width: CGFloat?) -> some View {
+        ForEach(tools, id: \.self) { tool in
+            let active = activeTool == tool || (tool == .face && faceMode) || (tool == .paint && paintMode)
+            Button { haptic(.light); tap(tool) } label: {
+                VStack(spacing: 5) {
+                    ZStack {
+                        if tool == .head, let sel {
+                            Circle().fill(headColor(sel.extruder - 1) ?? Color.secondary.opacity(0.35))
+                                .overlay(Circle().strokeBorder(Color.primary.opacity(0.35), lineWidth: 0.5))
+                                .frame(width: 28, height: 28)
+                            Text("\(sel.extruder)").font(.system(size: 14, weight: .bold))
+                                .foregroundColor((headColor(sel.extruder - 1).map { UIColor($0).isLight } ?? true) ? .black : .white)
+                        } else {
+                            Image(systemName: icon(for: tool)).font(.system(size: 26, weight: .medium))
+                        }
+                    }
+                    .frame(height: 30)
+                    Text(title(for: tool)).font(.system(size: 11, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.75)
+                }
+                .frame(minWidth: 74, maxWidth: width ?? .infinity)
+                .frame(width: width)
+                .frame(height: 66)
+                .background(RoundedRectangle(cornerRadius: 16).fill(active ? Color.accentColor.opacity(0.85) : Color.secondary.opacity(0.15)))
+                .foregroundColor(active ? .white : .primary)
+            }
+            .buttonStyle(.plain)
+            .disabled(tool == .undo ? !canUndo : (sel == nil && tool != .arrange))
+            .opacity(tool == .undo && !canUndo ? 0.4 : 1)
+        }
+    }
+
+    /// While painting the band's undo takes back strokes, otherwise plate steps.
+    private var canUndo: Bool {
+        paintMode ? (sel?.undoCount(paintLayer) ?? 0) > 0 : plate.undoSteps > 0
     }
 
     private func icon(for tool: Tool) -> String {
         switch tool {
+        case .undo: return "arrow.uturn.backward"
         case .head: return "circle.fill"
         case .rotate: return "rotate.3d"
+        case .sink: return "arrow.down.to.line"
         case .face: return "square.3.layers.3d.down.left"
         case .scale: return "arrow.up.left.and.arrow.down.right"
-        case .paint: return "paintbrush.pointed.fill"
+        case .paint: return printerType == .snapmakerU1 ? "paintbrush.pointed.fill" : "aqi.medium"
+        case .layers: return "slider.vertical.3"
+        case .pause: return "pause.circle"
         case .arrange: return "rectangle.3.group"
         case .reset: return "arrow.counterclockwise"
         }
@@ -1565,11 +2384,18 @@ struct ModelOrientView: View {
 
     private func title(for tool: Tool) -> String {
         switch tool {
+        case .undo: return lz(en: "Undo", de: "Rückgängig", fr: "Annuler", es: "Deshacer", pt: "Desfazer", it: "Annulla", zh: "撤销")
         case .head: return lz(en: "Head", de: "Kopf", fr: "Tête", es: "Cabezal", pt: "Cabeça", it: "Testa", zh: "喷头")
         case .rotate: return lz(en: "Rotate", de: "Drehen", fr: "Tourner", es: "Girar", pt: "Girar", it: "Ruota", zh: "旋转")
         case .face: return lz(en: "Lay flat", de: "Auflegen", fr: "À plat", es: "Apoyar", pt: "Apoiar", it: "Appoggia", zh: "放平")
+        case .sink: return lz(en: "Sink", de: "Absenken", fr: "Enfoncer", es: "Hundir", pt: "Afundar", it: "Abbassa", zh: "下沉")
         case .scale: return lz(en: "Scale", de: "Größe", fr: "Échelle", es: "Escala", pt: "Escala", it: "Scala", zh: "缩放")
-        case .paint: return lz(en: "Paint", de: "Bemalen", fr: "Peindre", es: "Pintar", pt: "Pintar", it: "Colora", zh: "上色")
+        // One head: the tool only paints fuzzy skin, and says so.
+        case .paint: return printerType == .snapmakerU1
+            ? lz(en: "Paint", de: "Bemalen", fr: "Peindre", es: "Pintar", pt: "Pintar", it: "Colora", zh: "上色")
+            : "Fuzzy Skin"
+        case .layers: return lz(en: "Layers", de: "Schichten", fr: "Couches", es: "Capas", pt: "Camadas", it: "Strati", zh: "分层")
+        case .pause: return lz(en: "Pause", de: "Pause", fr: "Pause", es: "Pausa", pt: "Pausa", it: "Pausa", zh: "暂停")
         case .arrange: return lz(en: "Arrange", de: "Anordnen", fr: "Ranger", es: "Ordenar", pt: "Organizar", it: "Disponi", zh: "排列")
         case .reset: return lz(en: "Reset", de: "Reset", fr: "Réinit.", es: "Restabl.", pt: "Repor", it: "Ripristina", zh: "重置")
         }
@@ -1578,18 +2404,82 @@ struct ModelOrientView: View {
     private func tap(_ tool: Tool) {
         sizeFocus = nil
         switch tool {
-        case .arrange:
-            withAnimation { plate.arrange() }
+        case .undo:
+            if paintMode { sel?.undoPaint(paintLayer) } else { withAnimation { plate.undo() } }
         case .reset:
             withAnimation { sel?.reset() }
-            sel?.clearPaint()
+            sel?.clearAllPaint()
         case .face:
             faceMode.toggle()
             if faceMode { paintMode = false; withAnimation { activeTool = nil } }
         default:
+            // Another tool ends "lay flat" — only one tool is active at a time.
+            faceMode = false
             withAnimation { activeTool = activeTool == tool ? nil : tool }
             paintMode = activeTool == .paint
-            if paintMode { faceMode = false; paintHead = sel?.extruder ?? 1 }
+            if paintMode {
+                faceMode = false; paintHead = sel?.extruder ?? 1
+            }
+        }
+    }
+
+    /// Orca's arrange options: may objects be turned to need less room, and
+    /// how far apart they stay. Arranging happens on the button.
+    @ViewBuilder private var arrangePanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(isOn: $arrangeRotate) {
+                Text(lz(en: "Rotate to save space", de: "Zum Platzsparen drehen", fr: "Tourner pour gagner de la place", es: "Girar para ahorrar espacio", pt: "Girar para poupar espaço", it: "Ruota per risparmiare spazio", zh: "旋转以节省空间"))
+                    .font(.caption.weight(.semibold))
+            }
+            HStack(spacing: 10) {
+                Text(lz(en: "Min. distance", de: "Mindestabstand", fr: "Distance min.", es: "Distancia mín.", pt: "Distância mín.", it: "Distanza min.", zh: "最小间距"))
+                    .font(.caption.weight(.semibold))
+                Slider(value: $arrangeGap, in: 0...30, step: 1)
+                Text(String(format: "%.0f mm", arrangeGap)).font(.caption.monospacedDigit()).frame(width: 46, alignment: .trailing)
+            }
+            Button {
+                haptic(.light)
+                withAnimation { plate.arrange(gap: Float(arrangeGap), minimizeFootprint: arrangeRotate) }
+            } label: {
+                Label(lz(en: "Arrange", de: "Anordnen", fr: "Ranger", es: "Ordenar", pt: "Organizar", it: "Disponi", zh: "排列"), systemImage: "rectangle.3.group")
+                    .fontWeight(.semibold).frame(maxWidth: .infinity).padding(.vertical, 4)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(plate.objects.isEmpty)
+        }
+    }
+
+    /// Lowering the object into the bed: what ends up below is cut off when
+    /// slicing, which gives it a flat face to stand on.
+    @ViewBuilder private var sinkPanel: some View {
+        if let o = sel {
+            let depth = Binding<Double>(get: { Double(o.sink) },
+                                        set: { o.sink = min(max(0, Float($0)), o.maxSink) })
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(lz(en: "Lower into the bed", de: "In die Platte absenken", fr: "Enfoncer dans le plateau", es: "Hundir en la placa", pt: "Afundar na mesa", it: "Abbassa nel piano", zh: "沉入打印板"))
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    Text(String(format: "%.1f mm", o.sink)).font(.caption.monospacedDigit())
+                }
+                HStack(spacing: 10) {
+                    // Plus raises the model, minus takes it deeper — the
+                    // symbols follow the height, not the depth value.
+                    Button { haptic(.light); depth.wrappedValue -= 0.1 } label: { Image(systemName: "plus.circle.fill").imageScale(.large) }
+                        .buttonStyle(.plain).disabled(o.sink <= 0)
+                    Slider(value: depth, in: 0...Double(max(o.maxSink, 0.1)), step: 0.1)
+                    Button { haptic(.light); depth.wrappedValue += 0.1 } label: { Image(systemName: "minus.circle.fill").imageScale(.large) }
+                        .buttonStyle(.plain).disabled(o.sink >= o.maxSink)
+                }
+                HStack {
+                    Text(lz(en: "Contact area", de: "Auflagefläche", fr: "Surface d'appui", es: "Superficie de apoyo", pt: "Área de apoio", it: "Superficie d'appoggio", zh: "接触面积")
+                         + ": " + (o.sink > 0.001 ? String(format: "%.0f mm²", o.contactArea()) : "–"))
+                    Spacer()
+                    Text(lz(en: "Print height", de: "Druckhöhe", fr: "Hauteur", es: "Altura", pt: "Altura", it: "Altezza", zh: "打印高度")
+                         + String(format: ": %.1f mm", o.placedSize.z - o.sink))
+                }
+                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -1609,6 +2499,14 @@ struct ModelOrientView: View {
                     .font(.caption2).foregroundStyle(.secondary)
                 headRow(selected: sel?.extruder ?? 1) { h in sel?.extruder = h }
             }
+        case .sink:
+            sinkPanel
+        case .arrange:
+            arrangePanel
+        case .layers:
+            layersPanel
+        case .pause:
+            pausePanel
         case .rotate:
             VStack(spacing: 8) {
                 HStack(spacing: 8) {
@@ -1664,22 +2562,6 @@ struct ModelOrientView: View {
                             .font(.caption.weight(.semibold))
                     }
                 }
-                Text(uniformScale
-                     ? lz(en: "Lock closed: all axes together. Tap the lock to change axes separately.",
-                          de: "Schloss zu: alle Achsen gemeinsam. Tippe das Schloss, um Achsen einzeln zu ändern.",
-                          fr: "Cadenas fermé : tous les axes ensemble. Touche le cadenas pour régler chaque axe séparément.",
-                          es: "Candado cerrado: todos los ejes juntos. Toca el candado para cambiar cada eje por separado.",
-                          pt: "Cadeado fechado: todos os eixos juntos. Toque no cadeado para alterar cada eixo separadamente.",
-                          it: "Lucchetto chiuso: tutti gli assi insieme. Tocca il lucchetto per modificare ogni asse separatamente.",
-                          zh: "已锁定：所有轴一起缩放。点击锁可单独调整各轴。")
-                     : lz(en: "Lock open: each axis on its own — the model gets distorted.",
-                          de: "Schloss offen: jede Achse für sich – das Modell wird verzerrt.",
-                          fr: "Cadenas ouvert : chaque axe séparément – le modèle est déformé.",
-                          es: "Candado abierto: cada eje por separado – el modelo se deforma.",
-                          pt: "Cadeado aberto: cada eixo separadamente – o modelo é distorcido.",
-                          it: "Lucchetto aperto: ogni asse per sé – il modello viene deformato.",
-                          zh: "已解锁：各轴单独缩放，模型会变形。"))
-                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             .onChange(of: sizeFocus) { old, new in
                 if let old { apply(old) }
@@ -1687,18 +2569,33 @@ struct ModelOrientView: View {
             }
         case .paint:
             VStack(alignment: .leading, spacing: 8) {
-                headRow(selected: paintHead) { h in paintHead = h }
+                if printerType == .snapmakerU1 {
+                    Picker("", selection: $chosenPaintLayer) {
+                        Text(lz(en: "Colour", de: "Farbe", fr: "Couleur", es: "Color", pt: "Cor", it: "Colore", zh: "颜色")).tag(PaintLayer.color)
+                        Text("Fuzzy Skin").tag(PaintLayer.fuzzy)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                if paintLayer == .fuzzy {
+                    Picker("", selection: $fuzzyErase) {
+                        Label(lz(en: "Paint", de: "Auftragen", fr: "Appliquer", es: "Aplicar", pt: "Aplicar", it: "Applica", zh: "涂抹"), systemImage: "paintbrush.pointed").tag(false)
+                        Label(lz(en: "Erase", de: "Entfernen", fr: "Effacer", es: "Borrar", pt: "Apagar", it: "Cancella", zh: "擦除"), systemImage: "eraser").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                } else {
+                    headRow(selected: paintHead) { h in paintHead = h }
+                }
                 HStack(spacing: 10) {
                     // Undo on the far left, Clear (with a confirmation) on the far
                     // right — they must not sit next to each other.
-                    Button { haptic(.light); sel?.undoPaint() } label: {
+                    Button { haptic(.light); sel?.undoPaint(paintLayer) } label: {
                         Image(systemName: "arrow.uturn.backward").imageScale(.large)
                             .frame(width: 36, height: 30)
                             .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.15)))
                     }
                     .buttonStyle(.plain)
-                    .disabled((sel?.undoCount ?? 0) == 0)
-                    .opacity((sel?.undoCount ?? 0) == 0 ? 0.35 : 1)
+                    .disabled((sel?.undoCount(paintLayer) ?? 0) == 0)
+                    .opacity((sel?.undoCount(paintLayer) ?? 0) == 0 ? 0.35 : 1)
                     .accessibilityLabel(lz(en: "Undo", de: "Rückgängig", fr: "Annuler", es: "Deshacer", pt: "Desfazer", it: "Annulla", zh: "撤销"))
                     Picker("", selection: $paintBrush) {
                         Text(lz(en: "Fill", de: "Füllen", fr: "Remplir", es: "Rellenar", pt: "Preencher", it: "Riempi", zh: "填充")).tag(false)
@@ -1722,31 +2619,17 @@ struct ModelOrientView: View {
                             .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.15)))
                     }
                     .buttonStyle(.plain)
-                    .disabled(!(sel?.hasPaint ?? false))
-                    .opacity((sel?.hasPaint ?? false) ? 1 : 0.35)
+                    .disabled(!(sel?.hasPaint(paintLayer) ?? false))
+                    .opacity((sel?.hasPaint(paintLayer) ?? false) ? 1 : 0.35)
                     .accessibilityLabel(lz(en: "Clear painting", de: "Bemalung leeren", fr: "Effacer la peinture", es: "Borrar pintura", pt: "Limpar pintura", it: "Cancella colorazione", zh: "清除上色"))
-                    .confirmationDialog(lz(en: "Remove all painting on this object?", de: "Gesamte Bemalung dieses Objekts entfernen?", fr: "Supprimer toute la peinture de cet objet ?", es: "¿Quitar toda la pintura de este objeto?", pt: "Remover toda a pintura deste objeto?", it: "Rimuovere tutta la colorazione di questo oggetto?", zh: "移除此对象的全部上色？"),
+                    .confirmationDialog(paintLayer == .fuzzy
+                                        ? lz(en: "Remove all painted fuzzy skin on this object?", de: "Gesamtes gemaltes Fuzzy Skin dieses Objekts entfernen?", fr: "Supprimer tout le fuzzy skin peint de cet objet ?", es: "¿Quitar todo el fuzzy skin pintado de este objeto?", pt: "Remover todo o fuzzy skin pintado deste objeto?", it: "Rimuovere tutto il fuzzy skin dipinto di questo oggetto?", zh: "移除此对象上所有绘制的绒毛表面？")
+                                        : lz(en: "Remove all painting on this object?", de: "Gesamte Bemalung dieses Objekts entfernen?", fr: "Supprimer toute la peinture de cet objet ?", es: "¿Quitar toda la pintura de este objeto?", pt: "Remover toda a pintura deste objeto?", it: "Rimuovere tutta la colorazione di questo oggetto?", zh: "移除此对象的全部上色？"),
                                         isPresented: $confirmClear, titleVisibility: .visible) {
-                        Button(lz(en: "Clear painting", de: "Bemalung leeren", fr: "Effacer", es: "Borrar", pt: "Limpar", it: "Cancella", zh: "清除"), role: .destructive) { sel?.clearPaint() }
+                        Button(lz(en: "Clear painting", de: "Bemalung leeren", fr: "Effacer", es: "Borrar", pt: "Limpar", it: "Cancella", zh: "清除"), role: .destructive) { sel?.clearPaint(paintLayer) }
                         Button(lz(en: "Cancel", de: "Abbrechen", fr: "Annuler", es: "Cancelar", pt: "Cancelar", it: "Annulla", zh: "取消"), role: .cancel) {}
                     }
                 }
-                Text(paintBrush
-                     ? lz(en: "Drag over the object: the brush paints head \(paintHead) and splits faces along its edge, like Orca.",
-                          de: "Über das Objekt streichen: der Pinsel malt Kopf \(paintHead) und teilt Flächen an seinem Rand, wie in Orca.",
-                          fr: "Glisse sur l'objet : le pinceau peint la tête \(paintHead) et divise les faces à son bord, comme Orca.",
-                          es: "Arrastra sobre el objeto: el pincel pinta el cabezal \(paintHead) y divide las caras en su borde, como Orca.",
-                          pt: "Arraste sobre o objeto: o pincel pinta a cabeça \(paintHead) e divide as faces na borda, como no Orca.",
-                          it: "Trascina sull'oggetto: il pennello colora la testa \(paintHead) e divide le facce al bordo, come Orca.",
-                          zh: "在对象上拖动：画笔涂上喷头 \(paintHead)，并像 Orca 一样沿边缘细分面。")
-                     : lz(en: "Tap a surface: it gets head \(paintHead). The slider is the edge angle — small keeps a face and the radius next to it apart, large takes more along. The object's own head erases.",
-                          de: "Tippe auf eine Fläche: sie bekommt Kopf \(paintHead). Der Regler ist der Kantenwinkel — klein trennt Fläche und Radius, groß nimmt mehr mit. Der eigene Kopf des Objekts radiert.",
-                          fr: "Touche une surface : elle passe à la tête \(paintHead). Le curseur est l'angle d'arête — petit sépare une face et le congé voisin, grand en prend davantage. La tête de l'objet efface.",
-                          es: "Toca una superficie: recibe el cabezal \(paintHead). El deslizador es el ángulo de arista — pequeño separa la cara del radio contiguo, grande abarca más. El cabezal propio borra.",
-                          pt: "Toque numa superfície: recebe a cabeça \(paintHead). O cursor é o ângulo de aresta — pequeno separa a face do raio ao lado, grande abrange mais. A cabeça do objeto apaga.",
-                          it: "Tocca una superficie: prende la testa \(paintHead). Il cursore è l'angolo di spigolo — piccolo separa la faccia dal raccordo accanto, grande ne prende di più. La testa dell'oggetto cancella.",
-                          zh: "点击一个面：分配给喷头 \(paintHead)。滑块是边缘角度——小则把平面和旁边的圆角分开，大则连带更多。对象自身的喷头用于擦除。"))
-                    .font(.caption2).foregroundStyle(.secondary)
             }
         default:
             EmptyView()
@@ -1815,6 +2698,98 @@ struct ModelOrientView: View {
         }
     }
 
+    /// Pauses: one row per height (finer with − / +, remove) and "+ Pause".
+    /// The heights can also be dragged on the slider on the right.
+    @ViewBuilder private var pausePanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(plate.pauseHeights.enumerated()), id: \.offset) { i, z in
+                HStack(spacing: 10) {
+                    Image(systemName: "pause.circle.fill").foregroundColor(.yellow)
+                    Text(lz(en: "Pause at", de: "Pause bei", fr: "Pause à", es: "Pausa a", pt: "Pausa a", it: "Pausa a", zh: "暂停于") + String(format: " %.1f mm", z))
+                        .font(.caption.monospacedDigit())
+                    Spacer()
+                    Button { nudgePause(i, -0.2) } label: { Image(systemName: "minus.circle.fill").imageScale(.large) }.buttonStyle(.plain)
+                    Button { nudgePause(i, 0.2) } label: { Image(systemName: "plus.circle.fill").imageScale(.large) }.buttonStyle(.plain)
+                    Button(role: .destructive) {
+                        haptic(.light)
+                        withAnimation { if plate.pauseHeights.indices.contains(i) { plate.pauseHeights.remove(at: i) } }
+                    } label: {
+                        Image(systemName: "trash").frame(width: 34, height: 28)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.15)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            Button {
+                haptic(.light)
+                withAnimation { plate.addPause() }
+            } label: {
+                Label(lz(en: "Add pause", de: "Pause hinzufügen", fr: "Ajouter une pause", es: "Añadir pausa", pt: "Adicionar pausa", it: "Aggiungi pausa", zh: "添加暂停"), systemImage: "plus")
+                    .fontWeight(.semibold).frame(maxWidth: .infinity).padding(.vertical, 4)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(plate.printHeight <= 0.6)
+        }
+    }
+
+    private func nudgePause(_ i: Int, _ d: Float) {
+        guard plate.pauseHeights.indices.contains(i) else { return }
+        haptic(.light)
+        let z = ((plate.pauseHeights[i] + d) * 10).rounded() / 10
+        plate.pauseHeights[i] = min(max(z, 0.2), max(0.2, plate.printHeight - 0.1))
+        plate.pauseHeights.sort()
+    }
+
+    /// Layer colours: one row per band (head, heights, remove) and "+ colour".
+    /// The heights are set with the slider on the right of the plate.
+    @ViewBuilder private var layersPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach($plate.layerBands) { $b in
+                HStack(spacing: 10) {
+                    Menu {
+                        ForEach(0..<4, id: \.self) { i in
+                            Button { b.head = i + 1 } label: {
+                                Label("\(i + 1)" + (headLabel(i).isEmpty ? "" : "  " + headLabel(i)),
+                                      systemImage: b.head == i + 1 ? "checkmark.circle.fill" : "circle")
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Circle().fill(headColor(b.head - 1) ?? Color.secondary)
+                                .overlay(Circle().strokeBorder(Color.primary.opacity(0.35), lineWidth: 0.5))
+                                .frame(width: 16, height: 16)
+                            Text("\(b.head)").font(.system(size: 13, weight: .bold))
+                            Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                    }
+                    .buttonStyle(.plain)
+                    Text(String(format: "%.1f – %.1f mm", b.from, min(b.to, plate.printHeight)))
+                        .font(.caption.monospacedDigit())
+                    Spacer()
+                    Button(role: .destructive) {
+                        haptic(.light)
+                        withAnimation { plate.layerBands.removeAll { $0.id == b.id } }
+                    } label: {
+                        Image(systemName: "trash").frame(width: 34, height: 28)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.15)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            Button {
+                haptic(.light)
+                withAnimation { plate.addBand(heads: [1, 2, 3, 4]) }
+            } label: {
+                Label(lz(en: "Add colour", de: "Farbe hinzufügen", fr: "Ajouter une couleur", es: "Añadir color", pt: "Adicionar cor", it: "Aggiungi colore", zh: "添加颜色"), systemImage: "plus")
+                    .fontWeight(.semibold).frame(maxWidth: .infinity).padding(.vertical, 4)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(plate.layerBands.count >= 4 || plate.printHeight <= 0.4)
+        }
+    }
+
     @ViewBuilder private func axisButtons(_ label: String, axis: SIMD3<Float>, color: Color) -> some View {
         HStack(spacing: 0) {
             Button { haptic(.light); withAnimation { sel?.rotate(axis: axis, degrees: -Float(rotateStep)) } } label: {
@@ -1849,6 +2824,15 @@ struct SlicerView: View {
     /// Saved plates, newest first.
     @State private var projects: [PlateProject] = []
     @State private var editing: PlateProject? = nil
+    /// Object scan (Beta): the cover, and a scan waiting for the plate view
+    /// to open once the cover is gone.
+    @State private var showScan = false
+    @State private var showScanHelp = false
+    /// Model library: the cover, and the file picked there, opened once the
+    /// cover is gone.
+    @State private var showLibrary = false
+    @State private var libraryPick: URL? = nil
+    @State private var scannedMesh: TriMesh? = nil
     /// "" = OrcaSlicer's settings in the app's language, "en" = in English.
     @AppStorage("orca_language") private var orcaLanguage: String = ""
 
@@ -1902,6 +2886,25 @@ struct SlicerView: View {
                         pt: "Toque para continuar de onde parou. Deslize para renomear ou excluir.",
                         it: "Tocca per riprendere da dove hai lasciato. Scorri per rinominare o eliminare.",
                         zh: "点击即可从上次的进度继续。滑动可重命名或删除。"))
+            }
+        }
+    }
+
+    /// A file from the model library onto the plate — read off the main
+    /// thread like any opened STL, then shown.
+    private func openLibraryModel(_ url: URL) {
+        guard let p = printer else { return }
+        loading = true
+        Task.detached(priority: .userInitiated) {
+            let r = Result { try ModelLoader.load(url: url) }
+            await MainActor.run {
+                loading = false
+                switch r {
+                case .success(let m):
+                    if let plate = session.plate { session.adopt(printer: p); plate.add(m) } else { session.start(mesh: m, printer: p) }
+                    showPlate = true
+                case .failure(let e): loadError = e.localizedDescription
+                }
             }
         }
     }
@@ -2004,6 +3007,34 @@ struct SlicerView: View {
                                   systemImage: "cube.transparent")
                         }
                         .disabled(printer == nil)
+                        if ScanSupport.available {
+                            // Two tap targets in one row: borderless, or the
+                            // whole row would start the scan.
+                            HStack {
+                                Button { showScan = true } label: {
+                                    Label("Scan to Duplicate", systemImage: "camera.viewfinder")
+                                }
+                                .buttonStyle(.borderless)
+                                .disabled(printer == nil)
+                                Spacer()
+                                Button { showScanHelp = true } label: {
+                                    Image(systemName: "questionmark.circle").foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel(lz(en: "About Scan to Duplicate", de: "Über Scan to Duplicate", fr: "À propos de Scan to Duplicate", es: "Acerca de Scan to Duplicate", pt: "Sobre o Scan to Duplicate", it: "Informazioni su Scan to Duplicate", zh: "关于 Scan to Duplicate"))
+                                .popover(isPresented: $showScanHelp) {
+                                    ScanHelpText()
+                                        .presentationCompactAdaptation(.popover)
+                                }
+                            }
+                        }
+                        if LibraryConfig.entryVisible {
+                            Button { showLibrary = true } label: {
+                                Label(lz(en: "Find models", de: "Modelle suchen", fr: "Trouver des modèles", es: "Buscar modelos", pt: "Procurar modelos", it: "Cerca modelli", zh: "查找模型"),
+                                      systemImage: "magnifyingglass")
+                            }
+                            .disabled(printer == nil)
+                        }
                     }
                     if session.plate != nil {
                         Button(role: .destructive) { confirmDiscard = true } label: {
@@ -2077,6 +3108,27 @@ struct SlicerView: View {
                 }
                 .environmentObject(settings)
             }
+            .fullScreenCover(isPresented: $showLibrary, onDismiss: {
+                guard let url = libraryPick else { return }
+                libraryPick = nil
+                openLibraryModel(url)
+            }) {
+                LibraryView { url in libraryPick = url }
+            }
+            .fullScreenCover(isPresented: $showScan, onDismiss: {
+                // Only one cover at a time: the plate opens once the scan is gone.
+                guard let m = scannedMesh, let p = printer else { return }
+                scannedMesh = nil
+                if let plate = session.plate {
+                    session.adopt(printer: p)
+                    plate.add(m)
+                } else {
+                    session.start(mesh: m, printer: p)
+                }
+                showPlate = true
+            }) {
+                ScanFlowView { mesh in scannedMesh = mesh }
+            }
             .fullScreenCover(isPresented: $showPlate, onDismiss: { projects = PlateStore.list() }) {
                 if let plate = session.plate, let p = printer {
                     ModelOrientView(plate: plate, printerType: p.type,
@@ -2115,3 +3167,166 @@ struct LoadingBadge: View {
     }
 }
 
+
+// MARK: Layer colour slider
+
+/// The plate's height from 0 to the top, with every colour band as a coloured
+/// stretch and two handles (bottom and top end). The whole slider is one big
+/// grip: a touch takes the nearest handle and drags it. Bands can not overlap,
+/// stay at least 0.2 mm thick and snap to 0.1 mm.
+struct LayerBandSlider: View {
+    @ObservedObject var plate: PlateModel
+    var color: (Int) -> Color
+    /// The handle being dragged: band and which end.
+    @State private var grabbed: (id: UUID, top: Bool)? = nil
+
+    var body: some View {
+        let top = max(plate.printHeight, 0.1)
+        VStack(spacing: 6) {
+            Text(String(format: "%.1f", top)).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            GeometryReader { geo in
+                let h = geo.size.height
+                ZStack(alignment: .top) {
+                    Capsule().fill(Color.white.opacity(0.18)).frame(width: 8)
+                    ForEach(plate.layerBands) { b in
+                        let y1 = y(min(b.to, top), top, h), y0 = y(b.from, top, h)
+                        RoundedRectangle(cornerRadius: 3).fill(color(b.head))
+                            .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(Color.white.opacity(0.5), lineWidth: 0.5))
+                            .frame(width: 12, height: max(2, y0 - y1))
+                            .offset(y: y1)
+                        knob(b, top: true, y: y1, maxZ: top)
+                        knob(b, top: false, y: y0, maxZ: top)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        if grabbed == nil { grabbed = nearest(to: g.startLocation.y, height: h, maxZ: top) }
+                        if let k = grabbed { move(k.id, top: k.top, toY: g.location.y, height: h, maxZ: top) }
+                    }
+                    .onEnded { _ in grabbed = nil })
+            }
+            Text("0").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+        }
+        .frame(width: 92)
+        .frame(maxHeight: 440)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private func y(_ z: Float, _ top: Float, _ h: CGFloat) -> CGFloat { h * CGFloat(1 - min(max(z, 0), top) / top) }
+
+    @ViewBuilder private func knob(_ b: LayerBand, top isTop: Bool, y: CGFloat, maxZ: Float) -> some View {
+        let active = grabbed?.id == b.id && grabbed?.top == isTop
+        HStack(spacing: 4) {
+            Text(String(format: "%.1f", isTop ? min(b.to, maxZ) : b.from)).font(.system(size: 9, weight: .semibold).monospacedDigit())
+                .padding(.horizontal, 3).padding(.vertical, 1)
+                .background(Capsule().fill(Color.black.opacity(0.55)))
+                .foregroundColor(.white)
+            Circle().fill(color(b.head))
+                .overlay(Circle().strokeBorder(Color.white, lineWidth: active ? 3 : 2))
+                .overlay(Image(systemName: isTop ? "chevron.up" : "chevron.down").font(.system(size: 7, weight: .bold)).foregroundColor(.white).shadow(radius: 1))
+                .frame(width: active ? 26 : 22, height: active ? 26 : 22)
+                .shadow(radius: 2)
+        }
+        .offset(x: -14, y: y - (active ? 13 : 11))
+        .allowsHitTesting(false)
+    }
+
+    /// The handle closest to where the finger went down (within 44 pt). Two
+    /// handles on the same spot: above it the upper band's bottom end is
+    /// meant, below it the lower band's top end.
+    private func nearest(to touch: CGFloat, height h: CGFloat, maxZ: Float) -> (id: UUID, top: Bool)? {
+        var best: (id: UUID, top: Bool, d: CGFloat)? = nil
+        for b in plate.layerBands {
+            for isTop in [true, false] {
+                let hy = y(isTop ? min(b.to, maxZ) : b.from, maxZ, h)
+                var d = abs(touch - hy)
+                // Shared spot: prefer the band on the side of the finger.
+                if (touch < hy && isTop) || (touch > hy && !isTop) { d += 3 }
+                if d <= 44, best == nil || d < best!.d { best = (b.id, isTop, d) }
+            }
+        }
+        return best.map { ($0.id, $0.top) }
+    }
+
+    /// Drags one end, kept between its neighbours and at least 0.2 mm thick.
+    private func move(_ id: UUID, top isTop: Bool, toY y: CGFloat, height: CGFloat, maxZ: Float) {
+        guard height > 0, let i = plate.layerBands.firstIndex(where: { $0.id == id }) else { return }
+        var z = Float(1 - min(max(y / height, 0), 1)) * maxZ
+        z = (z * 10).rounded() / 10
+        let sorted = plate.layerBands.sorted { $0.from < $1.from }
+        let k = sorted.firstIndex { $0.id == id } ?? 0
+        let below = k > 0 ? sorted[k - 1].to : 0
+        let above = k + 1 < sorted.count ? sorted[k + 1].from : maxZ
+        var b = plate.layerBands[i]
+        if isTop { b.to = min(max(z, b.from + 0.2), above) } else { b.from = max(min(z, min(b.to, maxZ) - 0.2), below) }
+        if b != plate.layerBands[i] { plate.layerBands[i] = b }
+    }
+}
+
+// MARK: Pause slider
+
+/// The plate's height with a knob per pause. The whole slider is the grip:
+/// a touch takes the nearest knob (within 44 pt) and drags it, 0.1 mm steps.
+struct PauseSlider: View {
+    @ObservedObject var plate: PlateModel
+    @State private var grabbed: Int? = nil
+
+    var body: some View {
+        let top = max(plate.printHeight, 0.1)
+        VStack(spacing: 6) {
+            Text(String(format: "%.1f", top)).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            GeometryReader { geo in
+                let h = geo.size.height
+                ZStack(alignment: .top) {
+                    Capsule().fill(Color.white.opacity(0.18)).frame(width: 8)
+                    ForEach(Array(plate.pauseHeights.enumerated()), id: \.offset) { i, z in
+                        let yy = y(z, top, h), active = grabbed == i
+                        HStack(spacing: 4) {
+                            Text(String(format: "%.1f", z)).font(.system(size: 9, weight: .semibold).monospacedDigit())
+                                .padding(.horizontal, 3).padding(.vertical, 1)
+                                .background(Capsule().fill(Color.black.opacity(0.55)))
+                                .foregroundColor(.white)
+                            Circle().fill(Color.yellow)
+                                .overlay(Circle().strokeBorder(Color.white, lineWidth: active ? 3 : 2))
+                                .overlay(Image(systemName: "pause.fill").font(.system(size: 8, weight: .bold)).foregroundColor(.black))
+                                .frame(width: active ? 26 : 22, height: active ? 26 : 22)
+                                .shadow(radius: 2)
+                        }
+                        .offset(x: -14, y: yy - (active ? 13 : 11))
+                        .allowsHitTesting(false)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        if grabbed == nil { grabbed = nearest(g.startLocation.y, h, top) }
+                        guard let i = grabbed, plate.pauseHeights.indices.contains(i), h > 0 else { return }
+                        var z = Float(1 - min(max(g.location.y / h, 0), 1)) * top
+                        z = min(max((z * 10).rounded() / 10, 0.2), max(0.2, top - 0.1))
+                        if plate.pauseHeights[i] != z { plate.pauseHeights[i] = z }
+                    }
+                    .onEnded { _ in grabbed = nil; plate.pauseHeights.sort() })
+            }
+            Text("0").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+        }
+        .frame(width: 92)
+        .frame(maxHeight: 440)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private func y(_ z: Float, _ top: Float, _ h: CGFloat) -> CGFloat { h * CGFloat(1 - min(max(z, 0), top) / top) }
+
+    private func nearest(_ touch: CGFloat, _ h: CGFloat, _ top: Float) -> Int? {
+        var best: (Int, CGFloat)? = nil
+        for (i, z) in plate.pauseHeights.enumerated() {
+            let d = abs(touch - y(z, top, h))
+            if d <= 44, best == nil || d < best!.1 { best = (i, d) }
+        }
+        return best?.0
+    }
+}

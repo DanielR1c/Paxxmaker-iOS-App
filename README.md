@@ -2,9 +2,21 @@ If you like the app and want to support its development
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/paxxmaker)
 
-## Version 2.4
 
-New: PaxxMaker Slicer (Beta)
+## Version 2.5
+
+• Thingiverse is now built into the app: browse models and send them straight to your print bed with one tap.
+
+• New slicing features:
+- Pause
+- Paintable Fuzzy Skin
+- Layer coloring
+
+---
+
+Version 2.4
+
+PaxxMaker Slicer (Beta)
 
 • Open the STL on your phone, place it on the build plate, scale it and paint faces for the individual heads. [PaxxMaker-Connect](https://github.com/DanielR1c/PaxxMaker-Connect) builds the bridge[...]
 
@@ -17,7 +29,7 @@ New: PaxxMaker Slicer (Beta)
 
   
   
-  What's new in version 2.3 (smart plug required for the first two)
+Version 2.3 (smart plug required for the first two)
   
 • Cost per print: power (measured at the smart plug) plus filament, priced via Spoolman or the slicer profile. New “Last Print Cost” tile with history.
 

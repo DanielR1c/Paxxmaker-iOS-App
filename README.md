@@ -1,6 +1,6 @@
 ## Version 2.6
 
-PaxxMaker Slicer
+[PaxxMaker-Connect](https://github.com/DanielR1c/PaxxMaker-Connect) 
 • Supports OrcaSlicer 2.5 and Snapmaker Orca 2.4.1.
 • New: colour mixing and colour gradients with preview.
 

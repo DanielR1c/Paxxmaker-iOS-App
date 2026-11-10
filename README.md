@@ -1,9 +1,25 @@
+## Version 2.6
+
+PaxxMaker Slicer
+• Supports OrcaSlicer 2.5 and Snapmaker Orca 2.4.1.
+• New: colour mixing and colour gradients with preview.
+
+Spoolman
+• Filter spools by material or fill level.
+• Sort by up to two criteria, e.g. by material in blocks (PLA, PETG …) and by fill level within each block.
+
+Live Activity
+• New, slimmer design
+
+iPhone Duo support
+Bug fixes
+
 If you like the app and want to support its development
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/paxxmaker)
+---
 
-
-## Version 2.5
+Version 2.5
 
 • Thingiverse is now built into the app: browse models and send them straight to your print bed with one tap.
 

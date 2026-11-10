@@ -1358,6 +1358,8 @@ struct EnergyCostTileView: View {
 
                     if isPrinting, let l = live, l.printing, Date().timeIntervalSince1970 - Double(l.at) < 180 {
                         // Running print: the cost so far, straight from the daemon.
+                        // Value block in the spare height, caption at the bottom.
+                        VStack(alignment: .leading, spacing: 10) {
                         Text(EnergyLog.money(EnergyLog.cents(l.cost) + EnergyLog.cents(liveFilamentCost ?? 0), l.currency))
                             .font(.system(size: 30, weight: .bold, design: .rounded))
                             .foregroundColor(.primary)
@@ -1374,9 +1376,12 @@ struct EnergyCostTileView: View {
                         }
                         .font(.system(size: 12, weight: .semibold)).foregroundColor(.secondary)
                         .lineLimit(1).minimumScaleFactor(0.7)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                         Text(lz(en: "Running print", de: "Laufender Druck", fr: "Impression en cours", es: "Impresión en curso", pt: "Impressão em andamento", it: "Stampa in corso", zh: "打印进行中"))
                             .font(.caption2).foregroundColor(.secondary).lineLimit(1)
                     } else if let r = last {
+                        VStack(alignment: .leading, spacing: 10) {
                         Text(EnergyLog.money(EnergyLog.cents(r.cost) + EnergyLog.cents(lastFilamentCost ?? 0), r.currency))
                             .font(.system(size: 30, weight: .bold, design: .rounded))
                             .foregroundColor(.primary)
@@ -1390,6 +1395,8 @@ struct EnergyCostTileView: View {
                         }
                         .font(.system(size: 12, weight: .semibold)).foregroundColor(.secondary)
                         .lineLimit(1).minimumScaleFactor(0.7)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                         Text(r.file.replacingOccurrences(of: ".gcode", with: ""))
                             .font(.caption2).foregroundColor(.secondary).lineLimit(1)
                     } else {
@@ -1397,10 +1404,9 @@ struct EnergyCostTileView: View {
                              ? lz(en: "No data yet", de: "Noch keine Daten", fr: "Pas encore de données", es: "Aún sin datos", pt: "Ainda sem dados", it: "Ancora nessun dato", zh: "暂无数据")
                              : "…")
                             .font(.system(size: 15, weight: .medium)).foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                             .padding(.vertical, 10)
                     }
-                    Spacer(minLength: 0)
                 }
                 .padding(14)
             }

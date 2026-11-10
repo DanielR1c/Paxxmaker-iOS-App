@@ -109,7 +109,7 @@ async function getReason(resp: Response): Promise<string | undefined> {
 
 // ─── Live Activity push ───────────────────────────────────────────────────────
 // contentState must match PaxxMakerWidgetAttributes.ContentState in the iOS app:
-//   { printState, progress, extruderTemp, bedTemp, timeElapsed }
+//   { printState, progress, progressFile?, extruderTemp, bedTemp, timeElapsed, filename? }
 async function sendLiveActivityPush(
   env: Env,
   token: string,
@@ -736,6 +736,9 @@ export default {
         extruderTemp: hotend,
         bedTemp:      bed,
         timeElapsed:  Math.floor(duration),
+        // The app shows the print's name from here (the activity may have been
+        // started in the background before the name was known).
+        filename:     filename || undefined,
       };
 
       const isEnd = event === "complete" || event === "error" || event === "cancelled";

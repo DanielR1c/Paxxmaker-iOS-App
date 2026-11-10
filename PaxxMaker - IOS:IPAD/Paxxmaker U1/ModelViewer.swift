@@ -197,6 +197,8 @@ final class ModelPlacement: ObservableObject, Identifiable {
     @Published var sink: Float = 0
     /// Which head prints this object (1-based, U1 only).
     @Published var extruder: Int = 1
+    /// Colour mixing with a second head (U1, Connect 1.5): nil = one head.
+    @Published var mix: ObjectMix? = nil
     /// The object's own process settings; nil = the general ones.
     @Published var settings: QuickSettings? = nil
     /// Colour painting (heads per face, with Orca-style subdivision); nil
@@ -736,7 +738,7 @@ final class PlateModel: ObservableObject {
     /// Everything a step can change, with the objects themselves kept alive
     /// so a removed one comes back with its mesh and painting.
     private struct PlateState {
-        struct Obj { let o: ModelPlacement; let rotation: SIMD4<Float>; let scale: SIMD3<Float>; let offset: SIMD2<Float>; let sink: Float; let extruder: Int }
+        struct Obj { let o: ModelPlacement; let rotation: SIMD4<Float>; let scale: SIMD3<Float>; let offset: SIMD2<Float>; let sink: Float; let extruder: Int; let mix: ObjectMix? }
         var objects: [Obj]
         var towerPos: SIMD2<Float>?
         var bands: [LayerBand]
@@ -744,7 +746,7 @@ final class PlateModel: ObservableObject {
         func same(as other: PlateState) -> Bool {
             guard objects.count == other.objects.count, towerPos == other.towerPos, bands == other.bands, pauses == other.pauses else { return false }
             for (a, b) in zip(objects, other.objects) {
-                if a.o !== b.o || a.rotation != b.rotation || a.scale != b.scale || a.offset != b.offset || a.sink != b.sink || a.extruder != b.extruder { return false }
+                if a.o !== b.o || a.rotation != b.rotation || a.scale != b.scale || a.offset != b.offset || a.sink != b.sink || a.extruder != b.extruder || a.mix != b.mix { return false }
             }
             return true
         }
@@ -757,7 +759,7 @@ final class PlateModel: ObservableObject {
     @Published private(set) var undoSteps = 0
 
     private func snapshot() -> PlateState {
-        PlateState(objects: objects.map { .init(o: $0, rotation: $0.rotation.vector, scale: $0.scale, offset: $0.offset, sink: $0.sink, extruder: $0.extruder) },
+        PlateState(objects: objects.map { .init(o: $0, rotation: $0.rotation.vector, scale: $0.scale, offset: $0.offset, sink: $0.sink, extruder: $0.extruder, mix: $0.mix) },
                    towerPos: towerPos, bands: layerBands, pauses: pauseHeights)
     }
 
@@ -793,6 +795,7 @@ final class PlateModel: ObservableObject {
             o.offset = s.offset
             o.sink = s.sink
             o.extruder = s.extruder
+            o.mix = s.mix
         }
         objects = prev.objects.map(\.o)
         towerPos = prev.towerPos
@@ -863,6 +866,7 @@ final class PlateModel: ObservableObject {
         p.scale = src.scale
         p.sink = src.sink
         p.extruder = src.extruder
+        p.mix = src.mix
         p.settings = src.settings
         p.restorePaint(src.paintSnapshot, layer: .color)
         p.restorePaint(src.fuzzySnapshot, layer: .fuzzy)
@@ -1024,7 +1028,23 @@ final class PlateModel: ObservableObject {
     /// follows from the purge volume per layer. Measured: 2 colours ≈ 6–13 mm
     /// (with a 5 mm brim around). Until a slice told the real depth (see
     /// `rememberTower`), an estimate by the number of heads is shown.
-    var towerSize: SIMD2<Float> { SIMD2(Self.towerWidth, Self.towerDepth(heads: usedHeads.count)) }
+    var towerSize: SIMD2<Float> {
+        // Colour mixing changes heads on every layer: the tower gets far
+        // deeper (measured ≈ 37 × 103 mm on the U1).
+        if objects.contains(where: { $0.mix != nil }) { return Self.mixTowerSize }
+        return SIMD2(Self.towerWidth, Self.towerDepth(heads: usedHeads.count))
+    }
+
+    static var mixTowerSize: SIMD2<Float> {
+        let w = UserDefaults.standard.double(forKey: "prime_tower_width_mix")
+        let d = UserDefaults.standard.double(forKey: "prime_tower_depth_mix")
+        return SIMD2(w > 5 ? Float(w) : 37, d > 5 ? Float(d) : 103)
+    }
+    /// The tower a slice with colour mixing really printed.
+    static func rememberMixTower(width: Float, depth: Float) {
+        if width > 5 { UserDefaults.standard.set(Double(width), forKey: "prime_tower_width_mix") }
+        if depth > 5 { UserDefaults.standard.set(Double(depth), forKey: "prime_tower_depth_mix") }
+    }
 
     static var towerWidth: Float {
         let v = UserDefaults.standard.double(forKey: "prime_tower_width")
@@ -1050,7 +1070,10 @@ final class PlateModel: ObservableObject {
 
     var usedHeads: Set<Int> {
         var s = Set<Int>()
-        for o in objects { s.insert(o.extruder); s.formUnion(o.paintedHeads) }
+        for o in objects {
+            s.insert(o.extruder); s.formUnion(o.paintedHeads)
+            if let m = o.mix { s.insert(m.head) }
+        }
         s.formUnion(activeBands.map(\.head))
         return s
     }
@@ -1401,7 +1424,7 @@ struct ModelSceneView: UIViewRepresentable {
                 // Selecting only tints the material — no rebuild for that.
                 Self.tint(node, selected: selected)
                 applyBands(node)
-                let key = "\(o.rotation.vector)|\(o.scale)|\(o.fitsBed)|\(o.extruder)|\(o.paintVersion)|\(parent.headColors.count)|\(o.sink)|\(parent.paintLayer)"
+                let key = "\(o.rotation.vector)|\(o.scale)|\(o.fitsBed)|\(o.extruder)|\(o.mix.map { "\($0.head),\($0.share),\($0.shareTop),\($0.gradient)" } ?? "")|\(o.paintVersion)|\(parent.headColors.count)|\(o.sink)|\(parent.paintLayer)"
                 guard keys[o.id] != key else { continue }
                 keys[o.id] = key
                 buildAsync(o)
@@ -1470,6 +1493,8 @@ struct ModelSceneView: UIViewRepresentable {
             /// The painting, frozen (no copy) — walked in the background.
             var painting: PaintSelector.Frozen?
             var base: SIMD4<Float>
+            /// Colour mixing as a gradient: `base` at the bottom, this at the top.
+            var baseTop: SIMD4<Float>? = nil
             var headCols: [SIMD4<Float>]
             var fits: Bool
             /// Lowered into the bed by this much: the part below is not drawn.
@@ -1561,8 +1586,17 @@ struct ModelSceneView: UIViewRepresentable {
             // Collecting 1.5 million pieces here used to stall the main
             // thread; the frozen painting is handed over as it is.
             let painting = (fuzzyView ? o.fuzzySelector : o.selector)?.frozen
+            var base = Self.shade(SIMD4(Float(ar), Float(ag), Float(ab), 1))
+            var baseTop: SIMD4<Float>? = nil
+            // Colour mixing: drawn in the colour the blend gives, roughly —
+            // bottom to top for a gradient.
+            if let m = o.mix, m.head != o.extruder, (1...4).contains(m.head) {
+                let a = base, b = headCols[m.head - 1]
+                base = ObjectMix.blend(a, b, share: m.share)
+                if m.gradient { baseTop = ObjectMix.blend(a, b, share: m.shareTop) }
+            }
             return GeometryJob(matrix: o.matrix(offset: .zero), raw: o.mesh.vertices, painting: painting,
-                               base: Self.shade(SIMD4(Float(ar), Float(ag), Float(ab), 1)), headCols: headCols,
+                               base: base, baseTop: baseTop, headCols: headCols,
                                fits: o.fitsBed, sink: o.sink, fuzzyView: fuzzyView)
         }
 
@@ -1580,16 +1614,33 @@ struct ModelSceneView: UIViewRepresentable {
             let outside = SIMD4<Float>(0.95, 0.6, 0.1, 1)
             let marked = SIMD4<Float>(1, 1, 1, 0.99)
             let floor = j.sink
+            // A gradient blend runs over the printed height of the object.
+            var zLo: Float = 0, zHi: Float = 1
+            if j.baseTop != nil, !j.raw.isEmpty {
+                zLo = .greatestFiniteMagnitude; zHi = -.greatestFiniteMagnitude
+                for v in j.raw { let z = place(v).z; zLo = min(zLo, z); zHi = max(zHi, z) }
+                zLo = max(zLo, floor)
+                if zHi - zLo < 0.01 { zHi = zLo + 0.01 }
+            }
+            @inline(__always) func baseAt(_ z: Float) -> SIMD4<Float> {
+                guard let top = j.baseTop else { return j.base }
+                let t = max(0, min(1, (z - zLo) / (zHi - zLo)))
+                return j.base + (top - j.base) * t
+            }
             @inline(__always) func put(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ c: SIMD3<Float>, painted: SIMD4<Float>?) {
                 var nn = simd_cross(b - a, c - a)
                 let len = simd_length(nn); if len > 0 { nn /= len }
                 let overhang = nn.z < overhangLimit && !(a.z < floor + 0.05 && b.z < floor + 0.05 && c.z < floor + 0.05)
                 // Alpha 0.99 marks colours of their own (painting, overhang,
                 // outside): the layer-colour shader leaves those alone.
-                let colour = !j.fits ? outside * marked : (painted.map { $0 * marked } ?? (overhang ? red * marked : j.base))
+                let own: SIMD4<Float>? = !j.fits ? outside * marked : (painted.map { $0 * marked } ?? (overhang ? red * marked : nil))
                 pos.append(toScene(a)); pos.append(toScene(b)); pos.append(toScene(c))
                 let sn = toScene(nn); nor.append(sn); nor.append(sn); nor.append(sn)
-                col.append(colour); col.append(colour); col.append(colour)
+                if let own {
+                    col.append(own); col.append(own); col.append(own)
+                } else {
+                    col.append(baseAt(a.z)); col.append(baseAt(b.z)); col.append(baseAt(c.z))
+                }
             }
             /// Only what stands above the bed is drawn; a triangle crossing it
             /// is cut there. Returns how many pieces were drawn.
@@ -2005,6 +2056,28 @@ struct ModelOrientView: View {
     }
 
     private var sel: ModelPlacement? { plate.selected }
+    /// iPhone Duo open across, iPad in landscape: the tools as a column at the
+    /// left edge — the bed keeps its height and every tool is in reach
+    /// without scrolling.
+    @ObservedObject private var duo = DuoState.shared
+    private var sideTools: Bool {
+        (duo.isOpen || UIDevice.current.userInterfaceIdiom == .pad) && duo.isLandscape
+    }
+    /// iPhone Duo: the middle of the 3D view (global x) — the title is
+    /// centred over it rather than squeezed next to "Close".
+    @State private var sceneMidX: CGFloat? = nil
+    private var toolColumn: some View {
+        // Two columns: all eleven tools fit the 669 pt height without scrolling.
+        ScrollView(.vertical, showsIndicators: false) {
+            LazyVGrid(columns: [GridItem(.fixed(74), spacing: 8), GridItem(.fixed(74), spacing: 8)], spacing: 8) {
+                toolButtons(width: 74)
+            }
+            .padding(.vertical, 10)
+        }
+        .frame(width: 176)
+        .background(.ultraThinMaterial)
+        .transition(.move(edge: .leading).combined(with: .opacity))
+    }
     /// The printer's live channel info (U1): colour and material per head.
     private var service: PrinterService? { printerServices.services.first { $0.name == printerConfig?.name } }
     // Both sources survive the printer being offline: the channel info is
@@ -2025,6 +2098,8 @@ struct ModelOrientView: View {
     }
     var body: some View {
         NavigationStack {
+            HStack(spacing: 0) {
+            if sideTools { toolColumn }
             VStack(spacing: 0) {
                 ZStack(alignment: .topLeading) {
                     ModelSceneView(plate: plate, accent: UIColor(Color(hex: accentHex) ?? .blue),
@@ -2039,6 +2114,9 @@ struct ModelOrientView: View {
                         faceMode = false
                     }
                     .background(Color.black.opacity(0.85))
+                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).midX.rounded() } action: { v in
+                        if duo.isFoldable { sceneMidX = v }
+                    }
                     .confirmationDialog(pressed?.name ?? "", isPresented: Binding(get: { pressed != nil }, set: { if !$0 { pressed = nil } }),
                                         titleVisibility: .visible) {
                         if let o = pressed {
@@ -2123,11 +2201,29 @@ struct ModelOrientView: View {
                     }
                 }
 
-                controls
+                // Side tools: the bar below only when it has something (several
+                // objects, an open tool panel).
+                if !sideTools || activeTool != nil || plate.objects.count > 1 {
+                    controls
+                        // iPhone Duo: below the side column's buttons its
+                        // strip is empty — the panel and the tool row run on
+                        // into it instead of stopping short of it.
+                        .ignoresSafeArea(.container, edges: duo.isFoldable ? DuoCoverInsets.coverSide : [])
+                }
             }
+            }
+            .animation(.easeInOut(duration: 0.25), value: sideTools)
             .navigationTitle(lz(en: "Plate", de: "Druckplatte", fr: "Plateau", es: "Placa", pt: "Mesa", it: "Piano", zh: "打印板"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                if duo.isFoldable {
+                    ToolbarItem(placement: .principal) {
+                        CentredBarTitle(targetMidX: sceneMidX) {
+                            Text(lz(en: "Plate", de: "Druckplatte", fr: "Plateau", es: "Placa", pt: "Mesa", it: "Piano", zh: "打印板"))
+                                .font(.headline)
+                        }
+                    }
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button(lz(en: "Close", de: "Schließen", fr: "Fermer", es: "Cerrar", pt: "Fechar", it: "Chiudi", zh: "关闭")) { dismiss() }
                 }
@@ -2304,7 +2400,7 @@ struct ModelOrientView: View {
                     .background(RoundedRectangle(cornerRadius: 14).fill(Color.secondary.opacity(0.12)))
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            toolRow
+            if !sideTools { toolRow }
         }
         .padding(12)
         .background(.ultraThinMaterial)
@@ -2337,7 +2433,10 @@ struct ModelOrientView: View {
                 VStack(spacing: 5) {
                     ZStack {
                         if tool == .head, let sel {
-                            Circle().fill(headColor(sel.extruder - 1) ?? Color.secondary.opacity(0.35))
+                            Circle().fill(sel.mix.map { m in
+                                    AnyShapeStyle(LinearGradient(colors: [headColor(sel.extruder - 1) ?? .gray, headColor(m.head - 1) ?? .gray],
+                                                                 startPoint: .leading, endPoint: .trailing))
+                                } ?? AnyShapeStyle(headColor(sel.extruder - 1) ?? Color.secondary.opacity(0.35)))
                                 .overlay(Circle().strokeBorder(Color.primary.opacity(0.35), lineWidth: 0.5))
                                 .frame(width: 28, height: 28)
                             Text("\(sel.extruder)").font(.system(size: 14, weight: .bold))
@@ -2497,7 +2596,12 @@ struct ModelOrientView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(lz(en: "Head that prints this object", de: "Kopf, der dieses Objekt druckt", fr: "Tête qui imprime cet objet", es: "Cabezal que imprime este objeto", pt: "Cabeça que imprime este objeto", it: "Testa che stampa questo oggetto", zh: "打印此对象的喷头"))
                     .font(.caption2).foregroundStyle(.secondary)
-                headRow(selected: sel?.extruder ?? 1) { h in sel?.extruder = h }
+                headRow(selected: sel?.extruder ?? 1) { h in
+                    sel?.extruder = h
+                    // Mixing a head with itself is no mix.
+                    if sel?.mix?.head == h { sel?.mix?.head = (1...4).first { $0 != h } ?? 1 }
+                }
+                if let o = sel { mixControls(o) }
             }
         case .sink:
             sinkPanel
@@ -2695,6 +2799,84 @@ struct ModelOrientView: View {
                     .foregroundColor(active ? .white : .primary)
                 }.buttonStyle(.plain)
             }
+        }
+    }
+
+    // MARK: colour mixing (U1, OrcaSlicer 2.5 via PaxxMaker-Connect 1.5)
+
+    private func headName(_ h: Int) -> String {
+        lz(en: "Head \(h)", de: "Kopf \(h)", fr: "Tête \(h)", es: "Cabezal \(h)", pt: "Cabeça \(h)", it: "Testa \(h)", zh: "喷头 \(h)")
+    }
+
+    /// The object's own head plus a second one, with the share and the look.
+    @ViewBuilder private func mixControls(_ o: ModelPlacement) -> some View {
+        Toggle(isOn: Binding(get: { o.mix != nil }, set: { on in
+            haptic(.light)
+            o.mix = on ? ObjectMix(head: (1...4).first { $0 != o.extruder } ?? 2) : nil
+        })) {
+            Label(lz(en: "Mix with a second head", de: "Mit zweitem Kopf mischen", fr: "Mélanger avec une 2e tête", es: "Mezclar con un 2.º cabezal", pt: "Misturar com 2.ª cabeça", it: "Mescola con una 2ª testa", zh: "与第二个喷头混色"),
+                  systemImage: "drop.halffull")
+                .font(.caption.weight(.semibold))
+        }
+        .tint(.accentColor)
+        if let m = o.mix {
+            headRow(selected: m.head) { h in if h != o.extruder { o.mix?.head = h } }
+            Picker("", selection: Binding(get: { m.gradient }, set: { o.mix?.gradient = $0 })) {
+                Text(lz(en: "Even", de: "Gleichmäßig", fr: "Uniforme", es: "Uniforme", pt: "Uniforme", it: "Uniforme", zh: "均匀")).tag(false)
+                Text(lz(en: "Gradient ↑", de: "Verlauf ↑", fr: "Dégradé ↑", es: "Degradado ↑", pt: "Gradiente ↑", it: "Sfumatura ↑", zh: "渐变 ↑")).tag(true)
+            }
+            .pickerStyle(.segmented)
+            shareRow(m.gradient ? lz(en: "Bottom", de: "Unten", fr: "Bas", es: "Abajo", pt: "Base", it: "Basso", zh: "底部") : nil,
+                     own: o.extruder, other: m.head, value: Binding(get: { m.share }, set: { o.mix?.share = $0 }))
+            if m.gradient {
+                shareRow(lz(en: "Top", de: "Oben", fr: "Haut", es: "Arriba", pt: "Topo", it: "Alto", zh: "顶部"),
+                         own: o.extruder, other: m.head, value: Binding(get: { m.shareTop }, set: { o.mix?.shareTop = $0 }))
+            }
+            // OrcaSlicer only grades the blend within sub-layers — with whole
+            // layers taking turns a gradient comes out 50/50. So a gradient
+            // always uses them.
+            Toggle(lz(en: "Fine sub-layers", de: "Feine Teilschichten", fr: "Sous-couches fines", es: "Subcapas finas", pt: "Subcamadas finas", it: "Sotto-strati fini", zh: "细分子层"),
+                   isOn: Binding(get: { m.sublayer || m.gradient }, set: { o.mix?.sublayer = $0 }))
+                .font(.caption).tint(.accentColor)
+                .disabled(m.gradient)
+            if m.gradient {
+                Text(lz(en: "A gradient needs fine sub-layers — each layer is split between both heads.",
+                        de: "Ein Verlauf braucht feine Teilschichten — jede Schicht wird auf beide Köpfe aufgeteilt.",
+                        fr: "Un dégradé nécessite des sous-couches fines — chaque couche est partagée entre les deux têtes.",
+                        es: "Un degradado necesita subcapas finas: cada capa se reparte entre ambos cabezales.",
+                        pt: "Um gradiente precisa de subcamadas finas — cada camada é dividida entre as duas cabeças.",
+                        it: "Una sfumatura richiede sotto-strati fini — ogni strato è diviso tra le due teste.",
+                        zh: "渐变需要细分子层——每层由两个喷头分担。"))
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            let ma = headLabel(o.extruder - 1).uppercased(), mb = headLabel(m.head - 1).uppercased()
+            if !ma.isEmpty, !mb.isEmpty, ma.trimmingCharacters(in: CharacterSet(charactersIn: "+ ")) != mb.trimmingCharacters(in: CharacterSet(charactersIn: "+ ")) {
+                Label(lz(en: "Both heads need the same material (\(ma) / \(mb)).", de: "Beide Köpfe brauchen dasselbe Material (\(ma) / \(mb)).", fr: "Les deux têtes doivent avoir le même matériau (\(ma) / \(mb)).", es: "Ambos cabezales necesitan el mismo material (\(ma) / \(mb)).", pt: "As duas cabeças precisam do mesmo material (\(ma) / \(mb)).", it: "Entrambe le teste richiedono lo stesso materiale (\(ma) / \(mb)).", zh: "两个喷头需要相同材料（\(ma) / \(mb)）。"),
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundColor(.orange)
+            }
+        }
+    }
+
+    /// Share of the own head: its colour, the blend, the other colour.
+    private func shareRow(_ title: String?, own: Int, other: Int, value: Binding<Double>) -> some View {
+        let a = UIColor(headColor(own - 1) ?? .gray), b = UIColor(headColor(other - 1) ?? .gray)
+        return HStack(spacing: 8) {
+            if let title { Text(title).font(.caption).frame(width: 44, alignment: .leading) }
+            Circle().fill(Color(a)).frame(width: 14, height: 14)
+                .overlay(Circle().strokeBorder(Color.primary.opacity(0.3), lineWidth: 0.5))
+            // The thumb pulls towards a colour: near the left dot = mostly
+            // that head. `value` stays the left head's share (what is sliced),
+            // only the slider runs the other way.
+            Slider(value: Binding(get: { 100 - value.wrappedValue }, set: { value.wrappedValue = 100 - $0 }),
+                   in: 10...90, step: 5)
+            Circle().fill(Color(b)).frame(width: 14, height: 14)
+                .overlay(Circle().strokeBorder(Color.primary.opacity(0.3), lineWidth: 0.5))
+            RoundedRectangle(cornerRadius: 5).fill(Color(ObjectMix.blend(a, b, share: value.wrappedValue)))
+                .frame(width: 30, height: 22)
+                .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.primary.opacity(0.3), lineWidth: 0.5))
+            Text("\(Int(value.wrappedValue))/\(100 - Int(value.wrappedValue))")
+                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary).frame(width: 40, alignment: .trailing)
         }
     }
 
@@ -3064,6 +3246,7 @@ struct SlicerView: View {
                     }
                 }
             }
+            .iPadReadableColumn()
             .navigationTitle(lz(en: "PaxxMaker Slicer", de: "PaxxMaker-Slicer", fr: "PaxxMaker Slicer", es: "PaxxMaker Slicer", pt: "PaxxMaker Slicer", it: "PaxxMaker Slicer", zh: "PaxxMaker 切片"))
             .fileImporter(isPresented: $showPicker, allowedContentTypes: [.item]) { result in
                 switch result {

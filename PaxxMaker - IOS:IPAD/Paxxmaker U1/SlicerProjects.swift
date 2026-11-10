@@ -26,6 +26,8 @@ nonisolated struct PlateProject: Codable, Identifiable {
         var paint: [String: PaintSelector.Snap]?
         /// Painted fuzzy skin, the same way; missing in older plates.
         var fuzzy: [String: PaintSelector.Snap]? = nil
+        /// Colour mixing with a second head; missing in older plates.
+        var mix: ObjectMix? = nil
     }
     var id: String
     var name: String
@@ -115,7 +117,7 @@ enum PlateStore {
                                  rotation: [r.x, r.y, r.z, r.w],
                                  scale: [o.scale.x, o.scale.y, o.scale.z],
                                  offset: [o.offset.x, o.offset.y],
-                                 extruder: o.extruder, settings: o.settings, sink: o.sink > 0 ? o.sink : nil, paint: paint, fuzzy: fuzzy))
+                                 extruder: o.extruder, settings: o.settings, sink: o.sink > 0 ? o.sink : nil, paint: paint, fuzzy: fuzzy, mix: o.mix))
         }
         let project = PlateProject(id: pid, name: name, printerID: printerID, modified: Date(),
                                    towerEnabled: plate.towerEnabled,
@@ -155,6 +157,7 @@ enum PlateStore {
             if o.scale.count == 3 { placed.scale = SIMD3(o.scale[0], o.scale[1], o.scale[2]) }
             if o.offset.count == 2 { placed.offset = SIMD2(o.offset[0], o.offset[1]) }
             placed.extruder = o.extruder
+            placed.mix = o.mix
             placed.settings = o.settings
             placed.sink = o.sink ?? 0
             if let paint = o.paint, !paint.isEmpty {
@@ -244,7 +247,7 @@ extension View {
 
 enum ConnectUpdate {
     /// The newest PaxxMaker-Connect this app knows about.
-    static let current = "1.4"
+    static let current = "1.5"
     static let releasesURL = "https://github.com/DanielR1c/PaxxMaker-Connect/releases/latest"
 
     struct Release { let version: String; let url: String }

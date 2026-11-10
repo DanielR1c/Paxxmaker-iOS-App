@@ -52,6 +52,11 @@ struct SlicerProfiles: Decodable {
         var bed_z: Double?
         var extruders: Int?
         var printer_model: String?
+        /// Filaments (Connect 1.5): what the preset is, through its chain.
+        var filament_id: String?
+        var filament_vendor: String?
+        var filament_type: String?
+        var filament_colour: String?
         var id: String { name }
     }
     var machine: [Preset]
@@ -75,7 +80,7 @@ struct SliceJob: Decodable {
         var out = text(orca) ?? unknownText
         // Only when this side has nothing to say about the code: then the
         // detail from the computer (log excerpt) is all there is.
-        if text(orca) == nil, !detail.isEmpty { out += "\n" + detail }
+        if (text(orca) == nil || orca == -51 || orca == -69), !detail.isEmpty { out = orca == -51 ? detail : out + "\n" + detail }
         out += "\n(OrcaSlicer \(code))"
         return out
     }
@@ -280,6 +285,14 @@ struct SliceJob: Decodable {
                       pt: "Só é possível um filamento TPU por impressão.",
                       it: "È possibile un solo filamento TPU per stampa.",
                       zh: "每次打印只能使用一种 TPU 耗材。")
+        case -69:
+            return lz(en: "Colour mixing refused: both mixed heads need the same material.",
+                      de: "Farbmischung abgelehnt: Beide gemischten Köpfe brauchen dasselbe Material.",
+                      fr: "Mélange refusé : les deux têtes mélangées doivent avoir le même matériau.",
+                      es: "Mezcla rechazada: ambos cabezales mezclados necesitan el mismo material.",
+                      pt: "Mistura recusada: as duas cabeças misturadas precisam do mesmo material.",
+                      it: "Miscelazione rifiutata: le due teste miscelate richiedono lo stesso materiale.",
+                      zh: "混色被拒绝：两个混合的喷头需要相同材料。")
         case -68:
             return lz(en: "One of the filaments does not suit the head it is meant for.",
                       de: "Eines der Filamente passt nicht zu dem Kopf, für den es gedacht ist.",
@@ -320,6 +333,12 @@ struct SliceJob: Decodable {
         var gcode: String?
         var size: Int?
         var support: [String: String]?
+        /// OrcaSlicer 2.5's plate statistics (Connect 1.5).
+        var stats: SliceStats?
+        /// Objects Orca could not repair (only when a repair was asked for).
+        var repair_failed: Int?
+        /// The program that sliced, e.g. "Snapmaker Orca 2.4.1" (Connect 1.5).
+        var slicer: String?
     }
     var id: String
     var state: String
@@ -437,7 +456,12 @@ struct ConnectClient {
 
     struct Info: Decodable { var name: String; var version: String; var host: String; var orca: Bool; var apps: [String]
         /// What this Connect can do beyond the basics (e.g. "ranges"); older ones send none.
-        var features: [String]? = nil }
+        var features: [String]? = nil
+        /// Connect 1.5: profile sources by name, the slicer each one uses, and
+        /// what each can do (statistics, repair and mixing need OrcaSlicer 2.5).
+        var app_names: [String: String]? = nil
+        var slicers: [String: String]? = nil
+        var features_by_app: [String: [String]]? = nil }
     func info() async throws -> Info { try await run(try request("/v1/info", timeout: 6), as: Info.self) }
 
     func profiles(app: String) async throws -> SlicerProfiles {
@@ -607,6 +631,9 @@ extension Notification.Name {
     /// "Done" after a send: close the slicer screens and show that printer.
     /// `object` is the printer's id as a string.
     static let paxxShowPrinter = Notification.Name("paxxmaker.showPrinter")
+    /// A printer's dashboard layout was reset (object: the printer's id) —
+    /// its dashboard loads the default again.
+    static let paxxLayoutReset = Notification.Name("paxxmaker.layoutReset")
 }
 
 enum ConnectPairing {
@@ -1083,6 +1110,34 @@ struct QuickSettings: Codable, Equatable {
         return q
     }
 
+    /// An object's own settings follow a change of the general ones wherever
+    /// the object still had the general value — only what was changed on the
+    /// object itself stays. (Before, an object kept a copy of the general values
+    /// from the moment "own settings" was switched on: support switched off in
+    /// general later stayed on for that object.)
+    mutating func follow(_ old: QuickSettings, to new: QuickSettings) {
+        if walls == old.walls { walls = new.walls }
+        if topLayers == old.topLayers { topLayers = new.topLayers }
+        if bottomLayers == old.bottomLayers { bottomLayers = new.bottomLayers }
+        if infill == old.infill { infill = new.infill }
+        if infillPattern == old.infillPattern { infillPattern = new.infillPattern }
+        if support == old.support { support = new.support }
+        if tree == old.tree { tree = new.tree }
+        if plateOnly == old.plateOnly { plateOnly = new.plateOnly }
+        if thresholdAngle == old.thresholdAngle { thresholdAngle = new.thresholdAngle }
+        if seam == old.seam { seam = new.seam }
+        if brimType == old.brimType { brimType = new.brimType }
+        if layerHeight == old.layerHeight { layerHeight = new.layerHeight }
+        if brimWidth == old.brimWidth { brimWidth = new.brimWidth }
+        if brimGap == old.brimGap { brimGap = new.brimGap }
+    }
+
+    /// Only what differs from the general settings — what the object really overrides.
+    func objectOverrides(over general: QuickSettings) -> [String: String] {
+        let g = general.objectOverrides
+        return objectOverrides.filter { g[$0.key] != $0.value }
+    }
+
     private static func mm(_ s: String) -> Double? { Double(s.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")) }
 
     /// The object-level subset as Orca's own keys and value spellings, for
@@ -1176,9 +1231,21 @@ struct SliceSettingsSheet: View {
     @State private var gcodeData: Data? = nil
     @State private var showPreview = false
     @State private var fetchingPreview = false
+    /// Colour mixing of two heads (U1, Connect 1.5 with OrcaSlicer 2.5).
+    /// Open edges per object, from the model check (nil = not checked yet).
+    @State private var openEdges: [UUID: Int] = [:]
+    @State private var checkingModels = false
+    @State private var repairModels = true
+    /// Profile sources the computer offers (OrcaSlicer / Snapmaker Orca).
+    @State private var sources: [String] = []
+    @State private var sourceNames: [String: String] = [:]
+    @State private var slicerNames: [String: String] = [:]
+    @State private var chosenSource = ""
 
     private var config: ConnectConfig? { ConnectConfig.load() }
-    private var key: String { "slicer_last_\(printer.name)" }
+    /// Last choices per printer — and per profile source, since the names
+    /// differ between OrcaSlicer and Snapmaker Orca.
+    private var key: String { app == "orca" ? "slicer_last_\(printer.name)" : "slicer_last_\(printer.name)_\(app)" }
     private var isU1: Bool { printer.type == .snapmakerU1 }
     /// Heads the plate uses (U1): each object's own plus painted regions.
     /// Several heads = a multi-material slice; one head is sliced as T0 and
@@ -1186,11 +1253,22 @@ struct SliceSettingsSheet: View {
     private var usedHeads: [Int] {
         guard isU1 else { return [1] }
         var set = Set<Int>()
-        for o in plate.objects { set.insert(o.extruder); set.formUnion(o.paintedHeads) }
+        let mixing = mixActive
+        for o in plate.objects {
+            set.insert(o.extruder)
+            set.formUnion(o.paintedHeads)
+            // A mixed object prints with its second head as well.
+            if mixing, let m = o.mix { set.insert(m.head) }
+        }
         set.formUnion(plate.activeBands.map(\.head))
         return set.isEmpty ? [1] : set.sorted()
     }
     private var multi: Bool { usedHeads.count > 1 }
+    private func has(_ feature: String) -> Bool { connectFeatures?.contains(feature) ?? false }
+    /// Objects mixed with a second head (set on the plate) — sliced as such
+    /// only by a Connect whose slicer can (OrcaSlicer 2.5).
+    private var mixedObjects: [ModelPlacement] { isU1 ? plate.objects.filter { $0.mix.map { $0.head != 0 } ?? false } : [] }
+    private var mixActive: Bool { !mixedObjects.isEmpty && has("mix") }
     private var head: Int { usedHeads.first ?? 1 }
     private var usedExtruders: [Int] { usedHeads }
 
@@ -1232,8 +1310,10 @@ struct SliceSettingsSheet: View {
                     Section { HStack { ProgressView(); Text(lz(en: "Loading profiles from the computer…", de: "Lade Profile vom Computer…", fr: "Chargement des profils depuis l'ordinateur…", es: "Cargando perfiles del ordenador…", pt: "Carregando perfis do computador…", it: "Carico i profili dal computer…", zh: "正在从电脑加载配置…")) } }
                 } else if let p = profiles {
                     profileSection(p)
+                    if !mixedObjects.isEmpty { mixSection }
                     layoutSections
                     perObjectSection
+                    if has("repair") { modelCheckSection }
                 }
                 // Layer colours need a Connect that writes height ranges.
                 if !plate.activeBands.isEmpty, let f = connectFeatures, !f.contains("ranges") {
@@ -1301,6 +1381,14 @@ struct SliceSettingsSheet: View {
                 // A different preset brings its own values.
                 if profiles != nil, q.process != new { Task { await fillFromProfile() } }
             }
+            .onChange(of: chosenSource) { _, new in
+                // Another source = other profiles: remember the choice, load anew.
+                guard !new.isEmpty, new != app else { return }
+                remember()
+                UserDefaults.standard.set(new, forKey: "slicer_source_\(printer.name)")
+                profiles = nil; job = nil; jobError = nil
+                Task { await load() }
+            }
             .onChange(of: filaments) { _, _ in
                 // A different filament brings its own temperatures.
                 guard profiles != nil else { return }
@@ -1310,11 +1398,25 @@ struct SliceSettingsSheet: View {
                 guard profiles != nil else { return }
                 Task { await loadBedType(); for e in usedExtruders { await loadTemps(head: e) } }
             }
+            // Objects with own settings follow the general ones except where
+            // they were changed on the object itself.
+            .onChange(of: q) { old, new in
+                for o in plate.objects {
+                    guard var own = o.settings else { continue }
+                    own.follow(old, to: new)
+                    if own != o.settings { o.settings = own }
+                }
+            }
         }
     }
 
     @ViewBuilder private func profileSection(_ p: SlicerProfiles) -> some View {
                     Section {
+                        if sources.count > 1 {
+                            Picker(lz(en: "Profiles from", de: "Profile aus", fr: "Profils de", es: "Perfiles de", pt: "Perfis de", it: "Profili da", zh: "配置来源"), selection: $chosenSource) {
+                                ForEach(sources, id: \.self) { Text(sourceNames[$0] ?? $0).tag($0) }
+                            }
+                        }
                         Picker(lz(en: "Printer", de: "Drucker", fr: "Imprimante", es: "Impresora", pt: "Impressora", it: "Stampante", zh: "打印机"), selection: $machine) {
                             ForEach(machinePresets) { m in Text(m.name).tag(m.name) }
                         }
@@ -1366,6 +1468,135 @@ struct SliceSettingsSheet: View {
                     }
     }
 
+    // MARK: colour mixing (Connect 1.5 / OrcaSlicer 2.5)
+
+    private func headName(_ h: Int) -> String {
+        lz(en: "Head \(h)", de: "Kopf \(h)", fr: "Tête \(h)", es: "Cabezal \(h)", pt: "Cabeça \(h)", it: "Testa \(h)", zh: "喷头 \(h)")
+    }
+
+    /// The material of the filament chosen for a head (profile type).
+    private func chosenType(_ head: Int) -> String {
+        let name = filaments[safe: head - 1] ?? ""
+        if let t = profiles?.filament.first(where: { $0.name == name })?.filament_type, !t.isEmpty { return t }
+        let t = filamentTypes[safe: head - 1] ?? ""
+        return t.isEmpty ? (Self.material(inName: name) ?? "").uppercased() : t
+    }
+
+    /// What the plate mixes — set per object with the "Head" tool there.
+    @ViewBuilder private var mixSection: some View {
+        Section {
+            ForEach(mixedObjects) { o in
+                if let m = o.mix {
+                    let ta = chosenType(o.extruder), tb = chosenType(m.head)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 8) {
+                            mixSwatch(o.extruder, m.head, m)
+                            Text(o.name).lineLimit(1)
+                            Spacer()
+                            Text("\(headName(o.extruder)) + \(headName(m.head))").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text(m.gradient
+                             ? lz(en: "Gradient \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", de: "Verlauf \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", fr: "Dégradé \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", es: "Degradado \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", pt: "Gradiente \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", it: "Sfumatura \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", zh: "渐变 \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))")
+                             : lz(en: "Even \(Int(m.share))/\(100 - Int(m.share))", de: "Gleichmäßig \(Int(m.share))/\(100 - Int(m.share))", fr: "Uniforme \(Int(m.share))/\(100 - Int(m.share))", es: "Uniforme \(Int(m.share))/\(100 - Int(m.share))", pt: "Uniforme \(Int(m.share))/\(100 - Int(m.share))", it: "Uniforme \(Int(m.share))/\(100 - Int(m.share))", zh: "均匀 \(Int(m.share))/\(100 - Int(m.share))"))
+                            .font(.caption).foregroundStyle(.secondary)
+                        if Self.baseMaterial(ta) != Self.baseMaterial(tb) {
+                            Label(lz(en: "Both heads need the same material (\(ta) / \(tb)).", de: "Beide Köpfe brauchen dasselbe Material (\(ta) / \(tb)).", fr: "Les deux têtes doivent avoir le même matériau (\(ta) / \(tb)).", es: "Ambos cabezales necesitan el mismo material (\(ta) / \(tb)).", pt: "As duas cabeças precisam do mesmo material (\(ta) / \(tb)).", it: "Entrambe le teste richiedono lo stesso materiale (\(ta) / \(tb)).", zh: "两个喷头需要相同材料（\(ta) / \(tb)）。"),
+                                  systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption).foregroundColor(.orange)
+                        }
+                    }
+                }
+            }
+            if !has("mix") {
+                Label(lz(en: "Colour mixing needs OrcaSlicer 2.5 as the slicer on the computer — this slice prints each object with its own head only.",
+                         de: "Farbmischung braucht OrcaSlicer 2.5 als Slicer auf dem Computer — dieser Slice druckt jedes Objekt nur mit seinem eigenen Kopf.",
+                         fr: "Le mélange de couleurs nécessite OrcaSlicer 2.5 sur l'ordinateur — ce tranchage imprime chaque objet avec sa propre tête.",
+                         es: "La mezcla de colores necesita OrcaSlicer 2.5 en el ordenador; este laminado imprime cada objeto solo con su cabezal.",
+                         pt: "A mistura de cores precisa do OrcaSlicer 2.5 no computador — este fatiamento imprime cada objeto só com a sua cabeça.",
+                         it: "La miscelazione richiede OrcaSlicer 2.5 sul computer — questo slicing stampa ogni oggetto solo con la propria testa.",
+                         zh: "混色需要电脑上的 OrcaSlicer 2.5——本次切片每个对象只用自己的喷头打印。"),
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote).foregroundColor(.orange)
+            }
+        } header: {
+            Text(lz(en: "Colour mixing", de: "Farbmischung", fr: "Mélange de couleurs", es: "Mezcla de colores", pt: "Mistura de cores", it: "Miscelazione colori", zh: "混色"))
+        } footer: {
+            Text(lz(en: "Set on the plate with the \"Head\" tool. The two heads take turns every layer — the print takes much longer and the prime tower gets about 10 cm deep.",
+                    de: "Eingestellt auf der Platte mit dem Werkzeug „Kopf\". Die beiden Köpfe wechseln sich jede Schicht ab — der Druck dauert deutlich länger und der Reinigungsturm wird ca. 10 cm tief.",
+                    fr: "Réglé sur le plateau avec l'outil « Tête ». Les deux têtes alternent à chaque couche — l'impression est bien plus longue et la tour de purge fait environ 10 cm.",
+                    es: "Se ajusta en la placa con la herramienta «Cabezal». Los dos cabezales se turnan cada capa: la impresión tarda mucho más y la torre de purga mide unos 10 cm.",
+                    pt: "Definido na mesa com a ferramenta \"Cabeça\". As duas cabeças alternam a cada camada — a impressão demora bem mais e a torre de purga fica com cerca de 10 cm.",
+                    it: "Impostato sul piano con lo strumento «Testa». Le due teste si alternano a ogni strato — la stampa dura molto di più e la torre di spurgo arriva a circa 10 cm.",
+                    zh: "在打印板上用“喷头”工具设置。两个喷头每层轮流打印——打印时间明显更长，擦拭塔约 10 厘米深。"))
+        }
+    }
+
+    /// Own head's colour, the blend, the second head's colour.
+    private func mixSwatch(_ a: Int, _ b: Int, _ m: ObjectMix) -> some View {
+        let ca = UIColor(Color(hex: previewColorHexes[safe: a - 1] ?? "") ?? .gray)
+        let cb = UIColor(Color(hex: previewColorHexes[safe: b - 1] ?? "") ?? .gray)
+        let lo = ObjectMix.blend(ca, cb, share: m.share)
+        let hi = m.gradient ? ObjectMix.blend(ca, cb, share: m.shareTop) : lo
+        return RoundedRectangle(cornerRadius: 5)
+            .fill(LinearGradient(colors: [Color(hi), Color(lo)], startPoint: .top, endPoint: .bottom))
+            .frame(width: 22, height: 22)
+            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.primary.opacity(0.3), lineWidth: 0.5))
+    }
+
+    // MARK: model check (Connect 1.5 / OrcaSlicer 2.5)
+
+    @ViewBuilder private var modelCheckSection: some View {
+        let broken = plate.objects.filter { (openEdges[$0.id] ?? 0) > 0 }
+        Section {
+            if checkingModels {
+                HStack { ProgressView(); Text(lz(en: "Checking models…", de: "Modelle werden geprüft…", fr: "Vérification des modèles…", es: "Comprobando modelos…", pt: "Verificando modelos…", it: "Controllo dei modelli…", zh: "正在检查模型…")) }
+            } else if broken.isEmpty, !openEdges.isEmpty {
+                Label(lz(en: "Models are closed — no holes found.", de: "Modelle sind geschlossen — keine Löcher gefunden.", fr: "Modèles fermés — aucun trou trouvé.", es: "Modelos cerrados — sin agujeros.", pt: "Modelos fechados — nenhum furo encontrado.", it: "Modelli chiusi — nessun buco trovato.", zh: "模型是封闭的——未发现孔洞。"),
+                      systemImage: "checkmark.seal.fill")
+                    .foregroundStyle(.green).font(.footnote)
+            } else {
+                ForEach(broken) { o in
+                    Label(lz(en: "\(o.name): \(openEdges[o.id] ?? 0) open edges (holes or cracks)",
+                             de: "\(o.name): \(openEdges[o.id] ?? 0) offene Kanten (Löcher oder Risse)",
+                             fr: "\(o.name) : \(openEdges[o.id] ?? 0) arêtes ouvertes (trous ou fissures)",
+                             es: "\(o.name): \(openEdges[o.id] ?? 0) aristas abiertas (agujeros o grietas)",
+                             pt: "\(o.name): \(openEdges[o.id] ?? 0) arestas abertas (furos ou fissuras)",
+                             it: "\(o.name): \(openEdges[o.id] ?? 0) spigoli aperti (buchi o crepe)",
+                             zh: "\(o.name)：\(openEdges[o.id] ?? 0) 条开放边（孔洞或裂缝）"),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange).font(.footnote)
+                }
+                if !broken.isEmpty {
+                    Toggle(lz(en: "Repair when slicing", de: "Beim Slicen reparieren", fr: "Réparer au tranchage", es: "Reparar al laminar", pt: "Reparar ao fatiar", it: "Ripara durante lo slicing", zh: "切片时修复"), isOn: $repairModels)
+                }
+            }
+        } header: {
+            Text(lz(en: "Model check", de: "Modell-Check", fr: "Vérification du modèle", es: "Comprobación del modelo", pt: "Verificação do modelo", it: "Controllo modello", zh: "模型检查"))
+        } footer: {
+            if !broken.isEmpty {
+                Text(lz(en: "OrcaSlicer's \"Fix Model\" closes holes and cracks, turns flipped faces outward and removes self-intersections.",
+                        de: "OrcaSlicers „Modell reparieren\" schließt Löcher und Risse, dreht verkehrte Flächen nach außen und entfernt Selbstüberschneidungen.",
+                        fr: "« Réparer le modèle » d'OrcaSlicer ferme trous et fissures, réoriente les faces et supprime les auto-intersections.",
+                        es: "«Reparar modelo» de OrcaSlicer cierra agujeros y grietas, orienta las caras hacia fuera y elimina autointersecciones.",
+                        pt: "O \"Reparar modelo\" do OrcaSlicer fecha furos e fissuras, vira faces para fora e remove autointerseções.",
+                        it: "«Ripara modello» di OrcaSlicer chiude buchi e crepe, orienta le facce verso l'esterno e rimuove le auto-intersezioni.",
+                        zh: "OrcaSlicer 的“修复模型”会封闭孔洞和裂缝、把翻转的面朝外并去除自相交。"))
+            }
+        }
+    }
+
+    /// Open edges of every object on the plate, off the main thread.
+    private func checkModels() async {
+        let todo = plate.objects.filter { openEdges[$0.id] == nil }.map { ($0.id, $0.mesh) }
+        guard !todo.isEmpty else { return }
+        checkingModels = true
+        let found = await Task.detached(priority: .utility) {
+            todo.map { ($0.0, MeshCheck.openEdges($0.1)) }
+        }.value
+        for (id, n) in found { openEdges[id] = n }
+        checkingModels = false
+    }
+
     // MARK: the arrangeable middle
 
     /// The groups as the user put them together; a group without a visible
@@ -1391,7 +1622,9 @@ struct SliceSettingsSheet: View {
     /// Objects can carry their own settings — that list is not part of the
     /// arrangement, it belongs to the plate.
     @ViewBuilder private var perObjectSection: some View {
-        if plate.objects.count > 1 {
+        // Also with a single object once it has own settings — they apply
+        // either way and must not be invisible.
+        if plate.objects.count > 1 || plate.objects.contains(where: { $0.settings != nil }) {
             Section {
                 ForEach(plate.objects) { o in
                     NavigationLink {
@@ -1402,7 +1635,7 @@ struct SliceSettingsSheet: View {
                             Spacer()
                             Text(o.settings == nil
                                  ? lz(en: "general", de: "allgemein", fr: "général", es: "general", pt: "geral", it: "generale", zh: "通用")
-                                 : lz(en: "own", de: "eigene", fr: "propres", es: "propios", pt: "próprios", it: "proprie", zh: "自定义"))
+                                 : ownLabel(o.settings!))
                                 .foregroundStyle(o.settings == nil ? .secondary : Color.accentColor).font(.footnote)
                         }
                     }
@@ -1419,6 +1652,15 @@ struct SliceSettingsSheet: View {
                         zh: "对象可以覆盖上面的通用设置（墙、填充、支撑、接缝、Brim、层高）。"))
             }
         }
+    }
+
+    /// "own" — and, as support is the one that surprises, whether it differs.
+    private func ownLabel(_ own: QuickSettings) -> String {
+        let base = lz(en: "own", de: "eigene", fr: "propres", es: "propios", pt: "próprios", it: "proprie", zh: "自定义")
+        guard own.support != q.support else { return base }
+        return base + " · " + (own.support
+            ? lz(en: "support on", de: "Support an", fr: "supports activés", es: "soportes activados", pt: "suportes ativados", it: "supporti attivi", zh: "支撑开")
+            : lz(en: "support off", de: "Support aus", fr: "supports désactivés", es: "soportes desactivados", pt: "suportes desativados", it: "supporti disattivati", zh: "支撑关"))
     }
 
     /// Below the result: back to the profile's values, and the editor.
@@ -1699,11 +1941,28 @@ struct SliceSettingsSheet: View {
                             row(lz(en: "Print time", de: "Druckzeit", fr: "Durée", es: "Tiempo", pt: "Tempo", it: "Tempo", zh: "打印时间"), r.time_s.map { EnergyLog.duration($0) } ?? "—")
                             row(lz(en: "Filament", de: "Filament", fr: "Filament", es: "Filamento", pt: "Filamento", it: "Filamento", zh: "耗材"),
                                 r.filament_g.map { String(format: "%.1f g", $0) } ?? "—")
-                            if let t = r.filament_g_tools, t.count > 1 {
+                            if r.stats == nil, let t = r.filament_g_tools, t.count > 1 {
                                 row("", perToolText(t))
                             }
                             row(lz(en: "Filament cost", de: "Filamentkosten", fr: "Coût filament", es: "Coste filamento", pt: "Custo filamento", it: "Costo filamento", zh: "耗材费用"), r.cost.map { EnergyLog.money($0, printer.energyCurrency) } ?? "—")
                             row(lz(en: "Layers", de: "Layer", fr: "Couches", es: "Capas", pt: "Camadas", it: "Layer", zh: "层数"), r.layers.map(String.init) ?? "—")
+                            if let sl = r.slicer, !sl.isEmpty {
+                                row(lz(en: "Sliced with", de: "Gesliced mit", fr: "Tranché avec", es: "Laminado con", pt: "Fatiado com", it: "Slicing con", zh: "切片程序"), sl)
+                            }
+                            if let st = r.stats {
+                                SliceStatsRows(stats: st, currency: printer.energyCurrency, isU1: isU1)
+                            }
+                            if let f = r.repair_failed, f > 0 {
+                                Label(lz(en: "OrcaSlicer could not repair every model — check the preview.",
+                                         de: "OrcaSlicer konnte nicht jedes Modell reparieren — prüfe die Vorschau.",
+                                         fr: "OrcaSlicer n'a pas pu réparer tous les modèles — vérifie l'aperçu.",
+                                         es: "OrcaSlicer no pudo reparar todos los modelos — revisa la vista previa.",
+                                         pt: "O OrcaSlicer não conseguiu reparar todos os modelos — verifique a pré-visualização.",
+                                         it: "OrcaSlicer non ha potuto riparare tutti i modelli — controlla l'anteprima.",
+                                         zh: "OrcaSlicer 未能修复所有模型——请检查预览。"),
+                                      systemImage: "exclamationmark.triangle.fill")
+                                    .font(.footnote).foregroundColor(.orange)
+                            }
                             row("Support", supportText(r.support))
                             Button {
                                 Task { await openPreview() }
@@ -1817,9 +2076,15 @@ struct SliceSettingsSheet: View {
         let client = ConnectClient(config: cfg)
         do {
             let info = try await client.info()
-            app = info.apps.first ?? "orca"
+            sources = info.apps
+            sourceNames = info.app_names ?? [:]
+            slicerNames = info.slicers ?? [:]
+            // The source picked for this printer, else the computer's choice.
+            let mine = UserDefaults.standard.string(forKey: "slicer_source_\(printer.name)") ?? ""
+            app = info.apps.contains(mine) ? mine : (info.apps.first ?? "orca")
+            chosenSource = app
             connectVersion = info.version
-            connectFeatures = info.features ?? []
+            connectFeatures = info.features_by_app?[app] ?? info.features ?? []
             let p = try await client.profiles(app: app)
             profiles = p
             // Last choice for this printer, else the first fitting preset.
@@ -1844,6 +2109,7 @@ struct SliceSettingsSheet: View {
             await fillFromProfile(keepTweaks: q.process == process)
             await loadBedType()
             for e in usedExtruders { await loadTemps(head: e) }
+            if has("repair") { await checkModels() }
         } catch {
             loadError = error.localizedDescription
         }
@@ -1999,7 +2265,10 @@ struct SliceSettingsSheet: View {
                 let m = part.transform
                 let flat: [Double] = (0..<4).flatMap { c in (0..<4).map { r in Double(m[c][r]) } }
                 var d: [String: Any] = ["name": o.name, "model": mid, "transform": flat, "extruder": multi ? o.extruder : 1]
-                if let own = o.settings { d["settings"] = own.objectOverrides }
+                if let own = o.settings {
+                    let diff = own.objectOverrides(over: q)
+                    if !diff.isEmpty { d["settings"] = diff }
+                }
                 if multi {
                     let strings = part.paint
                     if !strings.isEmpty { d["paint"] = Dictionary(uniqueKeysWithValues: strings.map { (String($0.key), $0.value) }) }
@@ -2020,6 +2289,30 @@ struct SliceSettingsSheet: View {
                 objs.append(d)
             }
             spec["objects"] = objs
+            // Holes found by the model check: OrcaSlicer's "Fix Model" closes them.
+            if has("repair"), repairModels, openEdges.values.contains(where: { $0 > 0 }) { spec["repair"] = true }
+            if mixActive {
+                // One blend per distinct (own head, mix) — objects alike share it.
+                var groups: [(head: Int, mix: ObjectMix, objects: [Int])] = []
+                for (i, o) in plate.objects.enumerated() {
+                    guard let m = o.mix, m.head != o.extruder else { continue }
+                    if let g = groups.firstIndex(where: { $0.head == o.extruder && $0.mix == m }) { groups[g].objects.append(i) }
+                    else { groups.append((o.extruder, m, [i])) }
+                }
+                spec["mixes"] = groups.map { g -> [String: Any] in
+                    let ca = UIColor(Color(hex: previewColorHexes[safe: g.head - 1] ?? "") ?? .gray)
+                    let cb = UIColor(Color(hex: previewColorHexes[safe: g.mix.head - 1] ?? "") ?? .gray)
+                    let c = ObjectMix.blend(ca, cb, share: g.mix.share)
+                    var r: CGFloat = 0, gg: CGFloat = 0, b: CGFloat = 0, al: CGFloat = 0
+                    c.getRed(&r, green: &gg, blue: &b, alpha: &al)
+                    var m: [String: Any] = ["components": [g.head, g.mix.head], "objects": g.objects,
+                                            "gradient": g.mix.gradient, "sublayer": g.mix.sublayer || g.mix.gradient,
+                                            "colour": String(format: "#%02X%02X%02X", Int(r * 255), Int(gg * 255), Int(b * 255))]
+                    if g.mix.gradient { m["range"] = [g.mix.share / 100, g.mix.shareTop / 100] }
+                    else { m["ratios"] = [g.mix.share / 100, 1 - g.mix.share / 100] }
+                    return m
+                }
+            }
             stage = "slice"; progress = 0.15
             var j = try await client.createJob(spec)
             while j.state == "queued" || j.state == "running" {
@@ -2093,8 +2386,15 @@ struct SliceSettingsSheet: View {
     /// The chosen profile's material does not fit what is loaded in the head.
     private func filamentMismatch(_ head: Int) -> Bool {
         let loaded = baseMaterialOrEmpty(loadedMaterial(head))
-        guard !loaded.isEmpty, let own = Self.material(inName: filaments[head - 1]) else { return false }
+        guard !loaded.isEmpty, let own = presetMaterial(filaments[head - 1]) else { return false }
         return own != loaded
+    }
+
+    /// A preset's material: its profile's filament_type (Connect 1.5), else
+    /// the word in its name.
+    private func presetMaterial(_ name: String) -> String? {
+        if let t = profiles?.filament.first(where: { $0.name == name })?.filament_type, !t.isEmpty { return Self.baseMaterial(t) }
+        return Self.material(inName: name)
     }
 
     private func baseMaterialOrEmpty(_ t: String) -> String {
@@ -2102,23 +2402,37 @@ struct SliceSettingsSheet: View {
         return b == "none" ? "" : b
     }
 
-    /// Picks the best profile for a head when none fits its loaded material:
-    /// same material required, then the same maker, then the same colour.
+    /// Picks the best profile for a head when none fits its loaded material.
+    /// Same material required; then OrcaSlicer's filament id — the product
+    /// the spool is (maker + material + sub-type, minted as Orca does) — then
+    /// the same maker, sub-type and colour.
     private func matchLoadedFilament(head: Int, presets: [SlicerProfiles.Preset]) {
         let svc = printerServices.services.first(where: { $0.name == printer.name })
-        let loaded = baseMaterialOrEmpty(svc?.slotMaterials[safe: head - 1] ?? "")
+        let rawType = svc?.slotMaterials[safe: head - 1] ?? ""
+        let loaded = baseMaterialOrEmpty(rawType)
         guard !loaded.isEmpty else { return }
         let current = filaments[head - 1]
-        if !current.isEmpty, Self.material(inName: current) == loaded { return }      // already fits
-        let vendor = (svc?.slotVendors[safe: head - 1] ?? "").lowercased()
-        let colours = Self.colourWords(svc?.slotColorHexes[safe: head - 1] ?? "")
+        if !current.isEmpty, presetMaterial(current) == loaded { return }      // already fits
+        let vendorRaw = svc?.slotVendors[safe: head - 1] ?? ""
+        let vendor = vendorRaw.lowercased()
+        let sub = svc?.slotSubtypes[safe: head - 1] ?? ""
+        let colourHex = svc?.slotColorHexes[safe: head - 1] ?? ""
+        let colours = Self.colourWords(colourHex)
+        // The ids this spool may carry, in the maker spellings the profiles use.
+        let spellings = presets.compactMap(\.filament_vendor).filter { OrcaFilamentID.sameVendor($0, vendorRaw) }
+        let ids = vendorRaw.isEmpty ? [] : OrcaFilamentID.candidates(vendor: vendorRaw, type: rawType, subtype: sub, vendorSpellings: spellings)
         var best: (name: String, score: Int)? = nil
         for p in presets {
-            guard Self.material(inName: p.name) == loaded else { continue }
+            guard presetMaterial(p.name) == loaded else { continue }
             let n = p.name.lowercased()
             var score = 10
-            if !vendor.isEmpty, vendor != "none", n.contains(vendor) { score += 5 }
+            if let id = p.filament_id, ids.contains(id) { score += 8 }
+            if let v = p.filament_vendor, OrcaFilamentID.sameVendor(v, vendorRaw) { score += 5 }
+            else if !vendor.isEmpty, vendor != "none", n.contains(vendor) { score += 5 }
+            if !sub.isEmpty, n.contains(sub.lowercased()) { score += 3 }
             if colours.contains(where: { n.contains($0) }) { score += 3 }
+            else if let c = p.filament_colour, Self.colourWords(c.trimmingCharacters(in: CharacterSet(charactersIn: "#"))) == colours, !colours.isEmpty { score += 2 }
+            if p.origin == "user" { score += 1 }
             if best == nil || score > best!.score { best = (p.name, score) }
         }
         if let b = best { filaments[head - 1] = b.name }
@@ -2131,7 +2445,12 @@ struct SliceSettingsSheet: View {
         let d = try await ConnectClient(config: cfg).gcode(j.id)
         gcodeData = d
         // The real tower of this slice, for the plate next time.
-        if multi {
+        if multi, mixActive {
+            // The deep tower of colour mixing — the plate shows that one next time.
+            Task.detached(priority: .utility) {
+                if let t = Self.measureTower(d) { await MainActor.run { PlateModel.rememberMixTower(width: t.x, depth: t.y) } }
+            }
+        } else if multi {
             let heads = usedHeads.count
             Task.detached(priority: .utility) {
                 if let t = Self.measureTower(d) { await MainActor.run { PlateModel.rememberTower(width: t.x, depth: t.y, heads: heads) } }
@@ -2174,7 +2493,7 @@ struct SliceSettingsSheet: View {
     /// Width and depth of the prime tower in a G-code: the extrusions marked
     /// ";TYPE:Prime tower" (not its brim), from the 1st to the 99th percentile
     /// — the few wipe moves that run off the tower are left out.
-    static func measureTower(_ data: Data) -> SIMD2<Float>? {
+    nonisolated static func measureTower(_ data: Data) -> SIMD2<Float>? {
         guard let text = String(data: data, encoding: .utf8) else { return nil }
         var xs: [Float] = [], ys: [Float] = []
         var inTower = false, inBrim = false

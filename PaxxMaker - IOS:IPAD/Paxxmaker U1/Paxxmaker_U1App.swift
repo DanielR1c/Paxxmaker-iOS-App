@@ -316,6 +316,7 @@ struct Paxxmaker_U1App: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .duoObserved()
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .background {
@@ -458,8 +459,15 @@ struct Paxxmaker_U1App: App {
             let timeElapsed = Int(elapsedRaw)
             let liveState   = PaxxMakerWidgetAttributes.ContentState(
                 printState: newState, progress: progress,
-                extruderTemp: 0, bedTemp: 0, timeElapsed: timeElapsed
+                extruderTemp: 0, bedTemp: 0, timeElapsed: timeElapsed,
+                filename: fname.isEmpty ? nil : fname
             )
+            PaxxMakerWidgetAttributes.rememberFile(fname, printer: config.name)
+            // Thumbnail for the Live Activity — the update below redraws it.
+            if newState == "printing" || newState == "paused" {
+                await LiveActivityThumb.ensure(baseURL: config.baseURL, apiKey: config.apiKey,
+                                               filename: fname, printer: config.name)
+            }
 
             for activity in Activity<PaxxMakerWidgetAttributes>.activities
                 where activity.attributes.printerName == config.name {
@@ -495,7 +503,7 @@ struct Paxxmaker_U1App: App {
                let secret = config.cfSecret, !secret.isEmpty,
                Activity<PaxxMakerWidgetAttributes>.activities.first(where: { $0.attributes.printerName == config.name }) == nil,
                let activity = try? Activity.request(
-                   attributes: PaxxMakerWidgetAttributes(printerName: config.name, filename: ""),
+                   attributes: PaxxMakerWidgetAttributes(printerName: config.name, filename: fname),
                    content: ActivityContent(state: liveState, staleDate: nil),
                    pushType: .token
                ), let tokenData = activity.pushToken {

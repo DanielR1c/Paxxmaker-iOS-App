@@ -88,12 +88,13 @@ struct GCodeToolpaths {
     }
 
     /// GPU layout, mirrored by `Segment` in the shader source (36 bytes).
-    struct Segment {
+    nonisolated struct Segment {
         var ax: Float, ay: Float, az: Float
         var bx: Float, by: Float, bz: Float
         var w: Float, h: Float
-        var meta: UInt32                     // feature | tool << 8
+        var meta: UInt32                     // feature | tool << 8 | sub-layer pass << 16
         var feature: Feature { Feature(rawValue: Int(meta & 0xFF)) ?? .other }
+        static let subLayerFlag: UInt32 = 1 << 16
         var tool: UInt8 { UInt8((meta >> 8) & 0xFF) }
     }
 
@@ -109,6 +110,36 @@ struct GCodeToolpaths {
     var bounds: (min: SIMD3<Float>, max: SIMD3<Float>) = (.zero, .zero)
 
     var layerCount: Int { layerZ.count }
+
+    /// Colour mixing (Orca's sub-layer mode) prints each layer as thin passes of
+    /// the components on top of each other — e.g. 0.036 mm of T1, then 0.164 mm
+    /// of T2. Every pass keeps its own tool, Z and ;HEIGHT:, so the preview shows
+    /// what is really printed: the bands of each filament, never a blend.
+    /// The passes are only flagged here so the shader gives them straight sides:
+    /// drawn as Orca's rhombus, a 0.036-mm pass bulges out as far as a 0.164-mm
+    /// one and the bands on the wall looked about equally thick.
+    nonisolated mutating func markSubLayerPasses() {
+        guard layerStart.count > 1 else { return }
+        for l in 0..<(layerStart.count - 1) {
+            let a = layerStart[l], b = layerStart[l + 1]
+            guard b > a else { continue }
+            // Layer height from the layer heights' steps; the first layer from its own passes.
+            let full: Float = l > 0 && l < layerZ.count ? layerZ[l] - layerZ[l - 1]
+                                                        : segments[a..<b].map(\.h).max() ?? 0
+            guard full > 0.02 else { continue }
+            // Height printed per tool in passes thinner than the layer.
+            var part: [UInt8: Float] = [:]
+            for i in a..<b where segments[i].h < full * 0.9 {
+                let t = segments[i].tool
+                part[t] = max(part[t] ?? 0, segments[i].h)
+            }
+            // Only a real split of one layer by two or more heads (the passes add up to it).
+            guard part.count >= 2, abs(part.values.reduce(0, +) - full) < full * 0.25 else { continue }
+            for i in a..<b where segments[i].h < full * 0.9 && part[segments[i].tool] != nil {
+                segments[i].meta |= Segment.subLayerFlag
+            }
+        }
+    }
 
     /// Byte-level G-code parse. Handles G0/G1 with X/Y/Z/E, G2/G3 arcs (I/J or R),
     /// G90/G91, M82/M83, G92 E, Tn, ;TYPE:, ;WIDTH:, ;HEIGHT:, ;LAYER_CHANGE / ;Z:.
@@ -275,6 +306,7 @@ struct GCodeToolpaths {
         }
         out.layerStart.append(out.segments.count)
         out.travelStart.append(out.travels.count)
+        out.markSubLayerPasses()
         if lo.x <= hi.x { out.bounds = (lo, hi) }
         else if let f = out.segments.first { out.bounds = (SIMD3(f.ax, f.ay, f.az), SIMD3(f.bx, f.by, f.bz)) }
         return out
@@ -386,12 +418,24 @@ vertex BoxOut toolpath_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     float3 centre = a - hh * up + t * along;
     float3 off = c == 0u ? up * hh : (c == 1u ? r * hw : (c == 2u ? -up * hh : -r * hw));
     float3 nrm = c == 0u ? up : (c == 1u ? r : (c == 2u ? -up : -r));
+    if ((s.meta >> 16) & 1u) {
+        // Sub-layer pass of colour mixing: straight sides, so the band each
+        // pass leaves on the wall is exactly as tall as it is printed. Same
+        // corner order as the rhombus, turned by 45° (top-right, bottom-right,
+        // bottom-left, top-left), so the winding stays the same.
+        float sv = (c == 0u || c == 3u) ? 1.0 : -1.0;
+        float sh = (c == 0u || c == 1u) ? 1.0 : -1.0;
+        off = up * (sv * hh) + r * (sh * hw);
+        nrm = normalize(up * (sv * 0.5) + r * sh);
+    }
     float3 p = centre + off;
     BoxOut o;
     o.vpos = (u.view * float4(p, 1)).xyz;
     o.vnormal = (u.view * float4(nrm, 0)).xyz;
     o.pos = u.viewProj * float4(p, 1);
     uint feature = s.meta & 0xFFu, tool = (s.meta >> 8) & 0xFFu;
+    // Always the filament of the head that prints this line — also in the
+    // thin passes of colour mixing, never a blend.
     o.color = u.byTool ? colors[32 + min(tool, 15u)] : colors[min(feature, 31u)];
     return o;
 }
@@ -567,7 +611,11 @@ final class ToolpathRenderer: NSObject, MTKViewDelegate {
               let cmd = queue.makeCommandBuffer(), let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
         let aspect = Float(max(view.drawableSize.width, 1) / max(view.drawableSize.height, 1))
         if needsFit { fit(aspect: aspect) }
-        var u = Uniforms(viewProj: OrbitCamera.projection(aspect: aspect) * camera.view, view: camera.view, byTool: byTool ? 1 : 0)
+        // Near plane with the zoom: fixed at 1 mm the depth buffer could no
+        // longer tell the thin sub-layer passes of colour mixing apart from a
+        // normal viewing distance — the first-drawn head won everywhere.
+        let near = max(0.05, camera.distance * 0.02)
+        var u = Uniforms(viewProj: OrbitCamera.projection(aspect: aspect, near: near) * camera.view, view: camera.view, byTool: byTool ? 1 : 0)
         enc.setDepthStencilState(depthState)
         enc.setFrontFacing(.counterClockwise)
 
@@ -758,6 +806,10 @@ struct GCodePreviewView: View {
     @State private var paths: GCodeToolpaths? = nil
     @State private var maxLayer: Double = 0
     @State private var layerFraction: Double = 1
+    /// Typing a layer or a height instead of dragging: which one, and the text.
+    private enum JumpEntry { case layer, height }
+    @State private var jumpEntry: JumpEntry? = nil
+    @State private var jumpText = ""
     /// The preview opens by line type — that is what shows how it prints;
     /// the filament colours are one tap away.
     @State private var byTool = false
@@ -874,6 +926,51 @@ struct GCodePreviewView: View {
                 }
             }
             .onChange(of: maxLayer) { _, _ in layerFraction = 1 }
+            .alert(jumpEntry == .height
+                   ? lz(en: "Go to height", de: "Zu Höhe springen", fr: "Aller à la hauteur", es: "Ir a la altura", pt: "Ir para a altura", it: "Vai all'altezza", zh: "跳转到高度")
+                   : lz(en: "Go to layer", de: "Zu Layer springen", fr: "Aller à la couche", es: "Ir a la capa", pt: "Ir para a camada", it: "Vai al layer", zh: "跳转到层"),
+                   isPresented: Binding(get: { jumpEntry != nil }, set: { if !$0 { jumpEntry = nil } })) {
+                if jumpEntry == .height {
+                    TextField(lz(en: "Height in mm", de: "Höhe in mm", fr: "Hauteur en mm", es: "Altura en mm", pt: "Altura em mm", it: "Altezza in mm", zh: "高度 (mm)"), text: $jumpText)
+                        .keyboardType(.decimalPad)
+                } else {
+                    TextField("Layer", text: $jumpText).keyboardType(.numberPad)
+                }
+                // The kind goes along: the alert may already have reset
+                // jumpEntry by the time the button's action runs.
+                Button("OK") { [kind = jumpEntry] in applyJump(kind) }
+                Button(lz(en: "Cancel", de: "Abbrechen", fr: "Annuler", es: "Cancelar", pt: "Cancelar", it: "Annulla", zh: "取消"), role: .cancel) {}
+            } message: {
+                if let p = paths, p.layerCount > 0 {
+                    if jumpEntry == .height, let lo = p.layerZ.first, let hi = p.layerZ.last {
+                        Text("\(Self.mm(lo)) – \(Self.mm(hi)) mm")
+                    } else {
+                        Text("1 – \(p.layerCount)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Same notation as the height under the slider.
+    private static func mm(_ v: Float) -> String { String(format: "%.2f", v) }
+
+    /// Jumps to the typed layer, or to the layer whose top is nearest the typed
+    /// height. Out-of-range values go to the first or last layer.
+    private func applyJump(_ kind: JumpEntry?) {
+        defer { jumpEntry = nil }
+        guard let p = paths, p.layerCount > 0 else { return }
+        let text = jumpText.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
+        switch kind {
+        case .layer:
+            guard let n = Int(text) else { return }
+            maxLayer = Double(min(max(n, 1), p.layerCount) - 1)
+        case .height:
+            guard let h = Float(text) else { return }
+            let nearest = p.layerZ.indices.min { abs(p.layerZ[$0] - h) < abs(p.layerZ[$1] - h) } ?? 0
+            maxLayer = Double(nearest)
+        case nil:
+            break
         }
     }
 
@@ -882,12 +979,25 @@ struct GCodePreviewView: View {
         HStack(alignment: .top) {
             Spacer()
             VStack(spacing: 6) {
-                Text("\(Int(maxLayer) + 1)").font(.caption.weight(.semibold)).monospacedDigit()
-                Text("/ \(p.layerCount)").font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                // Tap the layer number or the height to type it in.
+                Button { jumpText = ""; jumpEntry = .layer } label: {
+                    VStack(spacing: 6) {
+                        Text("\(Int(maxLayer) + 1)").font(.caption.weight(.semibold)).monospacedDigit()
+                        Text("/ \(p.layerCount)").font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
                 VerticalLayerSlider(value: $maxLayer, range: 0...Double(max(0, p.layerCount - 1)))
                 if let z = p.layerZ[safe: Int(maxLayer)] {
-                    Text(String(format: "%.2f", z)).font(.caption2).monospacedDigit()
-                    Text("mm").font(.caption2).foregroundStyle(.secondary)
+                    Button { jumpText = ""; jumpEntry = .height } label: {
+                        VStack(spacing: 6) {
+                            Text(String(format: "%.2f", z)).font(.caption2).monospacedDigit()
+                            Text("mm").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 }
             }
             .padding(.vertical, 8).padding(.horizontal, 4)

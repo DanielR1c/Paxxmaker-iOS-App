@@ -283,7 +283,7 @@ struct SliceLayoutEditor: View {
             .searchable(text: $search, placement: .navigationBarDrawer(displayMode: .always),
                         prompt: lz(en: "Find a setting", de: "Einstellung suchen", fr: "Chercher un réglage", es: "Buscar un ajuste", pt: "Procurar um ajuste", it: "Cerca un'impostazione", zh: "查找设置"))
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { EditButton() }
+                ToolbarItem(placement: .cancellationAction) { AppEditButton() }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(lz(en: "Done", de: "Fertig", fr: "OK", es: "Listo", pt: "OK", it: "Fine", zh: "完成")) { dismiss() }
                 }

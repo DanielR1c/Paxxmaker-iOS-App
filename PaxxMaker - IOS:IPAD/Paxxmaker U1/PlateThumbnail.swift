@@ -27,7 +27,11 @@ enum PlateThumbnail {
         var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
         var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
         for o in plate.objects {
-            let colour = headColors[safe: o.extruder - 1] ?? accent
+            var colour = headColors[safe: o.extruder - 1] ?? accent
+            // A mixed object in the colour of its blend (middle of a gradient).
+            if let m = o.mix, let other = headColors[safe: m.head - 1] {
+                colour = ObjectMix.blend(colour, other, share: m.gradient ? (m.share + m.shareTop) / 2 : m.share)
+            }
             let g: SCNGeometry?
             let bands = plate.activeBands
             if (o.selector != nil && o.hasPaint) || !bands.isEmpty {

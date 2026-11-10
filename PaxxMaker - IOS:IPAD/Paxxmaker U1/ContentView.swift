@@ -797,6 +797,14 @@ struct WebView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
+        if fitWidth {
+            // The printer-screen page (paxx12 screen-apps) shows a frame counter
+            // in its top-right corner (#status), right over the printer's own
+            // status icons. Hidden in the tile; the page itself is untouched.
+            let css = "#status{display:none !important}"
+            let js = "var s=document.createElement('style');s.textContent='\(css)';document.documentElement.appendChild(s);"
+            config.userContentController.addUserScript(WKUserScript(source: js, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        }
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         if fitWidth {
@@ -906,8 +914,8 @@ struct PrinterWidgetEntryData: Codable {
 }
 
 // MARK: - Live Activity Attributes (must match PaxxMakerShared.swift in widget target)
-struct PaxxMakerWidgetAttributes: ActivityAttributes {
-    struct ContentState: Codable, Hashable {
+nonisolated struct PaxxMakerWidgetAttributes: ActivityAttributes {
+    nonisolated struct ContentState: Codable, Hashable {
         var printState: String
         var progress: Double
         var extruderTemp: Double
@@ -916,6 +924,8 @@ struct PaxxMakerWidgetAttributes: ActivityAttributes {
         /// Position in the file, sent alongside the slicer estimate by the
         /// printer bridge. Optional: pushes from an older bridge still decode.
         var progressFile: Double? = nil
+        /// The file being printed (must match the widget's copy).
+        var filename: String? = nil
 
         /// What to display. Follows the user's choice in Settings → Extra
         /// Features; falls back to the slicer value when an older bridge
@@ -928,6 +938,19 @@ struct PaxxMakerWidgetAttributes: ActivityAttributes {
     }
     var printerName: String
     var filename: String
+
+    /// Where the app leaves the current print's thumbnail (LiveActivityThumb).
+    nonisolated static func thumbnailURL(printer: String) -> URL? {
+        let safe = String(printer.map { $0.isLetter || $0.isNumber ? $0 : "_" })
+        return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.paxxmaker.u1")?
+            .appendingPathComponent("la_thumb_\(safe).png")
+    }
+
+    /// Last known file name per printer, for the Live Activity (read by the widget).
+    nonisolated static func rememberFile(_ name: String, printer: String) {
+        guard !name.isEmpty else { return }
+        UserDefaults(suiteName: "group.paxxmaker.u1")?.set(name, forKey: "la_file_\(printer)")
+    }
 }
 
 struct FilamentSlot: Identifiable {
@@ -1061,6 +1084,10 @@ class PrinterService: ObservableObject {
     // False only when the printer's command list was read and SET_SPOOL_ID is
     // missing (filament tag detection switched off in the firmware config).
     @Published var spoollinkCommandsReady: Bool = true
+    /// True only once the printer's command list was read and has SET_SPOOL_ID.
+    /// Automatic (not user-triggered) commands wait for this — an unknown
+    /// command shows up as a GCode error on the U1's screen.
+    var spoollinkCommandsConfirmed = false
     @Published var slotCardUIDs: [String] = ["", "", "", ""]   // RFID card UID per channel
     // Cached like the spool tile, so painting and the G-code preview show the
     // last loaded colours while the printer is off.
@@ -1222,7 +1249,7 @@ class PrinterService: ObservableObject {
             }
             guard let want else { continue }
             if (mcSlotSpools[safe: ch] ?? -1) != want { setSlotSpool(ch, want) }
-            if spoollinkCommandsReady, (fwSlotSpoolIds[safe: ch] ?? 0) != want {
+            if spoollinkCommandsConfirmed, (fwSlotSpoolIds[safe: ch] ?? 0) != want {
                 spoollinkAssign(channel: ch, spoolId: want)
             }
         }
@@ -1772,7 +1799,10 @@ class PrinterService: ObservableObject {
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let help = json["result"] as? [String: Any] else { return }
             let ok = help.keys.contains { $0.uppercased() == "SET_SPOOL_ID" }
-            DispatchQueue.main.async { self.updateIfChanged(\.spoollinkCommandsReady, ok) }
+            DispatchQueue.main.async {
+                self.spoollinkCommandsConfirmed = ok
+                self.updateIfChanged(\.spoollinkCommandsReady, ok)
+            }
         }.resume()
     }
 
@@ -1998,11 +2028,17 @@ class PrinterService: ObservableObject {
         let v = id ?? -1
         if mcSlotSpools.count == 4 { mcSlotSpools[slot] = v }
         mcStoreMapping(mcSlotSpools)
+        // Only to a printer that has the 4-colour hook: Klipper answers a
+        // variable of an unknown macro with an error, and the U1 shows that on
+        // its screen (GCode error 0001-0529-…) — it happened on every app start
+        // with SpoolLink firmware, whose assignment is mirrored here.
+        guard mcHookInstalled else { return }
         Task { await self.mcGcode("SET_GCODE_VARIABLE MACRO=_SPOOLMAN_MAP VARIABLE=spool\(slot) VALUE=\(v)") }
     }
 
     func setAutoTracking(_ on: Bool) {
         mcAutoTracking = on
+        guard mcHookInstalled else { return }
         Task { await self.mcGcode("SET_GCODE_VARIABLE MACRO=_SPOOLMAN_MAP VARIABLE=enabled VALUE=\(on ? 1 : 0)") }
     }
 
@@ -2041,6 +2077,8 @@ class PrinterService: ObservableObject {
             self.mcBusy = false
             if ready {
                 self.mcStatusMsg = nil
+                // Just installed and loaded — the macro exists now.
+                self.mcHookInstalled = true
                 let stored = self.mcStoredMapping()
                 self.mcApplyMapping(stored)
                 self.setAutoTracking(true)
@@ -2070,7 +2108,7 @@ class PrinterService: ObservableObject {
     }
 
     private func mcApplyMapping(_ s: [Int]) {
-        guard s.count == 4 else { return }
+        guard s.count == 4, mcHookInstalled else { return }
         Task { for i in 0..<4 { await self.mcGcode("SET_GCODE_VARIABLE MACRO=_SPOOLMAN_MAP VARIABLE=spool\(i) VALUE=\(s[i])") } }
     }
 
@@ -2369,7 +2407,7 @@ class PrinterService: ObservableObject {
                 }
                 return
             }
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [self] in
                 self.updateIfChanged(\.isOnline, true)
                 self.updateIfChanged(\.isViaLiveActivity, false)
                 self.lastSeenDate = Date()
@@ -2510,9 +2548,11 @@ class PrinterService: ObservableObject {
                    let extruder = config["extruder"] as? [String: Any] {
                     let nozzle: Double? = (extruder["nozzle_diameter"] as? Double)
                         ?? ((extruder["nozzle_diameter"] as? String).flatMap { Double($0) })
-                    if let n = nozzle, self.nozzleDiameters[0] != n {
-                        self.nozzleDiameters[0] = n
-                        self.nozzleDiametersLoaded[0] = true
+                    if let n = nozzle {
+                        if self.nozzleDiameters[0] != n { self.nozzleDiameters[0] = n }
+                        // Also when it equals the 0.4 default — before, a 0.4 mm
+                        // nozzle (the usual one) never counted as read: "Ø – mm".
+                        if !self.nozzleDiametersLoaded[0] { self.nozzleDiametersLoaded[0] = true }
                     }
                 }
                 if prevState == "printing" && self.printState == "complete" {
@@ -2673,6 +2713,13 @@ class PrinterService: ObservableObject {
         )
         var all = (try? JSONDecoder().decode([PrinterWidgetEntryData].self,
                                              from: defaults.data(forKey: "w_all_printers") ?? Data())) ?? []
+        // Redraw the widgets when what they show changed. Comparing with
+        // previousPrintState never fired: fetchStatus sets it to the new state
+        // before calling here, so the widgets only caught up on their own
+        // 5/30-minute schedule (a fresh print showed "–" and 0 °C for ages).
+        let old = all.first(where: { $0.id == name })
+        let widgetChanged = old == nil || old?.printState != printState || old?.filename != filename
+            || abs((old?.progress ?? 0) - progress) >= 0.01
         if let idx = all.firstIndex(where: { $0.id == name }) { all[idx] = entry } else { all.append(entry) }
         if let encoded = try? JSONEncoder().encode(all) {
             defaults.set(encoded, forKey: "w_all_printers")
@@ -2693,7 +2740,7 @@ class PrinterService: ObservableObject {
                 try? WCSession.default.updateApplicationContext(ctx)
             }
         }
-        if printState != previousPrintState { WidgetCenter.shared.reloadAllTimelines() }
+        if widgetChanged { WidgetCenter.shared.reloadAllTimelines() }
         var bgStates = (defaults.dictionary(forKey: "bg_prev_print_states") as? [String: String]) ?? [:]
         if bgStates[name] != printState { bgStates[name] = printState; defaults.set(bgStates, forKey: "bg_prev_print_states") }
 
@@ -2717,8 +2764,21 @@ class PrinterService: ObservableObject {
     func updateLiveActivity(prevState: String) {
         let state = PaxxMakerWidgetAttributes.ContentState(
             printState: printState, progress: progress,
-            extruderTemp: activeExtruderTemp, bedTemp: bedTemp, timeElapsed: printTimeElapsed
+            extruderTemp: activeExtruderTemp, bedTemp: bedTemp, timeElapsed: printTimeElapsed,
+            filename: filename.isEmpty ? nil : filename
         )
+        PaxxMakerWidgetAttributes.rememberFile(filename, printer: name)
+        // The print's thumbnail for the Live Activity (fetched once per file).
+        if !isDemoMode, !filename.isEmpty, printState == "printing" || printState == "paused" {
+            let (b, k, f, n) = (baseURL, apiKey, filename, name)
+            Task {
+                guard await LiveActivityThumb.ensure(baseURL: b, apiKey: k, filename: f, printer: n) else { return }
+                // Redraw the activity with the new image.
+                for act in Activity<PaxxMakerWidgetAttributes>.activities where act.attributes.printerName == n {
+                    await act.update(.init(state: act.content.state, staleDate: nil))
+                }
+            }
+        }
         if prevState != "printing" && printState == "printing" {
             if prevState != "paused" {
                 everOccupied = [Bool](repeating: false, count: 4)
@@ -3343,11 +3403,13 @@ struct ExtruderCard: View {
                         Text(nozzleLoaded ? String(format: "%.1f mm", nozzle) : "–")
                             .font(.caption2).fontWeight(.medium)
                             .foregroundColor(nozzleLoaded ? .secondary : .secondary.opacity(0.35))
-                        Spacer()
+                            .lineLimit(1).minimumScaleFactor(0.7)
+                        Spacer(minLength: 2)
                         if switchCount > 0 {
                             HStack(spacing: 2) {
                                 Image(systemName: "arrow.2.squarepath").font(.system(size: 9))
                                 Text("\(switchCount)×").font(.caption2).fontWeight(.medium)
+                                    .lineLimit(1).minimumScaleFactor(0.7)
                             }
                             .foregroundColor(.secondary.opacity(0.7))
                         }
@@ -3558,7 +3620,7 @@ struct SingleNozzleCombinedCard: View {
                         Image(systemName: "flame.fill").font(.system(size: 12)).foregroundColor(.orange)
                         Text("Extruder")
                             .font(.caption2).fontWeight(.semibold).foregroundColor(.secondary)
-                            .textCase(.uppercase).tracking(1).lineLimit(1)
+                            .textCase(.uppercase).tracking(1).lineLimit(1).minimumScaleFactor(0.7)
                         Circle().fill(statusColor).frame(width: 7, height: 7)
                             .shadow(color: statusColor.opacity(0.6), radius: 3)
                         Spacer(minLength: 0)
@@ -3576,6 +3638,9 @@ struct SingleNozzleCombinedCard: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            // Like the Heizbett tile: spare height between temperature and
+            // the bottom row, so both tiles keep their lines together.
+            .frame(maxHeight: .infinity, alignment: .top)
 
             // Filament chip + nozzle diameter.
             HStack(spacing: 8) {
@@ -3693,10 +3758,14 @@ private struct PreheatIdxBox: Identifiable { let id: Int }
 // A tile of tappable preheat presets. Tap = apply (nozzle + bed). Long-press a
 // preset → context menu → edit its material name and temperatures. Presets are
 // stored per printer.
-// Klipper's speed and flow factors (M220 / M221) as their own tile for
-// single-nozzle printers — the status tile hides them in its compact sizes.
+// Klipper's speed and flow factors (M220 / M221) as their own tile (every
+// printer) — they used to be the bottom row of the status tile.
 struct SpeedFlowTileView: View {
     @ObservedObject var printer: PrinterService
+    /// Narrow tile (half on a phone-wide page, or a third): Tempo above Flow.
+    /// Wider: both side by side in one row — the full-width tile used to stack
+    /// them with a preset row in between and came out far too tall.
+    var compact: Bool = false
     @AppStorage("app_language") private var appLanguage: String = "en"
     // Slider position while the finger is down; sent on release so the
     // printer isn't flooded with M220s on every pixel.
@@ -3704,24 +3773,58 @@ struct SpeedFlowTileView: View {
     @State private var flowDrag: Double? = nil
 
     private let speedPresets: [Int] = [50, 75, 100, 150, 200]
+    private let flowPresets: [Int] = [90, 95, 100, 105, 110]
+
+    /// Typing a value: which factor, and the text field's content.
+    private enum Entry: Identifiable { case speed, flow; var id: Self { self } }
+    @State private var entry: Entry? = nil
+    @State private var entryText = ""
+
+    private func applyEntry() {
+        guard let e = entry, let pct = Int(entryText.trimmingCharacters(in: .whitespaces)) else { return }
+        let v = Double(pct) / 100
+        switch e {
+        case .speed: printer.setSpeedFactor(min(max(v, 0.5), 3.0))
+        case .flow:  printer.setExtrudeFactor(min(max(v, 0.5), 1.5))
+        }
+    }
 
     @ViewBuilder
     private func factorRow(label: String, icon: String, color: Color, value: Double,
-                           range: ClosedRange<Double>, drag: Binding<Double?>,
+                           range: ClosedRange<Double>, step: Double, drag: Binding<Double?>, presets: [Int],
+                           entryKind: Entry,
                            set: @escaping (Double) -> Void) -> some View {
         VStack(spacing: 6) {
             HStack {
                 Image(systemName: icon).font(.system(size: 11, weight: .semibold)).foregroundColor(color)
                 Text(label).font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary)
-                Spacer()
-                Text("\(Int(((drag.wrappedValue ?? value) * 100).rounded())) %")
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                    .foregroundColor(.primary)
-                    .contentTransition(.numericText())
-                    .animation(.easeInOut(duration: 0.2), value: value)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                // Tap the value for the presets (they had a row of their own)
+                // or to type a value.
+                Menu {
+                    ForEach(presets, id: \.self) { p in
+                        Button("\(p) %") { haptic(.light); set(Double(p) / 100) }
+                    }
+                    Divider()
+                    Button {
+                        entryText = "\(Int((value * 100).rounded()))"
+                        entry = entryKind
+                    } label: {
+                        Label(lz(en: "Enter…", de: "Eingeben…", fr: "Saisir…", es: "Introducir…", pt: "Inserir…", it: "Inserisci…", zh: "输入…"), systemImage: "keyboard")
+                    }
+                } label: {
+                    Text("\(Int(((drag.wrappedValue ?? value) * 100).rounded())) %")
+                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .foregroundColor(.primary)
+                        .lineLimit(1).minimumScaleFactor(0.6)
+                        .contentTransition(.numericText())
+                        .animation(.easeInOut(duration: 0.2), value: value)
+                }
+                .buttonStyle(.plain)
             }
             HStack(spacing: 8) {
-                Button { haptic(.light); set(value - 0.05) } label: {
+                Button { haptic(.light); set(value - step) } label: {
                     Image(systemName: "minus.circle.fill").font(.system(size: 22)).foregroundColor(color)
                 }.buttonStyle(.plain)
                 Slider(value: Binding(get: { drag.wrappedValue ?? value },
@@ -3732,11 +3835,24 @@ struct SpeedFlowTileView: View {
                        })
                     .tint(color)
                     .animation(.easeInOut(duration: 0.2), value: value)
-                Button { haptic(.light); set(value + 0.05) } label: {
+                Button { haptic(.light); set(value + step) } label: {
                     Image(systemName: "plus.circle.fill").font(.system(size: 22)).foregroundColor(color)
                 }.buttonStyle(.plain)
             }
         }
+    }
+
+    private var speedRow: some View {
+        factorRow(label: lz(en: "Speed", de: "Tempo", fr: "Vitesse", es: "Veloc.", pt: "Veloc.", it: "Velocità", zh: "速度"),
+                  icon: "speedometer", color: .blue, value: printer.speedFactor,
+                  range: 0.5...2.0, step: 0.05, drag: $speedDrag, presets: speedPresets, entryKind: .speed) { printer.setSpeedFactor($0) }
+    }
+
+    private var flowRow: some View {
+        factorRow(label: lz(en: "Flow", de: "Flow", fr: "Débit", es: "Flujo", pt: "Fluxo", it: "Flusso", zh: "流量"),
+                  icon: "drop.fill", color: .teal, value: printer.extrudeFactor,
+                  // Flow is fine-tuned: 1 % per tap.
+                  range: 0.5...1.5, step: 0.01, drag: $flowDrag, presets: flowPresets, entryKind: .flow) { printer.setExtrudeFactor($0) }
     }
 
     var body: some View {
@@ -3745,32 +3861,30 @@ struct SpeedFlowTileView: View {
                 Text(lz(en: "Speed & Flow", de: "Tempo & Flow", fr: "Vitesse & Débit", es: "Velocidad y flujo", pt: "Velocidade e fluxo", it: "Velocità e flusso", zh: "速度与流量"))
                     .font(.caption).fontWeight(.semibold)
                     .foregroundColor(.secondary).textCase(.uppercase).tracking(1)
-
-                factorRow(label: lz(en: "Speed", de: "Geschwindigkeit", fr: "Vitesse", es: "Velocidad", pt: "Velocidade", it: "Velocità", zh: "速度"),
-                          icon: "speedometer", color: .blue, value: printer.speedFactor,
-                          range: 0.5...2.0, drag: $speedDrag) { printer.setSpeedFactor($0) }
-
-                // One-tap presets for the speed factor.
-                HStack(spacing: 6) {
-                    ForEach(speedPresets, id: \.self) { p in
-                        let active = Int((printer.speedFactor * 100).rounded()) == p
-                        Button { haptic(.light); printer.setSpeedFactor(Double(p) / 100) } label: {
-                            Text("\(p)%")
-                                .font(.system(size: 11, weight: .semibold))
-                                .frame(maxWidth: .infinity).padding(.vertical, 6)
-                                .background(RoundedRectangle(cornerRadius: 8)
-                                    .fill(active ? Color.blue.opacity(0.85) : Color.secondary.opacity(0.12)))
-                                .foregroundColor(active ? .white : .primary)
-                        }.buttonStyle(.plain)
+                if compact {
+                    speedRow.frame(maxHeight: .infinity)
+                    flowRow.frame(maxHeight: .infinity)
+                } else {
+                    HStack(alignment: .center, spacing: 14) {
+                        speedRow
+                        Divider().frame(height: 44)
+                        flowRow
                     }
+                    .frame(maxHeight: .infinity)
                 }
-
-                factorRow(label: lz(en: "Flow", de: "Flow", fr: "Débit", es: "Flujo", pt: "Fluxo", it: "Flusso", zh: "流量"),
-                          icon: "drop.fill", color: .teal, value: printer.extrudeFactor,
-                          range: 0.5...1.5, drag: $flowDrag) { printer.setExtrudeFactor($0) }
             }
         }
         .disabled(printer.isViaLiveActivity)
+        .alert(entry == .flow ? "Flow" : lz(en: "Speed", de: "Tempo", fr: "Vitesse", es: "Velocidad", pt: "Velocidade", it: "Velocità", zh: "速度"),
+               isPresented: Binding(get: { entry != nil }, set: { if !$0 { entry = nil } })) {
+            TextField("%", text: $entryText).keyboardType(.numberPad)
+            Button(lz(en: "Set", de: "Setzen", fr: "Définir", es: "Establecer", pt: "Definir", it: "Imposta", zh: "设置")) { applyEntry(); entry = nil }
+            Button(lz(en: "Cancel", de: "Abbrechen", fr: "Annuler", es: "Cancelar", pt: "Cancelar", it: "Annulla", zh: "取消"), role: .cancel) { entry = nil }
+        } message: {
+            Text(entry == .flow
+                 ? lz(en: "Flow in percent (50–150).", de: "Flow in Prozent (50–150).", fr: "Débit en pour cent (50–150).", es: "Flujo en porcentaje (50–150).", pt: "Fluxo em percentagem (50–150).", it: "Flusso in percentuale (50–150).", zh: "流量百分比（50–150）。")
+                 : lz(en: "Speed in percent (50–300).", de: "Tempo in Prozent (50–300).", fr: "Vitesse en pour cent (50–300).", es: "Velocidad en porcentaje (50–300).", pt: "Velocidade em percentagem (50–300).", it: "Velocità in percentuale (50–300).", zh: "速度百分比（50–300）。"))
+        }
     }
 }
 
@@ -3819,11 +3933,12 @@ struct PreheatTileView: View {
                 }
                 Text(value)
                     .font(.system(size: 20, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
+                    // White on the light pastel card was hard to read.
+                    .foregroundStyle(.primary)
                     .minimumScaleFactor(0.6).lineLimit(1)
                 Text(label)
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundColor(.white.opacity(0.55))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
                     .lineLimit(1).minimumScaleFactor(0.7)
             }
             .padding(10)
@@ -3881,6 +3996,7 @@ struct PreheatTileView: View {
                         coolPill
                     }
                 }
+                .frame(maxHeight: .infinity)
             }
         }
         .onAppear { load() }
@@ -4009,7 +4125,7 @@ struct TempSparklineView: View {
 
 // MARK: - Dashboard Tile
 enum DashboardTile: String, CaseIterable, Identifiable {
-    case webcam, webcam2, status, screen, extruder, bed, chamber, preheat, filament, spools, cleaning, calibration, stats, smartPlug, activeSpool, energyCost, speed
+    case webcam, webcam2, status, screen, extruder, bed, chamber, preheat, filament, spools, cleaning, calibration, stats, smartPlug, activeSpool, energyCost, speed, hardware
     var id: String { rawValue }
     var label: String {
         switch self {
@@ -4030,6 +4146,7 @@ enum DashboardTile: String, CaseIterable, Identifiable {
         case .activeSpool: return lz(en: "Active Spool", de: "Aktive Spule", fr: "Bobine active", es: "Bobina activa", pt: "Bobina ativa", it: "Bobina attiva", zh: "当前料盘")
         case .energyCost: return lz(en: "Last Print Cost", de: "Kosten letzter Druck", fr: "Coût dernière impression", es: "Coste última impresión", pt: "Custo da última impressão", it: "Costo ultima stampa", zh: "上次打印费用")
         case .speed: return lz(en: "Speed & Flow", de: "Tempo & Flow", fr: "Vitesse & Débit", es: "Velocidad y flujo", pt: "Velocidade e fluxo", it: "Velocità e flusso", zh: "速度与流量")
+        case .hardware: return lz(en: "Steppers & Electronics", de: "Stepper & Elektronik", fr: "Moteurs pas à pas & Électronique", es: "Motores paso a paso y electrónica", pt: "Motores de passo e eletrônica", it: "Motori passo-passo ed elettronica", zh: "步进电机与电子")
         }
     }
     var icon: String {
@@ -4051,6 +4168,7 @@ enum DashboardTile: String, CaseIterable, Identifiable {
         case .activeSpool: return "smallcircle.filled.circle"
         case .energyCost: return "eurosign.circle.fill"
         case .speed: return "speedometer"
+        case .hardware: return "thermometer.medium"
         }
     }
 }
@@ -4067,7 +4185,7 @@ struct TileEditorView: View {
     private static func staticItems(for printerType: PrinterConfig.PrinterType) -> [DashboardItem] {
         let singleNozzleHidden: Set<DashboardTile> = [.screen, .filament, .spools, .cleaning]
         return DashboardTile.allCases
-            .filter { printerType == .singleNozzle ? !singleNozzleHidden.contains($0) : ($0 != .cleaning && $0 != .speed) }
+            .filter { printerType == .singleNozzle ? !singleNozzleHidden.contains($0) : $0 != .cleaning }
             .map { .tile($0) }
     }
 
@@ -4285,8 +4403,9 @@ private struct ConfirmableButton: View {
                 Text(label)
                     .font(.system(size: 10, weight: .semibold))
                     .multilineTextAlignment(.center)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.65)
+                    // Two lines: "Reinigen + Poop entsorgen" was cut off on one.
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.8)
             }
             .foregroundColor(.white)
             .frame(maxWidth: .infinity, minHeight: 44)
@@ -4342,24 +4461,122 @@ struct DashboardView: View {
     @AppStorage("splitscreen_mode") private var splitscreenMode: Bool = false
     @AppStorage("current_splitscreen_count") private var storedSplitscreenCount: Int = 1
     @State private var isLandscape: Bool = false
+    /// Width of this printer's page. Two printers side by side (open iPhone
+    /// Duo, iPad split) leave each page about as wide as an iPhone, and the
+    /// tiles there follow the iPhone rules instead of getting squeezed.
+    @State private var pageWidth: CGFloat = 0
+    /// iPhone Duo: open it has its own tile layout (a second set of saved
+    /// widths/order), closed it uses the phone one — so neither spoils the other.
+    @ObservedObject private var duo = DuoState.shared
+    /// Wide enough for tiles side by side: iPad, or an open iPhone Duo.
+    private var wideLayout: Bool { horizontalSizeClass == .regular || duo.isOpen }
 
-    private static let defaultTileOrder     = "webcam,status,screen,extruder,bed,chamber,preheat,spools,filament,calibration,cleaning,stats"
+    /// Closed iPhone Duo: how far the bar buttons move right. The bar keeps
+    /// the tab-bar column's width (the same as the system's side inset) as its
+    /// own inset once more; the page content already reaches past it.
+    /// Where the bar buttons end now (global x), and where the page content
+    /// ends — the buttons move over by the difference.
+    @State private var barButtonsMaxX: CGFloat = 0
+    private var duoBarShift: CGFloat {
+        let win = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first
+        guard let win, barButtonsMaxX > 0 else { return 0 }
+        var contentEnd = win.bounds.width - win.safeAreaInsets.right - 16
+        // Two printers side by side: the left page ends at its own edge, not
+        // the window's — measured against the window its buttons slid over
+        // onto the right page and vanished there.
+        if dashFrame.width > 0 { contentEnd = min(contentEnd, dashFrame.maxX - 16) }
+        return max(0, contentEnd - barButtonsMaxX)
+    }
+
+
+    /// Input lock and edit/done — in the bar's trailing group.
+    @ViewBuilder private var barButtons: some View {
+        // Input lock: closed = the control tiles and the printer screen
+        // take no touches, so nothing gets sent by accident. Sits next
+        // to the settings button, well away from the emergency stop.
+        Button {
+            haptic(printer.inputLocked ? .light : .medium)
+            withAnimation(.easeInOut(duration: 0.2)) { printer.inputLocked.toggle() }
+        } label: {
+            Image(systemName: printer.inputLocked ? "lock.fill" : "lock.open")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(printer.inputLocked ? .orange : .primary)
+        }
+        .accessibilityLabel(printer.inputLocked
+            ? lz(en: "Unlock input", de: "Eingabe entsperren", fr: "Déverrouiller la saisie", es: "Desbloquear entrada", pt: "Desbloquear entrada", it: "Sblocca input", zh: "解锁输入")
+            : lz(en: "Lock input", de: "Eingabe sperren", fr: "Verrouiller la saisie", es: "Bloquear entrada", pt: "Bloquear entrada", it: "Blocca input", zh: "锁定输入"))
+        if isEditMode {
+            Button(lz(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo", pt: "Concluído", it: "Fatto", zh: "完成")) {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { isEditMode = false }
+            }
+            .fontWeight(.semibold)
+        } else {
+            Button(action: { withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { isEditMode = true } }) {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 18, weight: .semibold))
+            }
+        }
+    }
+    /// Where the pinned webcam starts (global y) — tabletop mode.
+    @State private var tabletopTop: CGFloat = 0
+    /// The dashboard's frame on screen — to line columns up with the fold.
+    @State private var dashFrame: CGRect = .zero
+    /// iPhone Duo half open like a book (fold down the middle): the widths of
+    /// a two-column row's left and right tile, so the gap sits on the fold.
+    private var bookColumns: (left: CGFloat, right: CGFloat, gap: CGFloat)? {
+        guard duo.book, !isEditMode, let fold = duo.fold, dashFrame.width > 0 else { return nil }
+        let l = fold.minX - 8 - (dashFrame.minX + 16)
+        let r = (dashFrame.maxX - 16) - (fold.maxX + 8)
+        guard l > 200, r > 200 else { return nil }
+        return (l, r, fold.width + 16)
+    }
+    /// iPhone Duo half open, lying like a laptop (fold across): the webcam on
+    /// the upright half, the controls on the flat half below the fold.
+    /// The webcam's height up to the fold, or nil when not in that pose.
+    private var tabletopCamHeight: CGFloat? {
+        guard duo.tabletop, !isEditMode, let fold = duo.fold,
+              tileOrder.contains(where: { $0.rawID == DashboardTile.webcam.rawValue }) else { return nil }
+        let h = fold.minY - max(tabletopTop, 1) - 10
+        return h > 120 ? h : nil
+    }
+
+    private static let defaultTileOrder     = "webcam,status,hardware,speed,screen,extruder,bed,chamber,preheat,spools,filament,calibration,cleaning,stats"
     private static let defaultHalfWidth     = "filament,calibration"
-    // iPad default: spools next to extruder, calibration+cleaning side-by-side
-    private static let defaultTileOrderIPad = "webcam,status,screen,extruder,spools,bed,chamber,preheat,filament,calibration,cleaning,stats"
-    private static let defaultHalfWidthIPad = "extruder,spools,calibration,cleaning"
-    // Single-nozzle default: Extruder|Heizbett, Vorheizen|Statistiken,
-    // Kalibrierung|Aktive Spule — all half-width pairs.
-    private static let defaultTileOrderSN   = "webcam,status,extruder,bed,preheat,stats,calibration,activeSpool"
-    private static let defaultHalfWidthSN   = "extruder,bed,preheat,stats,calibration,activeSpool"
+    // Single-nozzle default: Elektronik|Tempo & Flow, Extruder|Heizbett,
+    // Vorheizen|Statistiken, Kalibrierung|Aktive Spule — all half-width pairs.
+    private static let defaultTileOrderSN   = "webcam,status,hardware,speed,extruder,bed,preheat,stats,calibration,activeSpool"
+    private static let defaultHalfWidthSN   = "hardware,speed,extruder,bed,preheat,stats,calibration,activeSpool"
+    // Two cameras on a U1 (arranged on the open iPhone Duo, 2026-11-10): both
+    // cameras and the printer screen on top, the status beside the screen,
+    // the small tiles in rows of three, the extruder card full width last.
+    private static let defaultTileOrderTwoCams      = "webcam,webcam2,screen,status,hardware,activeSpool,speed,spools,bed,chamber,stats,filament,calibration,extruder,cg_default"
+    private static let defaultHalfWidthTwoCamsWide  = "webcam,webcam2,screen,status,filament,calibration"
+    private static let defaultThirdWidthTwoCamsWide = "hardware,speed,bed,activeSpool,spools,chamber"
+    // The same on a phone (no thirds there, the status always full width):
+    // the cameras side by side, the printer screen full width (beside the
+    // status it would stand alone), the small tiles in pairs.
+    private static let defaultHalfWidthTwoCamsPhone = "webcam,webcam2,hardware,activeSpool,speed,spools,bed,chamber,filament,calibration"
+    // One camera on a U1: the same arrangement without the second camera —
+    // camera and printer screen side by side on top, the status full width
+    // below them (alone in its row it gets the width).
+    private static let defaultTileOrderOneCam      = "webcam,screen,status,hardware,activeSpool,speed,spools,bed,chamber,stats,filament,calibration,extruder,cg_default"
+    private static let defaultHalfWidthOneCamWide  = "webcam,screen,activeSpool,speed,filament,calibration"
+    // Wide (iPad / open Duo): tiles of a similar height share a row, so none
+    // is stretched — motors, bed and chamber in thirds (the bed and chamber
+    // stood empty beside the tall spool tile), active spool and speed in
+    // halves, the spools full width (four in a row, short).
+    private static let defaultTileOrderOneCamWide  = "webcam,screen,status,hardware,bed,chamber,activeSpool,speed,spools,stats,filament,calibration,extruder,cg_default"
+    private static let defaultThirdWidthOneCamWide = "hardware,bed,chamber"
+    private static let defaultHalfWidthOneCamPhone = "webcam,screen,hardware,activeSpool,speed,spools,bed,chamber,filament,calibration"
+    // Two cameras on a single-nozzle printer: the second beside the first.
+    private static let defaultTileOrderSNTwoCams    = "webcam,webcam2,status,hardware,speed,extruder,bed,preheat,stats,calibration,activeSpool"
+    private static let defaultHalfWidthSNTwoCams    = "webcam,webcam2,hardware,speed,extruder,bed,preheat,stats,calibration,activeSpool"
     @State private var showEmergencyConfirm = false
     @State private var showPauseConfirm = false
     @State private var showResumeConfirm = false
     @State private var showCancelConfirm = false
     @State private var showBedTempInput = false
     @State private var bedTempInput = ""
-
-    @State private var statusTileSize: Int = 0   // 0=full  1=no motor temps  2=no speed/flow either
 
     @State private var tileOrderString: String = DashboardView.defaultTileOrder
     @State private var hiddenTilesString: String = ""
@@ -4413,7 +4630,6 @@ struct DashboardView: View {
                 if t == .smartPlug  { return !printer.smartPlugIP.isEmpty }
                 if t == .activeSpool { return printer.spoolmanAvailable }
                 if t == .energyCost { return printer.energyTrackingEnabled }
-                if t == .speed { return printer.printerType == .singleNozzle }
                 return true
             }
     }
@@ -4427,7 +4643,7 @@ struct DashboardView: View {
             if t == .activeSpool { return printer.spoolmanAvailable }
             if t == .energyCost { return printer.energyTrackingEnabled }
             if t == .preheat { return printer.printerType == .singleNozzle }
-            if t == .speed { return printer.printerType == .singleNozzle }
+            if t == .speed { return true }
             return printer.printerType == .singleNozzle ? !snExcluded.contains(t) : t != .cleaning
         }
         let parts = tileOrderString.split(separator: ",").map { String($0) }
@@ -4568,7 +4784,11 @@ struct DashboardView: View {
 
     // Max allowed width state (0=full only, 1=full/half, 2=full/half/third) per context
     func maxWidthState(for item: DashboardItem) -> Int {
-        let isIPad = horizontalSizeClass == .regular
+        // Page narrower than ~540 pt of content (iPhone width): iPhone rules.
+        // Thirds would be ~120 pt and a half U1 extruder ~190 pt there —
+        // labels broke letter by letter.
+        let narrowPage = pageWidth > 0 && pageWidth - 32 < 540
+        let isIPad = wideLayout && !narrowPage
         guard isIPad else {
             // iPhone: status always locked full; extruder only for the U1
             // (multi-nozzle card is wide) — single-nozzle extruder is compact
@@ -4606,11 +4826,34 @@ struct DashboardView: View {
         }
     }
 
+    /// The narrowest a tile may get: the U1's two-head extruder card needs
+    /// room for both heads side by side, everything else a sensible minimum.
+    private func minCellWidth(for item: DashboardItem) -> CGFloat {
+        if item.rawID == DashboardTile.extruder.rawValue && printer.printerType == .snapmakerU1 { return 300 }
+        // 150: a half tile on the smallest iPhones (~165 pt) stays half.
+        return 150
+    }
+
+    /// Width a tile would get as half (1) or third (2) of this page.
+    private func cellWidth(state: Int) -> CGFloat {
+        let content = pageWidth - 32
+        let n: CGFloat = state == 2 ? 3 : (state == 1 ? 2 : 1)
+        return (content - 12 * (n - 1)) / n
+    }
+
     // Actual display state: stored preference clamped to what the current context allows
     func effectiveWidthState(for item: DashboardItem) -> Int {
         if item.rawID.hasPrefix("__sp_t_") { return 2 }  // third-width spacer
         if item.isSpacerItem { return 1 }                 // half-width spacer
-        return min(tileWidthState(item), maxWidthState(for: item))
+        var state = min(tileWidthState(item), maxWidthState(for: item))
+        // And never narrower than the tile can be laid out — measured on this
+        // page, whatever the device and pose (the extruder as a third of the
+        // upright Duo broke "No filament" letter by letter).
+        if pageWidth > 0 {
+            let minW = minCellWidth(for: item)
+            while state > 0 && cellWidth(state: state) < minW { state -= 1 }
+        }
+        return state
     }
 
     // Cycles full → half → (third if allowed) → full
@@ -4621,35 +4864,7 @@ struct DashboardView: View {
 
     // Groups tiles into rows using a 6-unit bin: full=6, half=3, third=2.
     // Mixed half+third tiles on the same row are allowed as long as total ≤ 6.
-    /// Normal (non-edit) view: no holes. Spacers are dropped and a row with
-    /// room left pulls the next tile that fits up into it, so hiding a tile
-    /// in the middle never leaves an empty column with the rest starting a
-    /// row lower. Edit mode keeps the literal order (spacers included) so
-    /// dragging stays predictable.
-    func packedRows(from items: [DashboardItem]) -> [[DashboardItem]] {
-        func units(_ item: DashboardItem) -> Int {
-            switch effectiveWidthState(for: item) { case 2: return 2; case 1: return 3; default: return 6 }
-        }
-        var pending = items.filter { !$0.isSpacerItem }
-        var rows: [[DashboardItem]] = []
-        while !pending.isEmpty {
-            let first = pending.removeFirst()
-            var row = [first]
-            var remaining = 6 - units(first)
-            var i = 0
-            while remaining > 0, i < pending.count {
-                if units(pending[i]) <= remaining {
-                    remaining -= units(pending[i])
-                    row.append(pending.remove(at: i))
-                } else {
-                    i += 1
-                }
-            }
-            rows.append(row)
-        }
-        return rows
-    }
-
+    // Literal order, spacers included — used for edit mode and normal view alike.
     func tileRows(from items: [DashboardItem]) -> [[DashboardItem]] {
         func unitCount(_ item: DashboardItem) -> Int {
             switch effectiveWidthState(for: item) {
@@ -4687,23 +4902,86 @@ struct DashboardView: View {
         return rows
     }
 
-    private func lKey(_ base: String) -> String { "\(base)_\(printerID)" }
+    private func lKey(_ base: String) -> String { duo.isOpen ? "\(base)_duo_\(printerID)" : "\(base)_\(printerID)" }
 
     func loadLayout() {
         let ud = UserDefaults.standard
-        let iPad = horizontalSizeClass == .regular
+        let iPad = wideLayout
         let sn = printer.printerType == .singleNozzle
-        tileOrderString = ud.string(forKey: lKey("dashboard_tile_order"))
-            ?? (sn ? DashboardView.defaultTileOrderSN : (iPad ? DashboardView.defaultTileOrderIPad : DashboardView.defaultTileOrder))
-        hiddenTilesString = ud.string(forKey: lKey("hidden_tiles")) ?? ""
+        // An open Duo without a layout of its own starts from the phone's
+        // order and hidden tiles (only the widths differ).
+        func phone(_ base: String) -> String? { duo.isOpen ? ud.string(forKey: "\(base)_\(printerID)") : nil }
+        // Two cameras connected: their own default arrangement.
+        let twoCams = printer.webcamConfigured && printer.webcam2StreamURL != nil
+        let defaultOrder = twoCams
+            ? (sn ? DashboardView.defaultTileOrderSNTwoCams : DashboardView.defaultTileOrderTwoCams)
+            : (sn ? DashboardView.defaultTileOrderSN
+                  : (iPad ? DashboardView.defaultTileOrderOneCamWide : DashboardView.defaultTileOrderOneCam))
+        tileOrderString = ud.string(forKey: lKey("dashboard_tile_order")) ?? phone("dashboard_tile_order") ?? defaultOrder
+        // The motor tile (split off the status tile): into a saved layout once,
+        // right below the status tile — appended it would land at the very end.
+        if !tileOrderString.contains(DashboardTile.hardware.rawValue),
+           !ud.bool(forKey: lKey("hardware_tile_added")) {
+            var parts = tileOrderString.split(separator: ",").map(String.init)
+            if let i = parts.firstIndex(of: DashboardTile.status.rawValue) {
+                parts.insert(DashboardTile.hardware.rawValue, at: i + 1)
+                tileOrderString = parts.joined(separator: ",")
+                ud.set(tileOrderString, forKey: lKey("dashboard_tile_order"))
+            }
+            ud.set(true, forKey: lKey("hardware_tile_added"))
+        }
+        hiddenTilesString = ud.string(forKey: lKey("hidden_tiles")) ?? phone("hidden_tiles") ?? ""
         tileGridModeString = ud.string(forKey: lKey("tile_grid_mode")) ?? ""
-        halfWidthString = ud.string(forKey: lKey("tile_half_width"))
-            ?? (sn ? DashboardView.defaultHalfWidthSN : (iPad ? DashboardView.defaultHalfWidthIPad : DashboardView.defaultHalfWidth))
-        thirdWidthString = ud.string(forKey: lKey("tile_third_width")) ?? ""
-        // Restore the status tile's saved height (0=full … 2=compact). Stored per
-        // printer like the widths; without this it reset to full on every launch.
-        if ud.object(forKey: lKey("status_tile_size")) != nil {
-            statusTileSize = ud.integer(forKey: lKey("status_tile_size"))
+        let defaultHalf: String
+        var defaultThird = ""
+        if twoCams && sn {
+            defaultHalf = DashboardView.defaultHalfWidthSNTwoCams
+        } else if twoCams {
+            defaultHalf = iPad ? DashboardView.defaultHalfWidthTwoCamsWide : DashboardView.defaultHalfWidthTwoCamsPhone
+            if iPad { defaultThird = DashboardView.defaultThirdWidthTwoCamsWide }
+        } else if sn {
+            defaultHalf = DashboardView.defaultHalfWidthSN
+        } else {
+            var half = iPad ? DashboardView.defaultHalfWidthOneCamWide : DashboardView.defaultHalfWidthOneCamPhone
+            // No camera at all: the printer screen alone on top, full width.
+            if !printer.webcamConfigured {
+                half = half.split(separator: ",").filter { $0 != "webcam" && $0 != "screen" }.joined(separator: ",")
+            }
+            defaultHalf = half
+            if iPad { defaultThird = DashboardView.defaultThirdWidthOneCamWide }
+        }
+        let halfStr = ud.string(forKey: lKey("tile_half_width")) ?? defaultHalf
+        let thirdStr = ud.string(forKey: lKey("tile_third_width")) ?? defaultThird
+        halfWidthString = halfStr
+        thirdWidthString = thirdStr
+        // Speed & Flow left the status tile and is a tile of its own (also on
+        // the U1 now): once into every saved layout, full width right below
+        // the status tile, where those controls used to be. A half-width
+        // status keeps its partner — the new tile goes after that pair, so no
+        // existing pair is split (gaps stay in place now).
+        // Also shown, in case it had been hidden while the status tile still
+        // carried the same controls.
+        if !ud.bool(forKey: lKey("speed_tile_added")) {
+            var parts = tileOrderString.split(separator: ",").map(String.init)
+            if !parts.contains(DashboardTile.speed.rawValue),
+               let i = parts.firstIndex(of: DashboardTile.status.rawValue) {
+                let narrow = Set((halfStr + "," + thirdStr).split(separator: ",").map(String.init))
+                var at = i + 1
+                // (On a phone the status tile is always full width.)
+                if iPad && narrow.contains(DashboardTile.status.rawValue) {
+                    while at < parts.count, narrow.contains(parts[at]) || parts[at].hasPrefix("__sp_") { at += 1 }
+                }
+                parts.insert(DashboardTile.speed.rawValue, at: min(at, parts.count))
+                tileOrderString = parts.joined(separator: ",")
+                ud.set(tileOrderString, forKey: lKey("dashboard_tile_order"))
+            }
+            var hidden = hiddenTilesString.split(separator: ",").map(String.init)
+            if hidden.contains(DashboardTile.speed.rawValue) {
+                hidden.removeAll { $0 == DashboardTile.speed.rawValue }
+                hiddenTilesString = hidden.joined(separator: ",")
+                ud.set(hiddenTilesString, forKey: lKey("hidden_tiles"))
+            }
+            ud.set(true, forKey: lKey("speed_tile_added"))
         }
     }
 
@@ -4761,10 +5039,37 @@ struct DashboardView: View {
     private func mixedRow(_ row: [DashboardItem], eWSes: [Int], rowIndex: Int) -> some View {
         let totalUnits = eWSes.reduce(0) { $0 + gridSpan($1) }
         let remainingUnits = 6 - totalUnits
+        if pageWidth > 0 {
+            // Widths worked out from the page (6 units, 12 pt gaps): a Grid
+            // sized its columns by their content — a picture tile came out
+            // narrower than its third and sat indented.
+            let unit = (pageWidth - 32 - 12 * 5) / 6
+            let width: (Int) -> CGFloat = { span in unit * CGFloat(span) + 12 * CGFloat(span - 1) }
+            HStack(alignment: .top, spacing: 12) {
+                ForEach(row) { tile in
+                    tileCell(for: tile)
+                        .frame(width: width(gridSpan(effectiveWidthState(for: tile))))
+                        .frame(maxHeight: .infinity)
+                }
+                if remainingUnits > 0 {
+                    emptySlotDropZone(
+                        slotID: "__slot_mixed_\(row.last?.rawID ?? "")_\(rowIndex)",
+                        anchorID: row.last?.rawID ?? ""
+                    )
+                    .frame(width: width(remainingUnits))
+                    .frame(maxHeight: .infinity)
+                }
+            }
+            // One height for the row: the tallest tile's.
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+        } else {
         Grid(horizontalSpacing: 12, verticalSpacing: 0) {
             GridRow {
                 ForEach(row) { tile in
                     tileCell(for: tile)
+                        .frame(maxHeight: .infinity)
                         .gridCellColumns(gridSpan(effectiveWidthState(for: tile)))
                 }
                 if remainingUnits > 0 {
@@ -4776,22 +5081,48 @@ struct DashboardView: View {
                 }
             }
         }
+        // One height for the row: the tallest tile's.
+        .fixedSize(horizontal: false, vertical: true)
         .padding(.horizontal, 16)
+        }
     }
 
     @ViewBuilder
     private func uniformRow(_ row: [DashboardItem], eWSes: [Int], rowIndex: Int) -> some View {
         let ews0 = eWSes.first ?? 0
         let colCount = ews0 == 2 ? 3 : (ews0 == 1 ? 2 : 1)
+        if colCount == 2, let b = bookColumns {
+            // Book pose: one tile on each half, none across the fold. The two
+            // halves differ (the camera strip takes from one): pictures
+            // (webcam, printer screen) scale, so they go to the narrower half
+            // and the controls get the room.
+            let media: Set<String> = [DashboardTile.webcam.rawValue, DashboardTile.screen.rawValue]
+            let swap = row.count > 1 && (media.contains(row[0].rawID) != media.contains(row[1].rawID))
+                && (media.contains(row[0].rawID) == (b.left > b.right))
+            let first = swap ? row[1] : row[0]
+            let second: DashboardItem? = row.count > 1 ? (swap ? row[0] : row[1]) : nil
+            HStack(alignment: .top, spacing: 0) {
+                tileCell(for: first).frame(width: b.left).frame(maxHeight: .infinity)
+                Spacer(minLength: b.gap)
+                if let second { tileCell(for: second).frame(width: b.right).frame(maxHeight: .infinity) }
+                else { Color.clear.frame(width: b.right, height: 1) }
+            }
+            // Both halves as tall as the taller tile.
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 16)
+        } else {
+        let cols = colCount
         LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: colCount),
+            // Tiles in a row share its height (the grid proposes it); each
+            // tile fills it.
+            columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: cols),
             spacing: 0
         ) {
             ForEach(row) { tile in
                 tileCell(for: tile)
             }
-            if colCount > row.count {
-                ForEach(0..<(colCount - row.count), id: \.self) { slotIdx in
+            if cols > row.count {
+                ForEach(0..<(cols - row.count), id: \.self) { slotIdx in
                     emptySlotDropZone(
                         slotID: "__slot_\(row.last?.rawID ?? "")_\(rowIndex)_\(slotIdx)",
                         anchorID: row.last?.rawID ?? ""
@@ -4800,6 +5131,7 @@ struct DashboardView: View {
             }
         }
         .padding(.horizontal, 16)
+        }
     }
 
     var body: some View {
@@ -4846,7 +5178,20 @@ struct DashboardView: View {
                         .padding(.horizontal, 16)
                         .transition(.move(edge: .top).combined(with: .opacity))
                     }
-                    let rows = isEditMode ? tileRows(from: allTileItems) : packedRows(from: tileOrder)
+                    // Normal view = the edit-mode arrangement: same order, same
+                    // rows, deliberate gaps (spacers / empty slots) stay empty.
+                    // Packing tiles into gaps made them jump after "Done".
+                    // Same item list as edit mode, minus hidden tiles (tileOrder
+                    // also carried tiles that render nothing on this printer,
+                    // e.g. Preheat on the U1 — they'd hold an invisible slot).
+                    let shown = allTileItems.filter {
+                        !dashHiddenSet.contains($0.rawID)
+                            && !(tabletopCamHeight != nil && $0.rawID == DashboardTile.webcam.rawValue)
+                    }
+                    let rows = tileRows(from: isEditMode ? allTileItems : shown)
+                    // Rows everywhere (also on the open iPhone Duo): tiles side by
+                    // side share one height and fill it — staggered columns of
+                    // tall and flat tiles looked restless.
                     ForEach(0..<rows.count, id: \.self) { rowIndex in
                         dashboardRow(rows[rowIndex], rowIndex: rowIndex)
                     }
@@ -4870,6 +5215,28 @@ struct DashboardView: View {
                 )
             }
             .coordinateSpace(name: "dashScroll")
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { if duo.isFoldable { dashFrame = $0 } }
+            // Tabletop (iPhone Duo): the webcam stays on the upright half, the
+            // tiles scroll on the flat half below the fold.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if duo.tabletop, let fold = duo.fold, let h = tabletopCamHeight {
+                    VStack(spacing: 0) {
+                        staticTileView(for: .webcam)
+                            .frame(maxWidth: .infinity, maxHeight: h)
+                            .frame(height: h)
+                            .padding(.horizontal, 16)
+                        Color.clear.frame(height: fold.height + 18)
+                    }
+                    .padding(.top, 8)
+                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: { tabletopTop = $0 + 8 }
+                    .transition(.opacity)
+                } else if duo.tabletop {
+                    // Measure where the inset would start before the first layout.
+                    Color.clear.frame(height: 0)
+                        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: { tabletopTop = $0 + 8 }
+                }
+            }
+            .animation(.easeInOut(duration: 0.25), value: duo.tabletop)
             .scrollContentBackground(.hidden)
             .background(Color.clear)
             .refreshable {
@@ -4893,8 +5260,24 @@ struct DashboardView: View {
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: printer.printState)
         .ignoresSafeArea(edges: .top)
         .onAppear { loadLayout() }
+        .onReceive(NotificationCenter.default.publisher(for: .paxxLayoutReset)) { note in
+            if (note.object as? String) == printerID { loadLayout() }
+        }
+        // The second camera is found a moment after the first start (Moonraker
+        // lists it): a layout still at its default switches to the two-camera
+        // one. A layout of one's own is left alone.
+        .onChange(of: (printer.webcamConfigured ? 1 : 0) + (printer.webcam2StreamURL != nil ? 2 : 0)) { _, _ in
+            let ud = UserDefaults.standard
+            guard ud.string(forKey: lKey("dashboard_tile_order")) == nil,
+                  ud.string(forKey: lKey("tile_half_width")) == nil,
+                  ud.string(forKey: lKey("tile_third_width")) == nil else { return }
+            loadLayout()
+        }
+        // iPhone Duo folded or unfolded: the other saved layout.
+        .onChange(of: duo.isOpen) { _, _ in isEditMode = false; loadLayout() }
         .onDisappear { isEditMode = false }
         .onGeometryChange(for: Bool.self) { $0.size.width > $0.size.height } action: { isLandscape = $0 }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width.rounded() } action: { pageWidth = $0 }
         .toolbar {
             // Hide the emergency stop away from home (status via Live Activity,
             // LAN unreachable) — the command couldn't reach the printer anyway.
@@ -4910,32 +5293,32 @@ struct DashboardView: View {
                     }
                 }
             }
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                // Input lock: closed = the control tiles and the printer screen
-                // take no touches, so nothing gets sent by accident. Sits next
-                // to the settings button, well away from the emergency stop.
-                Button {
-                    haptic(printer.inputLocked ? .light : .medium)
-                    withAnimation(.easeInOut(duration: 0.2)) { printer.inputLocked.toggle() }
-                } label: {
-                    Image(systemName: printer.inputLocked ? "lock.fill" : "lock.open")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundColor(printer.inputLocked ? .orange : .primary)
+            if #available(iOS 26.0, *), DuoCoverInsets.coverSide == .trailing {
+                // Closed iPhone Duo: the bar keeps an inset for the tab-bar
+                // column, which left these buttons in the middle of the bar.
+                // Drawn with their own glass and moved over to the right edge.
+                ToolbarItem(placement: .topBarTrailing) {
+                    HStack(spacing: 18) { barButtons }
+                        .padding(.horizontal, 14).padding(.vertical, 9)
+                        .glassEffect(.regular.interactive(), in: .capsule)
+                        .offset(x: duoBarShift)
+                        // Measured on a background outside the offset, so the
+                        // shift never feeds back into the measurement (that
+                        // made the layout flip back and forth endlessly).
+                        .background {
+                            Color.clear
+                                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxX } action: { v in
+                                    if abs(v - barButtonsMaxX) > 1 { barButtonsMaxX = v }
+                                }
+                                // The page-centred printer name keeps clear of it.
+                                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { w in
+                                    DuoBarMetrics.shared.setTrailingWidth(w, for: printer)
+                                }
+                        }
                 }
-                .accessibilityLabel(printer.inputLocked
-                    ? lz(en: "Unlock input", de: "Eingabe entsperren", fr: "Déverrouiller la saisie", es: "Desbloquear entrada", pt: "Desbloquear entrada", it: "Sblocca input", zh: "解锁输入")
-                    : lz(en: "Lock input", de: "Eingabe sperren", fr: "Verrouiller la saisie", es: "Bloquear entrada", pt: "Bloquear entrada", it: "Blocca input", zh: "锁定输入"))
-                if isEditMode {
-                    Button(lz(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo", pt: "Concluído", it: "Fatto", zh: "完成")) {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { isEditMode = false }
-                    }
-                    .fontWeight(.semibold)
-                } else {
-                    Button(action: { withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { isEditMode = true } }) {
-                        Image(systemName: "ellipsis.circle")
-                            .font(.system(size: 18, weight: .semibold))
-                    }
-                }
+                .sharedBackgroundVisibility(.hidden)
+            } else {
+                ToolbarItemGroup(placement: .topBarTrailing) { barButtons }
             }
         }
         .alert(lz(en: "Emergency Stop?", de: "Notfall Stop?", fr: "Arrêt d'urgence ?", es: "¿Parada de emergencia?", pt: "Parada de Emergência?", it: "Arresto di emergenza?", zh: "紧急停止？"), isPresented: $showEmergencyConfirm) {
@@ -5026,12 +5409,41 @@ struct DashboardView: View {
         } else if let tile = item.asStaticTile {
             if tile == .screen {
                 // Keeps mirroring the real display, just takes no touches.
-                staticTileView(for: tile).allowsHitTesting(!locked)
+                mediaCell(tile, staticTileView(for: tile)).allowsHitTesting(!locked)
+            } else if tile == .webcam || tile == .webcam2 {
+                mediaCell(tile, staticTileView(for: tile))
             } else if Self.lockableTiles.contains(tile) {
                 staticTileView(for: tile).disabled(locked).opacity(locked ? 0.6 : 1)
             } else {
                 staticTileView(for: tile)
             }
+        }
+    }
+
+    /// Webcam / printer screen keep their picture's aspect ratio. Next to a
+    /// taller tile they sit centred on a card of the row's height, so the
+    /// row's edges stay in line instead of the picture ending half way.
+    @ViewBuilder
+    private func mediaCell<V: View>(_ tile: DashboardTile, _ view: V) -> some View {
+        let present: Bool = {
+            switch tile {
+            case .screen: return printer.printerType != .singleNozzle
+            case .webcam2: return printer.webcam2StreamURL != nil
+            default: return true
+            }
+        }()
+        if present {
+            view
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 16).fill(.thinMaterial)
+                        RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.06))
+                        RoundedRectangle(cornerRadius: 16).strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
+                    }
+                }
+        } else {
+            view
         }
     }
 
@@ -5185,34 +5597,6 @@ struct DashboardView: View {
             }
             } // end resize handle
 
-            // Height cycle button — only for the status tile
-            if item.rawID == DashboardTile.status.rawValue {
-            VStack(spacing: 0) {
-                Spacer()
-                HStack(spacing: 0) {
-                    let heightIcon = statusTileSize == 0 ? "chevron.up" : statusTileSize == 1 ? "chevron.up" : "chevron.down"
-                    let heightColor: Color = statusTileSize == 0 ? Color.black.opacity(0.55)
-                                          : statusTileSize == 1 ? Color.blue.opacity(0.8)
-                                          : Color.red.opacity(0.8)
-                    Image(systemName: heightIcon)
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(.white)
-                        .frame(width: 52, height: 52)
-                        .background(Circle().fill(heightColor))
-                        .contentShape(Rectangle())
-                        .padding(6)
-                        .onTapGesture {
-                            haptic(.light)
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                statusTileSize = (statusTileSize + 1) % 3
-                            }
-                            UserDefaults.standard.set(statusTileSize, forKey: lKey("status_tile_size"))
-                        }
-                    Spacer()
-                }
-            }
-            } // end height button
-
             // Rotate button (bottom-left) — camera tiles on single-nozzle
             // printers only (the U1's WebRTC player with its native controls
             // doesn't rotate cleanly): turns the image in 90° steps, stored on
@@ -5306,6 +5690,7 @@ struct DashboardView: View {
                             MacroButtonView(cmd: cmd, printer: printer)
                         }
                     }
+                    .frame(maxHeight: .infinity)
                 }
             }
         }
@@ -5356,7 +5741,9 @@ struct DashboardView: View {
                         Spacer()
                     }
                 }
-                statusProgressBlock
+                // Spare row height below the progress, so the buttons sit at
+                // the bottom like in the neighbouring tile.
+                statusProgressBlock.frame(maxHeight: .infinity, alignment: .top)
                 if printer.extruderTempHistories[0].count >= 4 {
                     TempSparklineView(
                         extruderHistories: printer.extruderTempHistories,
@@ -5368,10 +5755,7 @@ struct DashboardView: View {
                 }
                 if printer.printTimeElapsed > 0 { statusTimeRow }
                 statusControlButtons
-                // Speed & Flow — hidden in Stufe 3
-                if statusTileSize < 2 { statusSpeedFlow }
-                // Motor/MCU temps & current — hidden in Stufe 2 + 3
-                if statusTileSize == 0 { statusHardwareInfo }
+                // Speed & Flow and the motor/MCU values are tiles of their own.
             }
         }
     }
@@ -5458,39 +5842,48 @@ struct DashboardView: View {
         }
     }
 
-    @ViewBuilder private var statusSpeedFlow: some View {
-        HStack(spacing: 0) {
-            speedFlowControl(
-                label: lz(en: "Speed", de: "Tempo", fr: "Vitesse", es: "Velocidad", pt: "Velocidade", it: "Velocità", zh: "速度"),
-                icon: "speedometer", value: printer.speedFactor, color: .blue,
-                onDecrease: { printer.setSpeedFactor(printer.speedFactor - 0.05) },
-                onIncrease: { printer.setSpeedFactor(printer.speedFactor + 0.05) }
-            )
-            Divider().frame(height: 36)
-            speedFlowControl(
-                label: lz(en: "Flow", de: "Flow", fr: "Débit", es: "Flujo", pt: "Fluxo", it: "Flusso", zh: "流量"),
-                icon: "drop.fill", value: printer.extrudeFactor, color: .teal,
-                onDecrease: { printer.setExtrudeFactor(printer.extrudeFactor - 0.05) },
-                onIncrease: { printer.setExtrudeFactor(printer.extrudeFactor + 0.05) }
-            )
+    private var hardwareValues: [(label: String, value: String, icon: String, color: Color)] {
+        if printer.printerType == .singleNozzle {
+            return [("MCU", printer.mcuTemp.map { "\(Int($0))°C" } ?? "–", "cpu", .orange),
+                    ("Pi", printer.piTemp.map { "\(Int($0))°C" } ?? "–", "thermometer.medium", .red)]
         }
-        .background(Color.secondary.opacity(0.07)).cornerRadius(10)
-        .transition(.opacity.combined(with: .move(edge: .bottom)))
+        return [("Stepper X", printer.motorTempX.map { "\(Int($0))°C" } ?? "–", "thermometer", .orange),
+                ("Stepper Y", printer.motorTempY.map { "\(Int($0))°C" } ?? "–", "thermometer", .orange),
+                (lz(en: "Current", de: "Strom", fr: "Courant", es: "Corriente", pt: "Atual", it: "Attuale", zh: "当前"),
+                 String(format: "%.1fA", printer.currentDraw), "bolt.fill", .yellow)]
     }
 
+    /// Full width: the values side by side. Narrower: one row per value
+    /// (icon, name, value) — three columns of ~50 pt were cramped, and the
+    /// rows spread over the height a taller neighbour gives the tile.
     @ViewBuilder private var statusHardwareInfo: some View {
-        HStack(spacing: 0) {
-            if printer.printerType == .singleNozzle {
-                hardwareInfoItem(label: "MCU", value: printer.mcuTemp.map { "\(Int($0))°C" } ?? "–", icon: "cpu", color: .orange)
-                Divider().frame(height: 28)
-                hardwareInfoItem(label: "Pi", value: printer.piTemp.map { "\(Int($0))°C" } ?? "–", icon: "thermometer.medium", color: .red)
+        let vals = hardwareValues
+        Group {
+            if effectiveWidthState(for: .tile(.hardware)) == 0 {
+                HStack(spacing: 0) {
+                    ForEach(Array(vals.enumerated()), id: \.offset) { i, v in
+                        if i > 0 { Divider().frame(height: 28) }
+                        hardwareInfoItem(label: v.label, value: v.value, icon: v.icon, color: v.color)
+                            .frame(maxHeight: .infinity)
+                    }
+                }
             } else {
-                hardwareInfoItem(label: "Motor X", value: printer.motorTempX.map { "\(Int($0))°C" } ?? "–", icon: "thermometer", color: .orange)
-                Divider().frame(height: 28)
-                hardwareInfoItem(label: "Motor Y", value: printer.motorTempY.map { "\(Int($0))°C" } ?? "–", icon: "thermometer", color: .orange)
-                Divider().frame(height: 28)
-                hardwareInfoItem(label: lz(en: "Current", de: "Strom", fr: "Courant", es: "Corriente", pt: "Atual", it: "Attuale", zh: "当前"),
-                                 value: String(format: "%.1fA", printer.currentDraw), icon: "bolt.fill", color: .yellow)
+                VStack(spacing: 0) {
+                    ForEach(Array(vals.enumerated()), id: \.offset) { i, v in
+                        if i > 0 { Divider().padding(.horizontal, 10) }
+                        HStack(spacing: 6) {
+                            Image(systemName: v.icon).font(.system(size: 11)).foregroundColor(v.color)
+                                .frame(width: 16)
+                            Text(v.label).font(.system(size: 12)).foregroundColor(.secondary)
+                                .lineLimit(1).minimumScaleFactor(0.7)
+                            Spacer(minLength: 4)
+                            Text(v.value).font(.system(size: 14, weight: .bold, design: .rounded))
+                                .lineLimit(1).minimumScaleFactor(0.7)
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 7)
+                        .frame(maxHeight: .infinity)
+                    }
+                }
             }
         }
         .background(Color.secondary.opacity(0.07)).cornerRadius(10)
@@ -5656,6 +6049,7 @@ struct DashboardView: View {
                                 confirmMessage: lz(en: "Cleaning and purge discard will run.", de: "Reinigen und Poop entsorgen wird gestartet.", fr: "Le nettoyage et l'évacuation vont démarrer.", es: "Se iniciará la limpieza y descarte.", pt: "A limpeza e o descarte de purga serão executados.", it: "Verranno eseguiti la pulizia e lo scarico di spurgo.", zh: "将执行清洁和废料排出。"),
                                 printer: printer) { printer.cleanNozzleRoughDiscard() }
                         }
+                        .frame(maxHeight: .infinity)
                     }
                 }
             }
@@ -5691,6 +6085,7 @@ struct DashboardView: View {
                                 spoolCircle(slot: slot)
                             }
                         }
+                        .frame(maxHeight: .infinity)
                     } else {
                         HStack(spacing: 0) {
                             ForEach(printer.filamentSlots) { slot in
@@ -5698,6 +6093,7 @@ struct DashboardView: View {
                                     .frame(maxWidth: .infinity)
                             }
                         }
+                        .frame(maxHeight: .infinity)
                     }
                 }
                 .contentShape(Rectangle())
@@ -5771,6 +6167,7 @@ struct DashboardView: View {
                                 printer: printer) { printer.calibrateShaper() }
                         }
                     }
+                    .frame(maxHeight: .infinity)
                 }
             }
 
@@ -5794,6 +6191,7 @@ struct DashboardView: View {
                             .padding(.vertical, 8)
                             Spacer()
                         }
+                        .frame(maxHeight: .infinity)
                     } else {
                         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                             statCard(
@@ -5832,11 +6230,40 @@ struct DashboardView: View {
                                 gradient: [Color(hex: "43e97b") ?? .green, Color(hex: "38f9d7") ?? .teal]
                             )
                         }
+                        .frame(maxHeight: .infinity)
                     }
                 }
             }
 
         case .bed:
+            if printer.printerType != .singleNozzle {
+                // U1: laid out like the chamber tile beside it — header on top,
+                // temperature and its line centred below, both numbers on one
+                // height.
+                glassCard {
+                    VStack(spacing: 6) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "square.stack.3d.up.fill").font(.system(size: 12)).foregroundColor(.orange)
+                            Text(lz(en: "Heated Bed", de: "Heizbett", fr: "Plateau", es: "Cama", pt: "Mesa", it: "Piano", zh: "热床"))
+                                .font(.caption2).fontWeight(.semibold).foregroundColor(.secondary).textCase(.uppercase).tracking(1).lineLimit(1).minimumScaleFactor(0.8)
+                            Spacer(minLength: 0)
+                            Image(systemName: "pencil").font(.system(size: 11)).foregroundColor(.secondary)
+                        }
+                        .frame(height: Self.smallTileHeaderHeight)
+                        VStack(spacing: 4) {
+                            tileTemperature(printer.bedTemp)
+                            Text(printer.bedTarget > 0
+                                 ? "→ \(Int(printer.bedTarget))°C"
+                                 : lz(en: "Off", de: "Aus", fr: "Éteint", es: "Apagado", pt: "Desligado", it: "Spento", zh: "关闭"))
+                                .font(.system(size: 12, weight: .medium)).foregroundColor(.secondary).lineLimit(1)
+                                .frame(height: Self.smallTileLineHeight)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { bedTempInput = "\(Int(printer.bedTarget))"; showBedTempInput = true }
+                }
+            } else {
             glassCard {
                 VStack(alignment: .leading, spacing: 6) {
                     // Header + temperature mirror the Extruder tile exactly, so
@@ -5860,6 +6287,7 @@ struct DashboardView: View {
                              : lz(en: "Off", de: "Aus", fr: "Éteint", es: "Apagado", pt: "Desligado", it: "Spento", zh: "关闭"))
                             .font(.system(size: 12, weight: .medium)).foregroundColor(.secondary).lineLimit(1)
                     }
+                    .frame(maxHeight: .infinity, alignment: .top)
                     .contentShape(Rectangle())
                     .onTapGesture { bedTempInput = "\(Int(printer.bedTarget))"; showBedTempInput = true }
 
@@ -5883,13 +6311,14 @@ struct DashboardView: View {
                     }
                 }
             }
+            } // end single-nozzle bed
 
         case .chamber:
             if printer.printerType == .singleNozzle || !(printer.hasChamber || printer.printerType == .snapmakerU1) {
                 EmptyView()
             } else {
                 glassCard {
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(spacing: 6) {
                         HStack(spacing: 5) {
                             Image(systemName: "cube.transparent.fill").font(.system(size: 12)).foregroundColor(.purple)
                             Text(lz(en: "Chamber", de: "Bauraum", fr: "Enceinte", es: "Cámara", pt: "Câmara", it: "Camera", zh: "腔体"))
@@ -5900,12 +6329,9 @@ struct DashboardView: View {
                                     .font(.system(size: 14)).foregroundColor(printer.chamberLedOn ? .yellow : .secondary.opacity(0.5))
                             }.buttonStyle(.plain)
                         }
-                        HStack(alignment: .firstTextBaseline, spacing: 3) {
-                            Text("\(Int(printer.chamberTemp))").font(.system(size: 30, weight: .bold, design: .rounded))
-                                .foregroundColor(.primary).minimumScaleFactor(0.5).lineLimit(1)
-                            Text("°C").font(.system(size: 14, weight: .medium)).foregroundColor(.secondary)
-                            Spacer(minLength: 0)
-                        }
+                        .frame(height: Self.smallTileHeaderHeight)
+                        VStack(spacing: 4) {
+                        tileTemperature(printer.chamberTemp)
                         Button(action: {
                             fanSheetTitle = lz(en: "Cavity Fan", de: "Bauraum-Lüfter", fr: "Ventilateur enceinte", es: "Ventilador cámara", pt: "Ventoinha da Câmara", it: "Ventola della Camera", zh: "腔体风扇")
                             fanSheetValue = printer.cavityFanSpeed
@@ -5918,10 +6344,14 @@ struct DashboardView: View {
                                 if printer.purifierDetected {
                                     Image(systemName: "wind").font(.system(size: 10)).foregroundColor(.mint)
                                 }
-                                Spacer(minLength: 0)
                             }
+                            .frame(height: Self.smallTileLineHeight)
                             .contentShape(Rectangle())
                         }.buttonStyle(.plain)
+                        }
+                        // Centred in the tile below its header, on the same
+                        // height as the bed temperature beside it.
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
             }
@@ -5934,10 +6364,29 @@ struct DashboardView: View {
             }
 
         case .speed:
-            if printer.printerType == .singleNozzle {
-                SpeedFlowTileView(printer: printer)
-            } else {
-                EmptyView()
+            SpeedFlowTileView(printer: printer, compact: {
+                let ews = effectiveWidthState(for: .tile(.speed))
+                let content = pageWidth > 0 ? pageWidth - 32 : 360
+                let tileW = ews == 0 ? content : (ews == 1 ? (content - 12) / 2 : (content - 24) / 3)
+                return tileW < 260
+            }())
+
+        case .hardware:
+            // Motor temperatures and current (U1) or MCU / Pi (single nozzle) —
+            // used to be the bottom row of the status tile.
+            glassCard {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "thermometer.medium").font(.system(size: 12)).foregroundColor(.orange)
+                        Text(printer.printerType == .singleNozzle
+                             ? lz(en: "Electronics", de: "Elektronik", fr: "Électronique", es: "Electrónica", pt: "Eletrônica", it: "Elettronica", zh: "电子")
+                             : lz(en: "Steppers", de: "Stepper", fr: "Pas à pas", es: "Paso a paso", pt: "Motores de passo", it: "Passo-passo", zh: "步进电机"))
+                            .font(.caption2).fontWeight(.semibold).foregroundColor(.secondary).textCase(.uppercase).tracking(1).lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    // Fills the height a taller neighbour gives the row.
+                    statusHardwareInfo.frame(maxHeight: .infinity)
+                }
             }
 
         case .energyCost:
@@ -5953,6 +6402,19 @@ struct DashboardView: View {
                 isBusy: printer.isBusy
             )
 
+        }
+    }
+
+    /// Heated bed / chamber (U1): fixed header and sub-line heights, so the
+    /// two temperatures side by side sit exactly on one line.
+    static let smallTileHeaderHeight: CGFloat = 18
+    static let smallTileLineHeight: CGFloat = 16
+
+    func tileTemperature(_ value: Double) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 3) {
+            Text("\(Int(value))").font(.system(size: 30, weight: .bold, design: .rounded))
+                .foregroundColor(.primary).minimumScaleFactor(0.5).lineLimit(1)
+            Text("°C").font(.system(size: 14, weight: .medium)).foregroundColor(.secondary)
         }
     }
 
@@ -6024,34 +6486,6 @@ struct DashboardView: View {
     }
 
     @ViewBuilder
-    func speedFlowControl(label: String, icon: String, value: Double, color: Color,
-                          onDecrease: @escaping () -> Void, onIncrease: @escaping () -> Void) -> some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 3) {
-                Image(systemName: icon).font(.system(size: 9)).foregroundColor(color)
-                Text(label).font(.system(size: 9, weight: .semibold)).foregroundColor(.secondary)
-            }
-            HStack(spacing: 10) {
-                Button(action: onDecrease) {
-                    Image(systemName: "minus.circle.fill")
-                        .font(.system(size: 22)).foregroundColor(color)
-                }
-                .buttonStyle(.plain)
-                Text("\(Int(value * 100))%")
-                    .font(.system(size: 15, weight: .bold)).frame(minWidth: 44)
-                    .contentTransition(.numericText())
-                Button(action: onIncrease) {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.system(size: 22)).foregroundColor(color)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
-    }
-
-    @ViewBuilder
     func statCard(icon: String, value: String, label: String, gradient: [Color]) -> some View {
         ZStack {
             RoundedRectangle(cornerRadius: 14)
@@ -6069,13 +6503,15 @@ struct DashboardView: View {
                 }
                 Text(value)
                     .font(.system(size: 20, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
+                    // White on the light pastel card was hard to read.
+                    .foregroundStyle(.primary)
                     .minimumScaleFactor(0.6)
                     .lineLimit(1)
                 Text(label)
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundColor(.white.opacity(0.55))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.7)   // "Drucke gesamt" in a half-width tile
             }
             .padding(10)
         }
@@ -6142,6 +6578,14 @@ struct FilesView: View {
                 }
                 .frame(width: 52, height: 52)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                // No thumbnail in the file (or not loaded yet): same space, so
+                // the names of all rows line up.
+                Image(systemName: "cube.transparent")
+                    .font(.system(size: 20))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 52, height: 52)
+                    .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
             }
             VStack(alignment: .leading, spacing: 4) {
                 Text(file.displayName).font(.subheadline).bold().lineLimit(1)
@@ -6391,12 +6835,24 @@ struct PrintControlView: View {
     @State private var selectedTab = 0
     @State private var restoredTab = false
     @State private var hideTopPicker = false
+    @State private var pickerWidth: CGFloat = 0
     @AppStorage("expert_mode_enabled") private var expertModeEnabled: Bool = false
     @AppStorage("show_timelapse_tab") private var showTimelapseTab: Bool = true
     @AppStorage("show_klipper_tab") private var showKlipperTab: Bool = true
 
     private var showFirmwareTab: Bool {
         expertModeEnabled && printerService.printerType == .snapmakerU1
+    }
+
+    /// A segment of the Dashboard/Files/… picker. On the closed iPhone Duo the
+    /// cover display beside its camera strip leaves too little room for the
+    /// words ("Dashb…", "Timelap…") — there they become symbols.
+    @ViewBuilder private func subTab(_ title: String, icon: String) -> some View {
+        if DuoState.shared.isFoldable, pickerWidth > 0, pickerWidth < 390 {
+            Image(systemName: icon).accessibilityLabel(title)
+        } else {
+            Text(title)
+        }
     }
 
     var themeColor: Color {
@@ -6409,18 +6865,19 @@ struct PrintControlView: View {
             VStack(spacing: 0) {
                 if !hideTopPicker {
                     Picker("", selection: $selectedTab) {
-                        Text("Dashboard").tag(0)
-                        Text(lz(en: "Files", de: "Dateien", fr: "Fichiers", es: "Archivos", pt: "Arquivos", it: "File", zh: "文件")).tag(1)
+                        subTab("Dashboard", icon: "square.grid.2x2.fill").tag(0)
+                        subTab(lz(en: "Files", de: "Dateien", fr: "Fichiers", es: "Archivos", pt: "Arquivos", it: "File", zh: "文件"), icon: "folder.fill").tag(1)
                         if showKlipperTab {
-                            Text("Klipper").tag(2)
+                            subTab("Klipper", icon: "chevron.left.forwardslash.chevron.right").tag(2)
                         }
                         if showTimelapseTab {
-                            Text("Timelapse").tag(3)
+                            subTab("Timelapse", icon: "video.fill").tag(3)
                         }
                         if showFirmwareTab {
-                            Text(lz(en: "Config", de: "Konfiguration", fr: "Config", es: "Config", pt: "Configuração", it: "Configurazione", zh: "配置")).tag(4)
+                            subTab(lz(en: "Config", de: "Konfiguration", fr: "Config", es: "Config", pt: "Configuração", it: "Configurazione", zh: "配置"), icon: "gearshape.fill").tag(4)
                         }
                     }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { pickerWidth = $0 }
                     .pickerStyle(.segmented)
                     // Tight under the title bar so the tiles get the room.
                     .padding(.horizontal).padding(.top, 2).padding(.bottom, 8)
@@ -6495,18 +6952,71 @@ struct PrintControlView: View {
 /// so the view measures where it landed and shifts itself to the middle.
 struct PrinterTitle: ViewModifier {
     @ObservedObject var printer: PrinterService
+    /// iPhone Duo: this printer's page (global) — the name is centred on it,
+    /// as the phone centres it on its screen.
+    @State private var pageFrame: CGRect? = nil
     func body(content: Content) -> some View {
         content
             .navigationTitle(printer.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .principal) { PrinterTitleView(printer: printer) }
+                ToolbarItem(placement: .principal) { PrinterTitleView(printer: printer, pageFrame: pageFrame) }
+            }
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { r in
+                guard DuoState.shared.isFoldable else { return }
+                if let f = pageFrame, abs(f.minX - r.minX) < 0.5, abs(f.width - r.width) < 0.5 { return }
+                pageFrame = r
+            }
+    }
+}
+
+/// A bar title centred on a given x (global) instead of where the bar puts
+/// it. The bar gives a title only its own width, so there is no slot to
+/// measure: the title measures itself (outside its offset, so the shift
+/// doesn't feed back) and moves by the difference — kept between `minX` and
+/// `maxX` (e.g. clear of the bar buttons) when they are given.
+struct CentredBarTitle<Content: View>: View {
+    let targetMidX: CGFloat?
+    var minX: CGFloat? = nil
+    var maxX: CGFloat? = nil
+    @ViewBuilder var content: Content
+    @State private var own: CGRect = .zero
+
+    /// Shrinks the title (down to 60 %) when it is wider than the room between
+    /// minX and maxX — in a narrow split page it otherwise ran under a button.
+    private var scale: CGFloat {
+        guard let lo = minX, let hi = maxX, own.width > 0 else { return 1 }
+        return min(1, max(0.6, (hi - lo) / own.width))
+    }
+
+    private var shift: CGFloat {
+        guard let t = targetMidX, own.width > 0 else { return 0 }
+        let half = own.width * scale / 2          // scaleEffect keeps the centre
+        var s = t - own.midX
+        if let hi = maxX { s = min(s, hi - (own.midX + half)) }
+        if let lo = minX { s = max(s, lo - (own.midX - half)) }
+        return s
+    }
+
+    var body: some View {
+        content
+            .fixedSize()
+            .scaleEffect(scale)
+            .offset(x: shift)
+            .background {
+                Color.clear.onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { r in
+                    if abs(r.minX - own.minX) > 0.5 || abs(r.width - own.width) > 0.5 || abs(r.minY - own.minY) > 0.5 { own = r }
+                }
             }
     }
 }
 
 struct PrinterTitleView: View {
     @ObservedObject var printer: PrinterService
+    var pageFrame: CGRect? = nil
+    /// Natural width of the name (iPhone), to shrink it beside the bar buttons.
+    @State private var titleWidth: CGFloat = 0
+    @ObservedObject private var barMetrics = DuoBarMetrics.shared
     @AppStorage("app_language") private var appLanguage: String = "en"
 
     var body: some View {
@@ -6514,7 +7024,18 @@ struct PrinterTitleView: View {
         // barely move the middle — and the greedy height the measuring needs
         // pushed the name onto a line of its own below them. So the trick
         // stays where it is needed: on the iPhone.
-        if UIDevice.current.userInterfaceIdiom == .pad {
+        // iPhone Duo: its camera strip makes the window's middle the wrong
+        // middle — centred on the printer's own page instead (with two
+        // printers side by side, each in the middle of its half).
+        if DuoState.shared.isFoldable {
+            // Kept clear of the button capsule at the page's right edge (its
+            // width measured on the dashboard; a typical one until then).
+            let reserve = (barMetrics.trailingWidth[ObjectIdentifier(printer)] ?? 120) + 16 + 10
+            CentredBarTitle(targetMidX: pageFrame?.midX,
+                            // clear of the round emergency-stop button on the left
+                            minX: pageFrame.map { $0.minX + 16 + 52 },
+                            maxX: pageFrame.map { $0.maxX - reserve }) { titleStack }
+        } else if UIDevice.current.userInterfaceIdiom == .pad {
             titleStack.fixedSize()
                 .animation(.easeInOut(duration: 0.2), value: printer.inputLocked)
         } else {
@@ -6541,10 +7062,21 @@ struct PrinterTitleView: View {
 
     private var centredOnScreen: some View {
         GeometryReader { g in
-            let screenMid = (UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.bounds.midX)
-                ?? UIScreen.main.bounds.midX
+            let window = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first?.bounds
+                ?? UIScreen.main.bounds
+            let screenMid = window.midX
+            // Room around the screen's middle between the emergency-stop button
+            // (left, ~67 pt) and the lock/menu capsule (right, ~135 pt). On a
+            // 6.1" iPhone "Snapmaker U1" ran into the capsule — shrink it a
+            // little (never below 70 %) instead; it stays centred.
+            let half = max(0, min(screenMid - 67, window.width - 135 - screenMid))
+            let scale: CGFloat = titleWidth > 0 ? min(1, max(0.7, 2 * half / titleWidth)) : 1
             titleStack
                 .fixedSize()
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { w in
+                    if abs(w - titleWidth) > 0.5 { titleWidth = w }
+                }
+                .scaleEffect(scale)
             .frame(width: g.size.width, height: g.size.height)
             .offset(x: screenMid - g.frame(in: .global).midX)
         }
@@ -6558,9 +7090,22 @@ struct PrinterPagerView: View {
     let printers: [(PrinterConfig, PrinterService)]
     let allServices: [PrinterService]
     @Binding var currentPage: Int
+    @ObservedObject private var duo = DuoState.shared
+    /// The paged view's own width — the key it is rebuilt by (see below).
+    @State private var pagerWidth: CGFloat = 0
 
     var body: some View {
         ZStack {
+            if duo.isFoldable {
+                // The side strip (camera, clock, tab bar) in the printer's colour.
+                let cfg = printers[safe: currentPage]?.0
+                let gkey = cfg?.themeColor ?? "blue"
+                let gc = Color(hex: gkey) ?? appThemes.first { $0.key == gkey }?.color ?? .blue
+                LinearGradient(colors: [gc.opacity(0.45), gc.opacity(0.15)], startPoint: .top, endPoint: .bottom)
+                    .background(Color(.systemBackground))
+                    .ignoresSafeArea()
+
+            }
             // Don't build the paged TabView until printers are loaded. During
             // the brief launch window the list is empty, and an empty paged
             // TabView writes its selection back to 0 — which would overwrite
@@ -6576,11 +7121,37 @@ struct PrinterPagerView: View {
                         themeColorKey: pair.0.themeColor,
                         allServices: allServices
                     )
+                    // Closed iPhone Duo: a page built while swiping in gets the
+                    // trimmed side inset at once — it showed the empty band
+                    // until something else re-ran the correction.
+                    .onAppear {
+                        guard duo.isFoldable else { return }
+                        DispatchQueue.main.async { DuoCoverInsets.apply() }
+                    }
                     .tag(idx)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
-            .ignoresSafeArea()
+            .onGeometryChange(for: CGFloat.self) { $0.size.width.rounded() } action: { w in
+                if pagerWidth != w { pagerWidth = w }
+            }
+            // iPhone Duo: turned (or folded) the paged view kept the page size
+            // it had while the window changed — as wide as the whole window
+            // (the side strip's inset arrives a moment later) and shifted, cut
+            // off at both sides. Built afresh for each width it really gets;
+            // the printer shown stays (the selection lives outside).
+            .id(duo.isFoldable ? Int(pagerWidth) : 0)
+            .onChange(of: currentPage) { _, _ in
+                guard duo.isFoldable else { return }
+                for delay in [0.0, 0.2, 0.5] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { DuoCoverInsets.apply() }
+                }
+            }
+            // iPhone Duo: its camera, clock and the side tab bar sit on ONE side
+            // only. A pager that ignores the side insets lays each page out
+            // across them — the content was cut off on the left and the header
+            // buttons slid under the camera. There only the bottom is ignored.
+            .ignoresSafeArea(duo.isFoldable ? .container : .all, edges: duo.isFoldable ? .bottom : .all)
             }
 
             // Page dots — shown only when there are multiple printers
@@ -6999,10 +7570,11 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             settingsForm
+                .iPadReadableColumn()
                 .onAppear(perform: openPendingPrinter)
                 .onChange(of: pendingPushPrinter) { _, _ in openPendingPrinter() }
                 .navigationTitle(lz(en: "Settings", de: "Einstellungen", fr: "Paramètres", es: "Ajustes", pt: "Configurações", it: "Impostazioni", zh: "设置"))
-                .toolbar { EditButton() }
+                .toolbar { AppEditButton() }
                 .sheet(isPresented: $showAddPrinter) {
                     PrinterEditView(config: PrinterConfig(name: "", ip: "", type: .snapmakerU1)) { newPrinter in
                         settings.printers.append(newPrinter)
@@ -7159,7 +7731,9 @@ struct SettingsView: View {
                     if isIPad {
                         HStack {
                             Image(systemName: "rectangle.split.2x1").foregroundColor(.teal).frame(width: 28)
-                            Toggle(lz(en: "Split Screen (iPad)", de: "Splitscreen (iPad)", fr: "Écran partagé (iPad)", es: "Pantalla dividida (iPad)", pt: "Tela Dividida (iPad)", it: "Schermo Diviso (iPad)", zh: "分屏（iPad）"), isOn: $splitscreenMode)
+                            Toggle(DuoState.shared.isFoldable
+                                   ? lz(en: "Split Screen (unfolded)", de: "Splitscreen (aufgeklappt)", fr: "Écran partagé (déplié)", es: "Pantalla dividida (desplegado)", pt: "Tela Dividida (aberto)", it: "Schermo Diviso (aperto)", zh: "分屏（展开时）")
+                                   : lz(en: "Split Screen (iPad)", de: "Splitscreen (iPad)", fr: "Écran partagé (iPad)", es: "Pantalla dividida (iPad)", pt: "Tela Dividida (iPad)", it: "Schermo Diviso (iPad)", zh: "分屏（iPad）"), isOn: $splitscreenMode)
                         }
                     }
                     HStack {
@@ -7168,7 +7742,7 @@ struct SettingsView: View {
                     }
                     HStack {
                         Image(systemName: "cube.transparent").foregroundColor(.orange).frame(width: 28)
-                        Toggle(lz(en: "PaxxMaker Slicer", de: "PaxxMaker-Slicer", fr: "PaxxMaker Slicer", es: "PaxxMaker Slicer", pt: "PaxxMaker Slicer", it: "PaxxMaker Slicer", zh: "PaxxMaker 切片") + " (Beta)", isOn: $showSlicerTab)
+                        Toggle(lz(en: "PaxxMaker Slicer", de: "PaxxMaker-Slicer", fr: "PaxxMaker Slicer", es: "PaxxMaker Slicer", pt: "PaxxMaker Slicer", it: "PaxxMaker Slicer", zh: "PaxxMaker 切片"), isOn: $showSlicerTab)
                     }
 
                     HStack {
@@ -8214,10 +8788,14 @@ struct PrinterEditView: View {
                     if showResetLayoutConfirm {
                         Button(role: .destructive) {
                             let pid = config.id.uuidString
-                            UserDefaults.standard.removeObject(forKey: "dashboard_tile_order_\(pid)")
-                            UserDefaults.standard.removeObject(forKey: "hidden_tiles_\(pid)")
-                            UserDefaults.standard.removeObject(forKey: "tile_grid_mode_\(pid)")
-                            UserDefaults.standard.removeObject(forKey: "tile_half_width_\(pid)")
+                            // Phone and open-iPhone-Duo layout alike, widths
+                            // included (the thirds and the Duo's own layout
+                            // used to survive a reset).
+                            for base in ["dashboard_tile_order", "hidden_tiles", "tile_grid_mode", "tile_half_width", "tile_third_width"] {
+                                UserDefaults.standard.removeObject(forKey: "\(base)_\(pid)")
+                                UserDefaults.standard.removeObject(forKey: "\(base)_duo_\(pid)")
+                            }
+                            NotificationCenter.default.post(name: .paxxLayoutReset, object: pid)
                             showResetLayoutConfirm = false
                         } label: {
                             HStack {
@@ -9354,6 +9932,8 @@ struct SmartPlugTileView: View {
                     }
                 }
 
+                // Toggle + status take the spare height (header stays on top).
+                VStack(spacing: 14) {
                 // ── Toggle ──
                 ZStack {
                     // Track
@@ -9449,6 +10029,8 @@ struct SmartPlugTileView: View {
                         .opacity(watts == nil ? 0 : 1)
                         .animation(.easeInOut(duration: 0.2), value: watts == nil)
                 }
+                }
+                .frame(maxHeight: .infinity)
             }
             .padding(16)
         }
@@ -10422,26 +11004,75 @@ struct ScrollablePrinterTabView: View {
 
 }
 
-private struct SplitScrollOffsetKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+// MARK: - Splitscreen View
+/// Where the split screen is scrolled to, in pages (0 = first printer at the
+/// leading edge), straight from the scroll view. Only the side strip reads it
+/// (Observation: the pages don't redraw on every scroll frame).
+@MainActor @Observable final class SplitScrollState {
+    var position: CGFloat = 0
+    var visible: Int = 2
+    @ObservationIgnored var lastPage: Int = 0
 }
 
-// MARK: - Splitscreen View
+/// iPhone Duo: the side strip (camera, clock, tab bar) in the colour of the
+/// printer whose page touches it — blended while a swipe passes from one
+/// printer to the next.
+private struct SplitStripBackground: View {
+    let printers: [(PrinterConfig, PrinterService)]
+    let scroll: SplitScrollState
+
+    private func gradient(_ i: Int) -> LinearGradient {
+        let gkey = printers[safe: i]?.0.themeColor ?? "blue"
+        let gc = Color(hex: gkey) ?? appThemes.first { $0.key == gkey }?.color ?? .blue
+        return LinearGradient(colors: [gc.opacity(0.45), gc.opacity(0.15)], startPoint: .top, endPoint: .bottom)
+    }
+
+    var body: some View {
+        let last = max(printers.count - 1, 0)
+        let edge = DuoCoverInsets.coverSide == .leading
+            ? scroll.position
+            : scroll.position + CGFloat(scroll.visible - 1)
+        let p = min(max(edge, 0), CGFloat(last))
+        let i0 = Int(p.rounded(.down))
+        let i1 = min(i0 + 1, last)
+        ZStack {
+            gradient(i0)
+            gradient(i1).opacity(Double(p - CGFloat(i0)))
+        }
+        .background(Color(.systemBackground))
+        .ignoresSafeArea()
+    }
+}
+
 struct SplitscreenView: View {
     let printers: [(PrinterConfig, PrinterService)]
     let allServices: [PrinterService]
     @Binding var currentPage: Int
     @AppStorage("current_splitscreen_count") private var storedSplitscreenCount: Int = 1
+    @ObservedObject private var duo = DuoState.shared
+    @State private var scroll = SplitScrollState()
+
+    /// Three printers side by side only where each still gets a phone's width
+    /// (big iPad across); otherwise two, and the rest is a swipe away. The
+    /// open iPhone Duo across showed three ~290 pt pages — all visible, so
+    /// swiping was off.
+    private func visibleCount(for width: CGFloat) -> Int {
+        max(1, min(printers.count, width >= 1100 ? 3 : 2))
+    }
 
     var body: some View {
-        GeometryReader { geo in
-            // Landscape: 3 printers side by side, portrait: 2
-            let isLandscape = geo.size.width > geo.size.height
-            let maxVisible = isLandscape ? 3 : 2
-            let visibleCount = min(printers.count, maxVisible)
-            let printerWidth = geo.size.width / CGFloat(visibleCount)
+        ZStack {
+            if duo.isFoldable { SplitStripBackground(printers: printers, scroll: scroll) }
+            splitPages
+        }
+    }
 
+    private var splitPages: some View {
+        GeometryReader { geo in
+            let visible = visibleCount(for: geo.size.width)
+            let printerWidth = geo.size.width / CGFloat(visible)
+            // Turned or folded: built afresh for the width it really gets, so
+            // the pages snap to their new size (back to `currentPage` on appear).
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 0) {
@@ -10452,6 +11083,13 @@ struct SplitscreenView: View {
                                 themeColorKey: pair.0.themeColor,
                                 allServices: allServices
                             )
+                            // iPhone Duo: a page (re)built here gets its insets
+                            // set right away (see DuoCoverInsets).
+                            .onAppear {
+                                guard duo.isFoldable else { return }
+                                DispatchQueue.main.async { DuoCoverInsets.apply() }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { DuoCoverInsets.apply() }
+                            }
                             .frame(width: printerWidth)
                             .overlay(alignment: .leading) {
                                 if idx > 0 {
@@ -10463,33 +11101,56 @@ struct SplitscreenView: View {
                             .id(idx)
                         }
                     }
-                    .background(
-                        GeometryReader { contentGeo in
-                            Color.clear.preference(
-                                key: SplitScrollOffsetKey.self,
-                                value: printerWidth > 0 ? contentGeo.frame(in: .named("splitHScroll")).minX / printerWidth : 0
-                            )
-                        }
-                    )
                     .scrollTargetLayout()
                     .frame(height: geo.size.height)
                 }
-                .coordinateSpace(name: "splitHScroll")
                 .scrollTargetBehavior(.viewAligned)
-                .scrollDisabled(printers.count <= visibleCount)
-                .onPreferenceChange(SplitScrollOffsetKey.self) { normalized in
-                    let page = max(0, Int(round(-normalized)))
+                .scrollDisabled(printers.count <= visible)
+                .onScrollGeometryChange(for: CGFloat.self) { g in
+                    printerWidth > 0 ? (g.contentOffset.x + g.contentInsets.leading) / printerWidth : 0
+                } action: { _, pos in
+                    scroll.position = pos
+                    let page = min(max(Int(pos.rounded()), 0), max(printers.count - visible, 0))
+                    guard page != scroll.lastPage else { return }
+                    scroll.lastPage = page
                     if page != currentPage { currentPage = page }
-                }
-                .onAppear { storedSplitscreenCount = visibleCount }
-                .onChange(of: visibleCount) { _, new in storedSplitscreenCount = new }
-                .onChange(of: currentPage) { _, target in
-                    withAnimation(.easeInOut(duration: 0.3)) {
-                        proxy.scrollTo(target, anchor: .leading)
+                    guard duo.isFoldable else { return }
+                    for delay in [0.0, 0.2, 0.5] {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { DuoCoverInsets.apply() }
                     }
                 }
+                // iPhone Duo: a page that came in from off screen still has the
+                // inset meant for the system strip until the correction runs
+                // again — once the scroll has come to rest.
+                .onScrollPhaseChange { _, phase in
+                    guard duo.isFoldable, phase == .idle else { return }
+                    DuoCoverInsets.apply()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { DuoCoverInsets.apply() }
+                }
+                .onAppear {
+                    scroll.visible = visible
+                    storedSplitscreenCount = visible
+                    // After the first layout, so the pages have their size.
+                    if currentPage > 0 {
+                        let target = currentPage
+                        DispatchQueue.main.async { proxy.scrollTo(target, anchor: .leading) }
+                    }
+                }
+                .onChange(of: visible) { _, new in
+                    scroll.visible = new
+                    storedSplitscreenCount = new
+                }
+                .onChange(of: currentPage) { _, target in
+                    guard target != scroll.lastPage else { return }
+                    withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(target, anchor: .leading) }
+                }
             }
+            .id(duo.isFoldable ? Int(geo.size.width) : 0)
         }
+        // A scroll view reaches into the safe area — the page beyond the
+        // last visible one showed under the side strip. Cut off at the sides
+        // only (the bars keep reaching up and down).
+        .mask(Rectangle().padding(.vertical, -2000))
         .ignoresSafeArea(edges: .bottom)
     }
 }
@@ -10508,7 +11169,7 @@ struct ContentView: View {
     @AppStorage("has_shown_firmware_notice") private var hasShownFirmwareNotice: Bool = false
     @AppStorage("has_selected_language") private var hasSelectedLanguage: Bool = false
     @AppStorage("has_accepted_disclaimer") private var hasAcceptedDisclaimer: Bool = false
-    @AppStorage("has_seen_whatsnew_scan_1") private var hasSeenWhatsNewSL: Bool = false
+    @AppStorage("has_seen_whatsnew_slicer_spoolman_1") private var hasSeenWhatsNewSL: Bool = false
     @State private var showWhatsNewSL = false
     /// Set when the popup's "Update now" is tapped; SettingsView opens
     /// that printer and clears it again.
@@ -10518,6 +11179,7 @@ struct ContentView: View {
     @State private var showDisclaimer: Bool = false
     // Persisted so relaunching the app returns to the tab that was last open.
     @AppStorage("last_root_tab") private var rootTabSel: String = "main"
+    @ObservedObject private var duo = DuoState.shared
     @State private var pairingMessage: String? = nil
     // Persisted so relaunching returns to the printer that was last swiped to.
     @AppStorage("last_printer_page") private var currentPrinterPage: Int = 0
@@ -10569,6 +11231,8 @@ struct ContentView: View {
                                     allServices: printerServices.services,
                                     currentPage: $splitCurrentPage
                                 )
+                                // iPhone Duo: no white panel behind the side tab bar.
+                                .toolbarBackground(duo.isFoldable ? .hidden : .automatic, for: .tabBar)
                                 .tabItem {
                                     Label(lz(en: "Split Screen", de: "Splitscreen", fr: "Écran partagé", es: "Pantalla dividida", pt: "Tela Dividida", it: "Schermo Diviso", zh: "分屏"),
                                           systemImage: "rectangle.split.2x1.fill")
@@ -10580,6 +11244,9 @@ struct ContentView: View {
                                     allServices: printerServices.services,
                                     currentPage: $currentPrinterPage
                                 )
+                                // iPhone Duo: no white panel behind the side tab bar —
+                                // the printer colour runs through to the edge.
+                                .toolbarBackground(duo.isFoldable ? .hidden : .automatic, for: .tabBar)
                                 .tabItem {
                                     Label(currentConfig?.name ?? lz(en: "Printers", de: "Drucker", fr: "Imprimantes", es: "Impresoras", pt: "Impressoras", it: "Stampanti", zh: "打印机"),
                                           systemImage: currentConfig?.type.icon ?? "printer.fill")
@@ -10593,11 +11260,13 @@ struct ContentView: View {
                             }
                             if spoolmanEnabled {
                                 SpoolmanView()
+                                    .duoReadableWidth()
                                     .tabItem { Label("Spoolman", systemImage: "record.circle.fill") }
                                     .tag("spoolman")
                             }
                             if showSlicerTab {
                                 SlicerView()
+                                    .duoReadableWidth()
                                     .tabItem { Label(lz(en: "PaxxMaker Slicer", de: "PaxxMaker-Slicer", fr: "PaxxMaker Slicer", es: "PaxxMaker Slicer", pt: "PaxxMaker Slicer", it: "PaxxMaker Slicer", zh: "PaxxMaker 切片"), systemImage: "cube.transparent") }
                                     .tag("slicer")
                             }
@@ -10605,12 +11274,19 @@ struct ContentView: View {
                                 printerServices.update(from: settings)
                             }
                             .environmentObject(printerServices)
+                            .duoReadableWidth()
                             .tabItem { Label(lz(en: "Settings", de: "Einstellungen", fr: "Paramètres", es: "Ajustes", pt: "Configurações", it: "Impostazioni", zh: "设置"), systemImage: "gearshape.fill") }
                             .tag("settings")
                         }
                     }
                 }
                 .onAppear { printerServices.update(from: settings) }
+                // Closed iPhone Duo: a tab opened for the first time gets the
+                // trimmed side inset too (see DuoCoverInsets).
+                .onChange(of: rootTabSel) { _, _ in
+                    guard duo.isFoldable else { return }
+                    DispatchQueue.main.async { DuoCoverInsets.apply() }
+                }
                 // "Done" after sending a slice: the printer tab with the
                 // printer that got the file. (With printers as tabs,
                 // ScrollablePrinterTabView does this itself.) Set again while
@@ -10622,6 +11298,14 @@ struct ContentView: View {
                         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                             if rootTabSel != "main" { rootTabSel = "main" }
                             if let idx, currentPrinterPage != idx { currentPrinterPage = idx }
+                            // Split screen: scroll until that printer is in view.
+                            if let idx, isSplitscreenActive {
+                                let visible = max(1, min(visiblePrinters.count, UserDefaults.standard.integer(forKey: "current_splitscreen_count")))
+                                let lead = min(idx, max(visiblePrinters.count - visible, 0))
+                                if idx < splitCurrentPage || idx >= splitCurrentPage + visible, splitCurrentPage != lead {
+                                    splitCurrentPage = lead
+                                }
+                            }
                         }
                     }
                 }
@@ -10743,7 +11427,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - What's New popup (Spoollink + feedback note)
+// MARK: - What's New popup (slicer, colour mixing, Spoolman; rating page paused)
 /// Version marker the installer writes into the notifier config — the only file
 /// of a Server Push install that Moonraker serves. "" means the file exists
 /// without a marker, i.e. an install from before markers existed.
@@ -10779,9 +11463,15 @@ struct WhatsNewView: View {
     /// Two pages: what changed, then the request for a rating. Keeping the ask
     /// on its own page means it isn't skimmed past together with the news.
     @State private var page = 1
+    /// The rating page (page two) is paused for this release — set to true to
+    /// bring it back in a later one.
+    static let showsRatingPage = false
     /// Drives the star wave on page two. Set once the page appears so the
     /// animation runs on arrival rather than silently before it.
     @State private var starsIn = false
+    /// The Thingiverse note only concerns people who use the model library,
+    /// which lives in the slicer tab — read here so both call sites get it.
+    @AppStorage("show_slicer_tab") private var showSlicerTab: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -10796,9 +11486,9 @@ struct WhatsNewView: View {
             }
 
             Button {
-                if page == 1 { withAnimation { page = 2 } } else { onDismiss() }
+                if page == 1 && Self.showsRatingPage { withAnimation { page = 2 } } else { onDismiss() }
             } label: {
-                Text(page == 1
+                Text(page == 1 && Self.showsRatingPage
                      ? lz(en: "Got it", de: "Verstanden", fr: "Compris", es: "Entendido", pt: "Entendi", it: "Ho capito", zh: "知道了")
                      : "OK")
                     .fontWeight(.semibold).frame(maxWidth: .infinity).padding(.vertical, 13)
@@ -10874,28 +11564,89 @@ struct WhatsNewView: View {
     }
 
     private var textBlock: some View {
-            VStack(spacing: 18) {
-            Image(systemName: "camera.viewfinder")
-                .font(.system(size: 46)).foregroundColor(.accentColor).padding(.top, 10)
-            Text("Scan to Duplicate")
+        VStack(spacing: 18) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 42)).foregroundColor(.accentColor).padding(.top, 10)
+            Text(lz(en: "What's new", de: "Das ist neu", fr: "Nouveautés", es: "Novedades", pt: "Novidades", it: "Novità", zh: "新功能"))
                 .font(.title2).bold().multilineTextAlignment(.center)
-            Text(lz(
-                en: "New in the PaxxMaker Slicer: scan an object with your iPhone or iPad and print it again.\n\nWalk around the object, turn it over for the underside, and the 3D model is built right on the device — the camera supplies the detail, the LiDAR sensor the real size. The app then makes it printable by itself: loose bits removed, holes closed, the base cut flat. Straight onto the build plate, or export it as an STL.\n\nAccurate to roughly half a millimetre to a millimetre — ideal for figures, decoration and shaped parts. Needs an iPhone or iPad with LiDAR (Pro models).\n\nAlso new: find models on Thingiverse right in the app — sign in with your own account, browse by popularity, downloads or category, and put an STL on the plate with one tap.",
-                de: "Neu im PaxxMaker-Slicer: Ein Objekt mit dem iPhone oder iPad scannen und einfach nachdrucken.\n\nDu gehst um das Objekt herum, drehst es für die Unterseite, und das 3D-Modell entsteht direkt auf dem Gerät — die Kamera liefert die Details, der LiDAR-Sensor die echte Größe. Danach macht die App es selbst druckfertig: lose Teile weg, Löcher zu, Boden plan geschnitten. Direkt auf die Druckplatte oder als STL exportieren.\n\nGenau auf etwa einen halben bis einen Millimeter — ideal für Figuren, Deko und Formteile. Braucht ein iPhone oder iPad mit LiDAR (Pro-Modelle).\n\nAußerdem neu: Modelle direkt in der App auf Thingiverse suchen — mit deinem eigenen Konto anmelden, nach Beliebtheit, Downloads oder Kategorie stöbern und eine STL mit einem Tipp auf die Druckplatte legen.",
-                fr: "Nouveau dans PaxxMaker Slicer : scanne un objet avec ton iPhone ou iPad et imprime-le à nouveau.\n\nFais le tour de l'objet, retourne-le pour le dessous, et le modèle 3D est calculé directement sur l'appareil — la caméra apporte les détails, le capteur LiDAR la taille réelle. L'app le rend ensuite imprimable toute seule : fragments retirés, trous fermés, base aplanie. Directement sur le plateau ou en export STL.\n\nPrécis à environ un demi-millimètre à un millimètre — idéal pour figurines, déco et pièces de forme. Nécessite un iPhone ou iPad avec LiDAR (modèles Pro).\n\nAutre nouveauté : cherche des modèles sur Thingiverse directement dans l'app — connecte-toi avec ton propre compte, parcours par popularité, téléchargements ou catégorie, et pose un STL sur le plateau d'un geste.",
-                es: "Nuevo en PaxxMaker Slicer: escanea un objeto con tu iPhone o iPad y vuelve a imprimirlo.\n\nRodea el objeto, gíralo para la base y el modelo 3D se calcula en el propio dispositivo: la cámara aporta el detalle y el sensor LiDAR el tamaño real. Luego la app lo deja listo para imprimir sola: fragmentos fuera, agujeros cerrados, base aplanada. Directo a la placa o exportado como STL.\n\nPrecisión de medio a un milímetro: ideal para figuras, decoración y piezas de forma. Requiere un iPhone o iPad con LiDAR (modelos Pro).\n\nTambién nuevo: busca modelos en Thingiverse directamente en la app: inicia sesión con tu propia cuenta, explora por popularidad, descargas o categoría y pon un STL en la placa con un toque.",
-                pt: "Novo no PaxxMaker Slicer: escaneie um objeto com o iPhone ou iPad e imprima-o de novo.\n\nDê a volta no objeto, vire-o para a parte de baixo e o modelo 3D é calculado no próprio aparelho — a câmera fornece os detalhes, o sensor LiDAR o tamanho real. Depois o app o deixa pronto para imprimir sozinho: fragmentos removidos, furos fechados, base aplanada. Direto na mesa ou exportado como STL.\n\nPrecisão de meio a um milímetro — ideal para figuras, decoração e peças de forma. Requer iPhone ou iPad com LiDAR (modelos Pro).\n\nTambém novo: procure modelos no Thingiverse direto no app — entre com sua própria conta, navegue por popularidade, downloads ou categoria e coloque um STL na mesa com um toque.",
-                it: "Novità nel PaxxMaker Slicer: scansiona un oggetto con iPhone o iPad e stampalo di nuovo.\n\nGira intorno all'oggetto, capovolgilo per il fondo e il modello 3D viene calcolato direttamente sul dispositivo — la fotocamera fornisce i dettagli, il sensore LiDAR le dimensioni reali. Poi l'app lo rende stampabile da sola: frammenti rimossi, fori chiusi, base spianata. Direttamente sul piano o esportato come STL.\n\nPreciso da mezzo a un millimetro circa — ideale per figure, decorazioni e pezzi sagomati. Richiede iPhone o iPad con LiDAR (modelli Pro).\n\nNovità anche: cerca modelli su Thingiverse direttamente nell'app — accedi con il tuo account, sfoglia per popolarità, download o categoria e metti un STL sul piano con un tocco.",
-                zh: "PaxxMaker 切片新增：用 iPhone 或 iPad 扫描物体，然后直接复制打印。\n\n绕物体走一圈，翻过来扫底面，3D 模型就在设备上生成——相机提供细节，LiDAR 传感器提供真实尺寸。随后 App 会自动处理为可打印模型：去除碎片、补洞、底部切平。可直接放到打印板上，或导出为 STL。\n\n精度约 0.5–1 毫米——非常适合手办、装饰和造型件。需要带 LiDAR 的 iPhone 或 iPad（Pro 机型）。\n\n另外新增：直接在 App 中搜索 Thingiverse 模型——用你自己的账号登录，按热门、下载量或分类浏览，一点即可把 STL 放到打印板上。"))
-                .font(.subheadline).foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-
-
+            VStack(alignment: .leading, spacing: 14) {
+                newsRow("cube.transparent", .blue,
+                        lz(en: "Better slicer", de: "Slicer verbessert", fr: "Slicer amélioré", es: "Slicer mejorado", pt: "Slicer melhorado", it: "Slicer migliorato", zh: "切片改进"),
+                        lz(en: "Works with OrcaSlicer 2.5 and Snapmaker Orca — choose in PaxxMaker-Connect 1.5 where the profiles come from. Models are checked and repaired before slicing.",
+                           de: "Funktioniert mit OrcaSlicer 2.5 und Snapmaker Orca — in PaxxMaker-Connect 1.5 wählst du, woher die Profile kommen. Modelle werden vor dem Slicen geprüft und repariert.",
+                           fr: "Fonctionne avec OrcaSlicer 2.5 et Snapmaker Orca — choisis dans PaxxMaker-Connect 1.5 d'où viennent les profils. Les modèles sont vérifiés et réparés avant le découpage.",
+                           es: "Funciona con OrcaSlicer 2.5 y Snapmaker Orca: elige en PaxxMaker-Connect 1.5 de dónde vienen los perfiles. Los modelos se comprueban y reparan antes de laminar.",
+                           pt: "Funciona com OrcaSlicer 2.5 e Snapmaker Orca — escolha no PaxxMaker-Connect 1.5 de onde vêm os perfis. Os modelos são verificados e reparados antes do fatiamento.",
+                           it: "Funziona con OrcaSlicer 2.5 e Snapmaker Orca — scegli in PaxxMaker-Connect 1.5 da dove arrivano i profili. I modelli vengono controllati e riparati prima dello slicing.",
+                           zh: "支持 OrcaSlicer 2.5 和 Snapmaker Orca——在 PaxxMaker-Connect 1.5 中选择配置来源。切片前会检查并修复模型。"))
+                newsRow("paintpalette.fill", .purple,
+                        lz(en: "Colour mixing", de: "Farbmischung", fr: "Mélange de couleurs", es: "Mezcla de colores", pt: "Mistura de cores", it: "Miscelazione colori", zh: "混色"),
+                        lz(en: "Mix two filaments into a new colour or a gradient from bottom to top — with a preview of the result right in the model view.",
+                           de: "Zwei Filamente zu einer neuen Farbe mischen oder als Farbverlauf von unten nach oben — mit Vorschau des Ergebnisses direkt in der Modellansicht.",
+                           fr: "Mélange deux filaments en une nouvelle couleur ou en dégradé de bas en haut — avec un aperçu du résultat directement dans la vue du modèle.",
+                           es: "Mezcla dos filamentos en un color nuevo o en un degradado de abajo arriba, con vista previa del resultado en la vista del modelo.",
+                           pt: "Misture dois filamentos numa nova cor ou num degradê de baixo para cima — com prévia do resultado direto na visualização do modelo.",
+                           it: "Mescola due filamenti in un nuovo colore o in una sfumatura dal basso verso l'alto — con anteprima del risultato direttamente nella vista del modello.",
+                           zh: "将两种耗材混合成新颜色或从下到上的渐变——在模型视图中直接预览效果。"))
+                newsRow("chart.bar.fill", .green,
+                        lz(en: "Print statistics", de: "Druckstatistik", fr: "Statistiques d'impression", es: "Estadísticas de impresión", pt: "Estatísticas de impressão", it: "Statistiche di stampa", zh: "打印统计"),
+                        lz(en: "After slicing you see filament per head, tool changes and the estimated time. Spools are matched to the right filament profile more reliably.",
+                           de: "Nach dem Slicen siehst du Filament pro Kopf, Werkzeugwechsel und die geschätzte Zeit. Spulen werden zuverlässiger dem passenden Filamentprofil zugeordnet.",
+                           fr: "Après le découpage, tu vois le filament par tête, les changements d'outil et le temps estimé. Les bobines sont associées plus fiablement au bon profil.",
+                           es: "Tras laminar ves el filamento por cabezal, los cambios de herramienta y el tiempo estimado. Los carretes se asignan mejor al perfil correcto.",
+                           pt: "Após o fatiamento você vê o filamento por cabeça, as trocas de ferramenta e o tempo estimado. As bobinas são associadas ao perfil certo com mais precisão.",
+                           it: "Dopo lo slicing vedi il filamento per testina, i cambi utensile e il tempo stimato. Le bobine vengono abbinate al profilo giusto in modo più affidabile.",
+                           zh: "切片后可查看每个打印头的耗材用量、换头次数和预计时间。料盘与耗材配置的匹配也更可靠。"))
+                newsRow("line.3.horizontal.decrease.circle.fill", .orange,
+                        lz(en: "Spoolman: filter & sort", de: "Spoolman: Filtern & Sortieren", fr: "Spoolman : filtrer et trier", es: "Spoolman: filtrar y ordenar", pt: "Spoolman: filtrar e ordenar", it: "Spoolman: filtra e ordina", zh: "Spoolman：筛选与排序"),
+                        lz(en: "Top left: filter by material or fill level and sort by up to two criteria — e.g. by material in blocks (PLA, PETG …) and by fill level within.",
+                           de: "Oben links: nach Material oder Füllstand filtern und nach bis zu zwei Kriterien sortieren — z. B. nach Material in Blöcken (PLA, PETG …) und darin nach Füllstand.",
+                           fr: "En haut à gauche : filtre par matériau ou niveau et trie selon deux critères — p. ex. par matériau en blocs (PLA, PETG …) puis par niveau.",
+                           es: "Arriba a la izquierda: filtra por material o nivel y ordena por hasta dos criterios, p. ej. por material en bloques (PLA, PETG …) y dentro por nivel.",
+                           pt: "No canto superior esquerdo: filtre por material ou nível e ordene por até dois critérios — p. ex. por material em blocos (PLA, PETG …) e dentro deles por nível.",
+                           it: "In alto a sinistra: filtra per materiale o livello e ordina per due criteri — ad es. per materiale a blocchi (PLA, PETG …) e al loro interno per livello.",
+                           zh: "左上角：按材料或余量筛选，并可按两个条件排序——例如按材料分组（PLA、PETG…），组内按余量排序。"))
+                newsRow("bolt.badge.clock.fill", .teal,
+                        lz(en: "Live Activity", de: "Live-Aktivität", fr: "Activité en direct", es: "Actividad en vivo", pt: "Atividade ao Vivo", it: "Attività Live", zh: "实时活动"),
+                        lz(en: "New, slimmer look on the lock screen — see-through, with the name of the print and the time left.",
+                           de: "Neues, schlankeres Design auf dem Sperrbildschirm — durchsichtig, mit Name des Drucks und Restzeit.",
+                           fr: "Nouveau look plus fin sur l'écran verrouillé — transparent, avec le nom de l'impression et le temps restant.",
+                           es: "Nuevo diseño más fino en la pantalla bloqueada: translúcido, con el nombre de la impresión y el tiempo restante.",
+                           pt: "Novo visual mais fino na tela bloqueada — transparente, com o nome da impressão e o tempo restante.",
+                           it: "Nuovo aspetto più snello nella schermata di blocco — trasparente, con il nome della stampa e il tempo residuo.",
+                           zh: "锁屏上的全新精简设计——半透明，显示打印名称和剩余时间。"))
+                if showSlicerTab {
+                    newsRow("hourglass", .orange,
+                            lz(en: "Thingiverse still in review", de: "Thingiverse noch in Prüfung", fr: "Thingiverse en cours de validation", es: "Thingiverse en revisión", pt: "Thingiverse em análise", it: "Thingiverse in verifica", zh: "Thingiverse 审核中"),
+                            lz(en: "Access to the Thingiverse API is still being reviewed. Until it is approved, only a limited number of accesses is available.",
+                               de: "Der Zugang zur Thingiverse-API ist noch in Prüfung. Bis zur Zulassung gibt es aktuell nur begrenzte Zugänge.",
+                               fr: "L'accès à l'API Thingiverse est encore en cours de validation. Jusqu'à l'approbation, les accès sont pour l'instant limités.",
+                               es: "El acceso a la API de Thingiverse todavía está en revisión. Hasta su aprobación, los accesos son limitados por ahora.",
+                               pt: "O acesso à API do Thingiverse ainda está em análise. Até a aprovação, os acessos são limitados por enquanto.",
+                               it: "L'accesso all'API di Thingiverse è ancora in fase di verifica. Fino all'approvazione, gli accessi sono per ora limitati.",
+                               zh: "Thingiverse API 的访问权限仍在审核中。获批之前，目前仅开放有限的访问名额。"))
+                }
             }
-            .padding(.horizontal, 28)
-            .padding(.top, 28)
-            .padding(.bottom, 20)
+        }
+        .padding(.horizontal, 28)
+        .padding(.top, 28)
+        .padding(.bottom, 20)
+    }
+
+    private func newsRow(_ icon: String, _ color: Color, _ title: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 34, height: 34)
+                .background(color.opacity(0.14), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.subheadline).bold()
+                Text(text).font(.footnote).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
     }
 }
 
@@ -11568,6 +12319,7 @@ struct NFCColorOption: Identifiable {
 // MARK: - NFC View
 @available(iOS 15.0, *)
 struct NFCView: View {
+    @ObservedObject private var duo = DuoState.shared
     @StateObject private var nfc = OpenSpoolNFCManager()
     @State private var spoolData = OpenSpoolData()
     @State private var selectedColorID = "gray"
@@ -11638,7 +12390,8 @@ struct NFCView: View {
                             .padding(.horizontal, 24)
                             Spacer()
                         }
-                        .frame(width: 300)
+                        // iPhone Duo half open like a book: the divider on the fold.
+                        .frame(width: duo.book ? max(260, (duo.fold?.minX ?? 300)) : 300)
                         .background(Color(.secondarySystemGroupedBackground))
 
                         Divider()
@@ -12232,6 +12985,9 @@ struct TimelapseView: View {
                     }
                 }
                 .listStyle(.insetGrouped)
+                // iPhone Duo: the printer's colour behind the list, as on the
+                // other printer pages — the grey ended hard at the side column.
+                .scrollContentBackground(DuoState.shared.isFoldable ? .hidden : .automatic)
                 .refreshable { await loadFiles() }
             }
         }

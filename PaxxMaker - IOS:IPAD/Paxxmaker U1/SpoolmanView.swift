@@ -50,6 +50,14 @@ struct SpoolmanView: View {
     @State private var tab = 0
     @State private var showAdd = false
     @State private var nfcAdd: OpenSpoolData?
+    // Spool list: filter and order (remembered).
+    @AppStorage("spool_sort") private var sortKey = SpoolSort.name.rawValue
+    @AppStorage("spool_sort2") private var sortKey2 = ""          // second criterion ("" = none)
+    @AppStorage("spool_sort_desc") private var sortDesc = false
+    // Re-renders (and re-translates) the list and the menu when the language changes.
+    @AppStorage("app_language") private var appLanguage: String = "en"
+    @AppStorage("spool_filter_material") private var filterMaterial = ""
+    @AppStorage("spool_filter_level") private var filterLevel = SpoolLevel.all.rawValue
 
     var body: some View {
         NavigationView {
@@ -60,9 +68,15 @@ struct SpoolmanView: View {
                     content
                 }
             }
+            // A language switch rebuilds the rows too, not only this view.
+            .id(appLanguage)
+            .iPadReadableColumn()
             .navigationTitle("Spoolman")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if tab == 0, SpoolmanConfig.isEnabled, SpoolmanConfig.service != nil { filterMenu.id(appLanguage) }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     if tab == 0 {
                         // Spools: choose how to add — scan an NFC tag or fill in
@@ -131,9 +145,47 @@ struct SpoolmanView: View {
         List {
             // Active spools first; archived (empty) ones only below the toggle,
             // never mixed in between the full ones.
-            ForEach(store.spools.filter { !$0.archived }) { spool in
-                NavigationLink { SpoolDetailView(store: store, spool: spool) } label: {
-                    SpoolRow(spool: spool)
+            if filterActive {
+                // What is filtered — one tap clears it.
+                Button {
+                    filterMaterial = ""; filterLevel = SpoolLevel.all.rawValue
+                } label: {
+                    HStack {
+                        Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                        Text(filterSummary).lineLimit(1)
+                        Spacer()
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .font(.footnote)
+                }
+            }
+            let shown = arranged(store.spools.filter { !$0.archived })
+            if shown.isEmpty, filterActive {
+                Text(lz(en: "No spool matches the filter.", de: "Keine Spule passt zum Filter.", fr: "Aucune bobine ne correspond au filtre.", es: "Ningún carrete coincide con el filtro.", pt: "Nenhuma bobina corresponde ao filtro.", it: "Nessuna bobina corrisponde al filtro.", zh: "没有符合筛选的料盘。"))
+                    .foregroundStyle(.secondary)
+            }
+            if let groups = grouped(shown) {
+                // Sorted by material / manufacturer: one block per value, with its heading.
+                ForEach(groups, id: \.title) { g in
+                    Section {
+                        ForEach(g.spools) { spool in
+                            NavigationLink { SpoolDetailView(store: store, spool: spool) } label: {
+                                SpoolRow(spool: spool)
+                            }
+                        }
+                    } header: {
+                        HStack {
+                            Text(g.title)
+                            Spacer()
+                            Text("\(g.spools.count)").monospacedDigit()
+                        }
+                    }
+                }
+            } else {
+                ForEach(shown) { spool in
+                    NavigationLink { SpoolDetailView(store: store, spool: spool) } label: {
+                        SpoolRow(spool: spool)
+                    }
                 }
             }
             // Archive toggle at the very bottom, out of the way.
@@ -148,7 +200,7 @@ struct SpoolmanView: View {
                         Text(lz(en: "No archived spools", de: "Keine archivierten Spulen", fr: "Aucune bobine archivée", es: "Sin carretes archivados", pt: "Sem bobinas arquivadas", it: "Nessuna bobina archiviata", zh: "没有已归档的料盘"))
                             .foregroundStyle(.secondary)
                     }
-                    ForEach(archived) { spool in
+                    ForEach(arranged(archived)) { spool in
                         NavigationLink { SpoolDetailView(store: store, spool: spool) } label: {
                             SpoolRow(spool: spool)
                         }
@@ -159,6 +211,150 @@ struct SpoolmanView: View {
         .listStyle(.insetGrouped)
         .refreshable { await store.reloadAll() }
         .overlay { if store.isLoading && store.spools.isEmpty { ProgressView() } }
+    }
+
+    // ── Filter & sort ───────────────────────────────────────────────────────
+
+    /// Materials of the spools there are ("PLA", "PETG" …), for the filter.
+    private var materials: [String] {
+        Array(Set(store.spools.compactMap { ($0.filament.material ?? "").trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+    private var filterActive: Bool { !filterMaterial.isEmpty || filterLevel != SpoolLevel.all.rawValue }
+    private var filterSummary: String {
+        var parts: [String] = []
+        if !filterMaterial.isEmpty { parts.append(filterMaterial) }
+        if let l = SpoolLevel(rawValue: filterLevel), l != .all { parts.append(l.title) }
+        return parts.joined(separator: " · ")
+    }
+
+    private var filterMenu: some View {
+        Menu {
+            Section(lz(en: "Sort by", de: "Sortieren nach", fr: "Trier par", es: "Ordenar por", pt: "Ordenar por", it: "Ordina per", zh: "排序方式")) {
+                // Up to two ticks: the first one sorts (and forms blocks for
+                // material / manufacturer), the second one orders inside.
+                ForEach(SpoolSort.allCases) { k in
+                    Toggle(isOn: Binding(get: { sortKey == k.rawValue || sortKey2 == k.rawValue },
+                                         set: { _ in toggleSort(k) })) {
+                        Label(sortLabel(k), systemImage: k.icon)
+                    }
+                    .menuActionDismissBehavior(.disabled)
+                }
+                Toggle(isOn: $sortDesc) {
+                    Label(lz(en: "Reverse order", de: "Umgekehrte Reihenfolge", fr: "Ordre inverse", es: "Orden inverso", pt: "Ordem inversa", it: "Ordine inverso", zh: "倒序"), systemImage: "arrow.up.arrow.down")
+                }
+            }
+            Section(lz(en: "Fill level", de: "Füllstand", fr: "Niveau", es: "Nivel", pt: "Nível", it: "Livello", zh: "余量")) {
+                Picker("", selection: $filterLevel) {
+                    ForEach(SpoolLevel.allCases) { l in Text(l.title).tag(l.rawValue) }
+                }
+            }
+            Section(lz(en: "Material", de: "Material", fr: "Matériau", es: "Material", pt: "Material", it: "Materiale", zh: "材料")) {
+                Picker("", selection: $filterMaterial) {
+                    Text(lz(en: "All", de: "Alle", fr: "Tous", es: "Todos", pt: "Todos", it: "Tutti", zh: "全部")).tag("")
+                    ForEach(materials, id: \.self) { Text($0).tag($0) }
+                }
+            }
+        } label: {
+            Label(lz(en: "Filter & sort", de: "Filter & Sortieren", fr: "Filtrer et trier", es: "Filtrar y ordenar", pt: "Filtrar e ordenar", it: "Filtra e ordina", zh: "筛选与排序"),
+                  systemImage: filterActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+        }
+    }
+
+    private func toggleSort(_ k: SpoolSort) {
+        let key = k.rawValue
+        if sortKey == key {
+            // Untick the first criterion: the second one moves up; the last tick stays.
+            if !sortKey2.isEmpty { sortKey = sortKey2; sortKey2 = "" }
+        } else if sortKey2 == key {
+            sortKey2 = ""
+        } else if sortKey == SpoolSort.name.rawValue && sortKey2.isEmpty {
+            // Only the default (name) was ticked: the new tick takes its place —
+            // ticking "Material" should give the blocks right away. Name stays
+            // the last tie-break anyway.
+            sortKey = key
+        } else {
+            sortKey2 = key        // second tick (replaces an earlier second one)
+        }
+    }
+    private func sortLabel(_ k: SpoolSort) -> String {
+        guard !sortKey2.isEmpty else { return k.title }
+        if sortKey == k.rawValue { return "1. " + k.title }
+        if sortKey2 == k.rawValue { return "2. " + k.title }
+        return k.title
+    }
+
+    /// Blocks with a heading when the first criterion is material or manufacturer.
+    private func grouped(_ list: [SpoolmanSpool]) -> [(title: String, spools: [SpoolmanSpool])]? {
+        let key = SpoolSort(rawValue: sortKey) ?? .name
+        let none: String
+        let value: (SpoolmanSpool) -> String
+        switch key {
+        case .material:
+            none = lz(en: "No material", de: "Ohne Material", fr: "Sans matériau", es: "Sin material", pt: "Sem material", it: "Senza materiale", zh: "无材料")
+            value = { ($0.filament.material ?? "").trimmingCharacters(in: .whitespaces).uppercased() }
+        case .vendor:
+            none = lz(en: "No manufacturer", de: "Ohne Hersteller", fr: "Sans fabricant", es: "Sin fabricante", pt: "Sem fabricante", it: "Senza produttore", zh: "无厂商")
+            value = { ($0.filament.vendor?.name ?? "").trimmingCharacters(in: .whitespaces) }
+        default:
+            return nil
+        }
+        var out: [(title: String, spools: [SpoolmanSpool])] = []
+        for sp in list {
+            let v = value(sp)
+            let t = v.isEmpty ? none : v
+            if let i = out.firstIndex(where: { $0.title.caseInsensitiveCompare(t) == .orderedSame }) {
+                out[i].spools.append(sp)
+            } else {
+                out.append((t, [sp]))
+            }
+        }
+        return out
+    }
+
+    /// The spools filtered and in the chosen order.
+    private func arranged(_ list: [SpoolmanSpool]) -> [SpoolmanSpool] {
+        let level = SpoolLevel(rawValue: filterLevel) ?? .all
+        let filtered = list.filter { sp in
+            if !filterMaterial.isEmpty,
+               (sp.filament.material ?? "").trimmingCharacters(in: .whitespaces).caseInsensitiveCompare(filterMaterial) != .orderedSame { return false }
+            return level.contains(sp.remainingFraction)
+        }
+        let keys = [sortKey, sortKey2].compactMap { SpoolSort(rawValue: $0) }
+        func name(_ s: SpoolmanSpool) -> String { s.filament.displayName }
+        func text(_ x: String, _ y: String) -> Int {
+            switch x.localizedCaseInsensitiveCompare(y) {
+            case .orderedAscending: return -1
+            case .orderedDescending: return 1
+            default: return 0
+            }
+        }
+        func num(_ x: Double, _ y: Double) -> Int { x < y ? -1 : (x > y ? 1 : 0) }
+        // -1 / 0 / 1 for one criterion.
+        func cmp(_ a: SpoolmanSpool, _ b: SpoolmanSpool, _ key: SpoolSort) -> Int {
+            switch key {
+            case .name: return text(name(a), name(b))
+            // Emptiest first; unknown fill level at the end.
+            case .level: return num(a.remainingFraction ?? 2, b.remainingFraction ?? 2)
+            case .remaining: return num(a.remaining_weight ?? .infinity, b.remaining_weight ?? .infinity)
+            case .colour: return num(SpoolSort.colourKey(a.filament.color_hex), SpoolSort.colourKey(b.filament.color_hex))
+            case .material:
+                let ma = (a.filament.material ?? "").trimmingCharacters(in: .whitespaces)
+                let mb = (b.filament.material ?? "").trimmingCharacters(in: .whitespaces)
+                return text(ma.isEmpty ? "~" : ma, mb.isEmpty ? "~" : mb)
+            case .vendor: return text(a.filament.vendor?.name ?? "~", b.filament.vendor?.name ?? "~")
+            // Most recently used first; never used at the end.
+            case .lastUsed: return -text(a.last_used ?? "", b.last_used ?? "")
+            }
+        }
+        let sorted = filtered.sorted { a, b in
+            for k in keys + [.name] {
+                let c = cmp(a, b, k)
+                if c != 0 { return c < 0 }
+            }
+            return false
+        }
+        return sortDesc ? sorted.reversed() : sorted
     }
 
     // ── Filaments ───────────────────────────────────────────────────────────
@@ -298,11 +494,15 @@ struct ActiveSpoolTileView: View {
                 HStack(spacing: 12) {
                     ColorDot(hex: a.filament.color_hex, size: 38)
                     VStack(alignment: .leading, spacing: 3) {
+                        // Two lines for the name and a shrinking subtitle: in a
+                        // half-width tile on a 6.1" iPhone "PETG · 640 g" was cut
+                        // to "PETG · 64…", which read as 64 g.
                         Text(a.filament.rowTitle).font(.headline).foregroundColor(.primary)
-                            .lineLimit(1).minimumScaleFactor(0.8)
+                            .lineLimit(2).minimumScaleFactor(0.8)
                         let sub = [a.filament.material, a.remaining_weight.map { "\(Int($0)) g" }].compactMap { $0 }.joined(separator: " · ")
                         if !sub.isEmpty {
-                            Text(sub).font(.subheadline).foregroundColor(.secondary).lineLimit(1)
+                            Text(sub).font(.subheadline).foregroundColor(.secondary)
+                                .lineLimit(1).minimumScaleFactor(0.7)
                         }
                     }
                     Spacer(minLength: 0)
@@ -1008,6 +1208,72 @@ struct SpoollinkSheet: View {
         if let list = try? await svc.spools(includeArchived: false) {
             await MainActor.run { self.spools = list; self.spoolsLoaded = true }
             await MainActor.run { printer.refreshSpoolCardIndex() }
+        }
+    }
+}
+
+
+// MARK: - Spool list order and fill-level filter
+
+enum SpoolSort: String, CaseIterable, Identifiable {
+    case name, level, remaining, colour, material, vendor, lastUsed
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .name: return lz(en: "Name", de: "Name", fr: "Nom", es: "Nombre", pt: "Nome", it: "Nome", zh: "名称")
+        case .level: return lz(en: "Fill level (%)", de: "Füllstand (%)", fr: "Niveau (%)", es: "Nivel (%)", pt: "Nível (%)", it: "Livello (%)", zh: "余量 (%)")
+        case .remaining: return lz(en: "Remaining (g)", de: "Restmenge (g)", fr: "Restant (g)", es: "Restante (g)", pt: "Restante (g)", it: "Rimanente (g)", zh: "剩余 (克)")
+        case .colour: return lz(en: "Colour", de: "Farbe", fr: "Couleur", es: "Color", pt: "Cor", it: "Colore", zh: "颜色")
+        case .material: return lz(en: "Material", de: "Material", fr: "Matériau", es: "Material", pt: "Material", it: "Materiale", zh: "材料")
+        case .vendor: return lz(en: "Manufacturer", de: "Hersteller", fr: "Fabricant", es: "Fabricante", pt: "Fabricante", it: "Produttore", zh: "厂商")
+        case .lastUsed: return lz(en: "Last used", de: "Zuletzt benutzt", fr: "Dernière utilisation", es: "Último uso", pt: "Último uso", it: "Ultimo uso", zh: "最近使用")
+        }
+    }
+    var icon: String {
+        switch self {
+        case .name: return "textformat"
+        case .level: return "gauge.with.dots.needle.33percent"
+        case .remaining: return "scalemass"
+        case .colour: return "paintpalette"
+        case .material: return "square.stack.3d.up"
+        case .vendor: return "building.2"
+        case .lastUsed: return "clock"
+        }
+    }
+
+    /// Colours in rainbow order: greys (black → white) first, then by hue.
+    static func colourKey(_ hex: String?) -> Double {
+        let h = (hex ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "# "))
+        guard h.count >= 6, let v = Int(h.prefix(6), radix: 16) else { return 10 }
+        let r = Double((v >> 16) & 255) / 255, g = Double((v >> 8) & 255) / 255, b = Double(v & 255) / 255
+        let mx = max(r, g, b), mn = min(r, g, b), d = mx - mn
+        if d < 0.08 { return mx }                           // grey scale: 0…1
+        var hue: Double
+        if mx == r { hue = ((g - b) / d).truncatingRemainder(dividingBy: 6) }
+        else if mx == g { hue = (b - r) / d + 2 }
+        else { hue = (r - g) / d + 4 }
+        hue = hue < 0 ? hue + 6 : hue
+        return 1 + hue / 6                                  // colours: 1…2
+    }
+}
+
+enum SpoolLevel: String, CaseIterable, Identifiable {
+    case all, low, half, full
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .all: return lz(en: "All", de: "Alle", fr: "Toutes", es: "Todos", pt: "Todas", it: "Tutte", zh: "全部")
+        case .low: return lz(en: "Almost empty (< 20 %)", de: "Fast leer (< 20 %)", fr: "Presque vide (< 20 %)", es: "Casi vacío (< 20 %)", pt: "Quase vazia (< 20 %)", it: "Quasi vuota (< 20 %)", zh: "快用完 (< 20 %)")
+        case .half: return lz(en: "Half (20–60 %)", de: "Halb voll (20–60 %)", fr: "À moitié (20–60 %)", es: "A medias (20–60 %)", pt: "Meia (20–60 %)", it: "A metà (20–60 %)", zh: "一半 (20–60 %)")
+        case .full: return lz(en: "Full (> 60 %)", de: "Voll (> 60 %)", fr: "Pleine (> 60 %)", es: "Lleno (> 60 %)", pt: "Cheia (> 60 %)", it: "Piena (> 60 %)", zh: "较满 (> 60 %)")
+        }
+    }
+    func contains(_ f: Double?) -> Bool {
+        switch self {
+        case .all: return true
+        case .low: return (f ?? 1) < 0.2
+        case .half: return f.map { $0 >= 0.2 && $0 <= 0.6 } ?? false
+        case .full: return (f ?? 0) > 0.6
         }
     }
 }

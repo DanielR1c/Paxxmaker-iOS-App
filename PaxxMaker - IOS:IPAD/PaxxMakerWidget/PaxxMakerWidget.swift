@@ -48,51 +48,133 @@ struct PrinterTimelineProvider: AppIntentTimelineProvider {
 }
 
 // MARK: - Shared helpers
-private func tempCell(_ label: String, _ value: String) -> some View {
+// The look follows the Live Activity: the print's thumbnail with a status dot,
+// the print's name, the time left and a slim progress bar in the state colour
+// — on a calm background (light or dark with the system) that carries only a
+// hint of the printer's theme colour.
+
+private func modernBackground(_ accent: Color) -> some View {
+    ZStack {
+        Color(.systemBackground)
+        LinearGradient(colors: [accent.opacity(0.30), accent.opacity(0.08)],
+                       startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+}
+
+private func stateDotColor(_ data: PrinterWidgetData) -> Color {
+    data.printState == "standby" || data.printState == "unknown" ? .gray : data.stateColor
+}
+
+private func stateIcon(_ state: String) -> String {
+    switch state {
+    case "paused":   return "pause.fill"
+    case "error":    return "exclamationmark"
+    case "complete": return "checkmark"
+    default:         return "printer.fill"
+    }
+}
+
+/// Thumbnail of the current print (or the printer symbol) in a rounded tile,
+/// with the state as a dot (printing) or a small badge — as in the Live Activity.
+private struct PrintThumb: View {
+    let data: PrinterWidgetData
+    let size: CGFloat
+    var body: some View {
+        let color = stateDotColor(data)
+        Group {
+            if let img = data.thumbnail {
+                Image(uiImage: img).resizable().scaledToFit().padding(size * 0.07)
+            } else {
+                Image(systemName: "printer.fill")
+                    .font(.system(size: size * 0.40, weight: .semibold))
+                    .foregroundStyle(data.themeColor)
+            }
+        }
+        .frame(width: size, height: size)
+        .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: size * 0.26, style: .continuous))
+        .overlay(alignment: .bottomTrailing) {
+            Group {
+                if data.printState == "printing" || data.printState == "standby" || data.printState == "unknown" {
+                    Circle().fill(color)
+                        .frame(width: size * 0.2, height: size * 0.2)
+                        .overlay(Circle().strokeBorder(Color(.systemBackground), lineWidth: 2))
+                } else {
+                    Image(systemName: stateIcon(data.printState))
+                        .font(.system(size: size * 0.16, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: size * 0.3, height: size * 0.3)
+                        .background(color, in: Circle())
+                }
+            }
+            .offset(x: size * 0.06, y: size * 0.06)
+        }
+    }
+}
+
+private func progressBar(_ progress: Double, _ color: Color, height: CGFloat = 4) -> some View {
+    GeometryReader { geo in
+        ZStack(alignment: .leading) {
+            Capsule().fill(Color.primary.opacity(0.12))
+            Capsule().fill(color)
+                .frame(width: max(height, geo.size.width * min(1, max(0, progress))))
+        }
+    }
+    .frame(height: height)
+}
+
+private func percentText(_ progress: Double, size: CGFloat) -> some View {
+    HStack(alignment: .firstTextBaseline, spacing: 1) {
+        Text("\(Int(progress * 100))")
+            .font(.system(size: size, weight: .bold, design: .rounded))
+            .monospacedDigit()
+        Text("%")
+            .font(.system(size: size * 0.5, weight: .semibold, design: .rounded))
+            .foregroundStyle(.secondary)
+    }
+}
+
+/// Small temperature/time chip: symbol + value.
+private func chip(_ symbol: String, _ value: String) -> some View {
+    HStack(spacing: 3) {
+        Image(systemName: symbol).font(.system(size: 9, weight: .semibold))
+        Text(value).fixedSize()
+    }
+}
+
+private func titleLine(_ data: PrinterWidgetData) -> String {
+    data.isActive && !data.shortFilename.isEmpty ? data.shortFilename : data.name
+}
+
+/// "Snapmaker U1 · Printing" under the print's name, or only the state.
+private func subtitleLine(_ data: PrinterWidgetData) -> String {
+    data.isActive && !data.shortFilename.isEmpty ? "\(data.name) · \(data.stateLabel)" : data.stateLabel
+}
+
+/// One labelled value in a soft panel cell (large widget).
+private func valueCell(_ label: String, _ value: String) -> some View {
     VStack(spacing: 2) {
         Text(label)
-            .font(.system(size: 10))
-            .foregroundStyle(.white.opacity(0.65))
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
         Text(value)
-            .font(.system(size: 16, weight: .semibold, design: .rounded))
-            .foregroundStyle(.white)
+            .font(.system(size: 15, weight: .semibold, design: .rounded))
+            .monospacedDigit()
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
     }
     .frame(maxWidth: .infinity)
 }
 
-private func thinDivider() -> some View {
-    Rectangle()
-        .fill(Color.white.opacity(0.25))
-        .frame(width: 1, height: 28)
-}
-
-private func progressRing(progress: Double, size: CGFloat, lineWidth: CGFloat) -> some View {
-    ZStack {
-        Circle()
-            .stroke(Color.white.opacity(0.2), lineWidth: lineWidth)
-        Circle()
-            .trim(from: 0, to: progress)
-            .stroke(Color.white, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
-            .rotationEffect(.degrees(-90))
-            .shadow(color: .white.opacity(0.35), radius: 4)
-        VStack(spacing: 0) {
-            Text("\(Int(progress * 100))")
-                .font(.system(size: size * 0.31, weight: .bold, design: .rounded))
-                .foregroundStyle(.white)
-            Text("%")
-                .font(.system(size: size * 0.13, weight: .medium))
-                .foregroundStyle(.white.opacity(0.65))
-        }
-    }
-    .frame(width: size, height: size)
-}
-
-private func gradientBackground(_ color: Color) -> some View {
-    LinearGradient(
-        colors: [color, color.opacity(0.55)],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-    )
+private func spoolDot(_ slot: SpoolSlotData, size: CGFloat) -> some View {
+    Circle()
+        .fill(slot.detected
+              ? AnyShapeStyle(LinearGradient(colors: [slot.color, slot.gradientEnd],
+                                             startPoint: .topLeading, endPoint: .bottomTrailing))
+              : AnyShapeStyle(Color.primary.opacity(0.08)))
+        .frame(width: size, height: size)
+        .overlay(Circle().strokeBorder(Color.primary.opacity(0.15), lineWidth: 1))
+        .shadow(color: slot.detected ? slot.color.opacity(0.35) : .clear, radius: 4, y: 1)
 }
 
 // MARK: - Small Widget (2×2)
@@ -100,64 +182,36 @@ struct SmallWidgetView: View {
     let data: PrinterWidgetData
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header row
             HStack(alignment: .top) {
-                Text(data.name)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.7))
-                    .lineLimit(1)
-                Spacer()
-                Circle().fill(.white)
-                    .frame(width: 6, height: 6)
-                    .opacity(data.isActive ? 1 : 0.3)
-                    .shadow(color: .white.opacity(0.8), radius: data.isActive ? 4 : 0)
-            }
-
-            Text(data.stateLabel)
-                .font(.system(size: 22, weight: .bold, design: .rounded))
-                .foregroundStyle(.white)
-                .padding(.top, 2)
-
-            Spacer(minLength: 6)
-
-            // Ring centered
-            HStack {
-                Spacer()
-                progressRing(progress: data.progress, size: 62, lineWidth: 7)
-                Spacer()
-            }
-
-            Spacer(minLength: 4)
-
-            if data.isActive && data.eta > 0 {
-                HStack(spacing: 3) {
-                    Image(systemName: "timer").font(.system(size: 9, weight: .semibold))
-                    Text(data.formattedETA).fixedSize()
+                PrintThumb(data: data, size: 50)
+                Spacer(minLength: 4)
+                if data.isActive {
+                    percentText(data.progress, size: 26)
                 }
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.75))
             }
-
-            Spacer(minLength: 4)
-
-            // Temp pill
-            HStack(spacing: 4) {
-                Image(systemName: "flame.fill").font(.system(size: 9, weight: .semibold))
-                Text("\(Int(data.extruderTemp))°").fixedSize()
-                Spacer(minLength: 6)
-                Image(systemName: "square.fill").font(.system(size: 9, weight: .semibold))
-                Text("\(Int(data.bedTemp))°").fixedSize()
+            Spacer(minLength: 6)
+            Text(titleLine(data))
+                .font(.system(size: 14, weight: .semibold))
+                .lineLimit(1)
+            Text(data.etaLeft ?? subtitleLine(data))
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .padding(.top, 1)
+            if data.isActive {
+                progressBar(data.progress, data.stateColor)
+                    .padding(.top, 9)
+            } else {
+                HStack(spacing: 10) {
+                    chip("flame.fill", "\(Int(data.extruderTemp))°")
+                    chip("square.fill", "\(Int(data.bedTemp))°")
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.top, 7)
             }
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Color.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
         }
-        .padding(14)
-        .containerBackground(for: .widget) {
-            gradientBackground(data.themeColor)
-        }
+        .containerBackground(for: .widget) { modernBackground(data.themeColor) }
     }
 }
 
@@ -166,73 +220,42 @@ struct MediumWidgetView: View {
     let data: PrinterWidgetData
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
-            // Left: state info + progress
-            VStack(alignment: .leading, spacing: 5) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(data.name)
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.7))
-                        .lineLimit(1)
-                    Text(data.stateLabel)
-                        .font(.system(size: 26, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                }
-
-                Spacer(minLength: 0)
-
-                if data.isActive, !data.shortFilename.isEmpty {
-                    Text(data.shortFilename)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(0.65))
-                        .lineLimit(1)
-                }
-
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(Color.white.opacity(0.2)).frame(height: 5)
-                        Capsule().fill(Color.white)
-                            .frame(width: max(5, geo.size.width * data.progress), height: 5)
-                    }
-                }.frame(height: 5)
-
-                HStack(spacing: 8) {
-                    HStack(spacing: 3) {
-                        Image(systemName: "flame.fill").font(.system(size: 9, weight: .semibold))
-                        Text("\(Int(data.extruderTemp))°").fixedSize()
-                    }
-                    HStack(spacing: 3) {
-                        Image(systemName: "square.fill").font(.system(size: 9, weight: .semibold))
-                        Text("\(Int(data.bedTemp))°").fixedSize()
-                    }
-                    if data.isActive && data.eta > 0 {
-                        HStack(spacing: 3) {
-                            Image(systemName: "timer").font(.system(size: 9, weight: .semibold))
-                            Text(data.formattedETA).fixedSize()
+            PrintThumb(data: data, size: 100)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(titleLine(data))
+                    .font(.system(size: 16, weight: .bold))
+                    .lineLimit(1)
+                Text(subtitleLine(data))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.top, 1)
+                Spacer(minLength: 4)
+                if data.isActive {
+                    HStack(alignment: .firstTextBaseline) {
+                        percentText(data.progress, size: 30)
+                        Spacer(minLength: 4)
+                        if let eta = data.etaLeft {
+                            Text(eta)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
                         }
                     }
+                    progressBar(data.progress, data.stateColor)
+                        .padding(.top, 4)
+                    Spacer(minLength: 6)
+                }
+                HStack(spacing: 12) {
+                    chip("flame.fill", "\(Int(data.extruderTemp))°")
+                    chip("square.fill", "\(Int(data.bedTemp))°")
+                    if let ct = data.chamberTemp { chip("cube.transparent", "\(Int(ct))°") }
                 }
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.85))
+                .foregroundStyle(.secondary)
             }
-
-            // Right: big percentage
-            VStack(spacing: 2) {
-                Spacer()
-                Text("\(Int(data.progress * 100))")
-                    .font(.system(size: 44, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .monospacedDigit()
-                Text("%")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.65))
-                Spacer()
-            }
-            .frame(width: 62)
         }
-        .padding(16)
-        .containerBackground(for: .widget) {
-            gradientBackground(data.themeColor)
-        }
+        .containerBackground(for: .widget) { modernBackground(data.themeColor) }
     }
 }
 
@@ -241,108 +264,84 @@ struct LargeWidgetView: View {
     let data: PrinterWidgetData
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-
-            // Header: state text + ring side-by-side
             HStack(alignment: .center, spacing: 14) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Text(data.name)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.7))
-                            .lineLimit(1)
-                        Circle().fill(.white)
-                            .frame(width: 6, height: 6)
-                            .opacity(data.isActive ? 1 : 0.3)
-                            .shadow(color: .white.opacity(0.8), radius: data.isActive ? 4 : 0)
-                    }
-                    Text(data.stateLabel)
-                        .font(.system(size: 36, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                    if data.isActive && !data.shortFilename.isEmpty {
-                        Text(data.shortFilename)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.white.opacity(0.65))
-                            .lineLimit(1)
-                            .padding(.top, 1)
+                PrintThumb(data: data, size: 84)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(titleLine(data))
+                        .font(.system(size: 17, weight: .bold))
+                        .lineLimit(1)
+                    Text(subtitleLine(data))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if data.isActive {
+                        HStack(alignment: .firstTextBaseline) {
+                            percentText(data.progress, size: 32)
+                            Spacer(minLength: 4)
+                            if let eta = data.etaLeft {
+                                Text(eta)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.top, 2)
                     }
                 }
-                Spacer()
-                progressRing(progress: data.progress, size: 92, lineWidth: 10)
+            }
+            if data.isActive {
+                progressBar(data.progress, data.stateColor, height: 5)
+                    .padding(.top, 10)
+                Spacer(minLength: 12)
+            } else {
+                // Not printing: the values right below the header, the spare
+                // room at the bottom — not a gap in the middle.
+                Color.clear.frame(height: 14)
             }
 
-            Spacer(minLength: 14)
-
-            // Main temp panel
+            // Temperatures and time
             HStack(spacing: 0) {
-                tempCell("Extruder", "\(Int(data.extruderTemp))°C")
-                thinDivider()
-                tempCell("Bett", "\(Int(data.bedTemp))°C")
-                if data.isActive && data.timeElapsed > 0 {
-                    thinDivider()
-                    tempCell("Verstr.", data.formattedTime)
+                valueCell(lzShared(en: "Nozzle", de: "Düse", fr: "Buse", es: "Boquilla", pt: "Bico", it: "Ugello", zh: "喷嘴"), "\(Int(data.extruderTemp))°C")
+                valueCell(lzShared(en: "Bed", de: "Bett", fr: "Plateau", es: "Cama", pt: "Mesa", it: "Piatto", zh: "热床"), "\(Int(data.bedTemp))°C")
+                if let ct = data.chamberTemp {
+                    valueCell(lzShared(en: "Chamber", de: "Bauraum", fr: "Caisson", es: "Cámara", pt: "Câmara", it: "Camera", zh: "腔体"), "\(Int(ct))°C")
                 }
-                if data.isActive && data.eta > 0 {
-                    thinDivider()
-                    tempCell("ETA", data.formattedETA)
+                if data.isActive && data.timeElapsed > 0 {
+                    valueCell(lzShared(en: "Elapsed", de: "Verstrichen", fr: "Écoulé", es: "Transcurrido", pt: "Decorrido", it: "Trascorso", zh: "已用"), data.formattedTime)
                 }
             }
             .padding(.vertical, 10)
-            .background(Color.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 14))
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-            // Motor / chamber panel
-            if data.motorTempX != nil || data.motorTempY != nil || data.chamberTemp != nil {
-                Spacer(minLength: 8)
+            if data.motorTempX != nil || data.motorTempY != nil {
                 HStack(spacing: 0) {
-                    if let mx = data.motorTempX {
-                        tempCell("Motor X", "\(Int(mx))°C")
-                        if data.motorTempY != nil || data.chamberTemp != nil { thinDivider() }
-                    }
-                    if let my = data.motorTempY {
-                        tempCell("Motor Y", "\(Int(my))°C")
-                        if data.chamberTemp != nil { thinDivider() }
-                    }
-                    if let ct = data.chamberTemp {
-                        tempCell("Bauraum", "\(Int(ct))°C")
-                    }
+                    if let mx = data.motorTempX { valueCell("Motor X", "\(Int(mx))°C") }
+                    if let my = data.motorTempY { valueCell("Motor Y", "\(Int(my))°C") }
                 }
                 .padding(.vertical, 10)
-                .background(Color.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 14))
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.top, 8)
             }
 
-            // Spool panel
             if !data.spoolSlots.isEmpty {
-                Spacer(minLength: 8)
                 HStack(spacing: 0) {
                     ForEach(Array(data.spoolSlots.enumerated()), id: \.offset) { _, slot in
                         VStack(spacing: 5) {
-                            Circle()
-                                .fill(slot.detected
-                                    ? AnyShapeStyle(LinearGradient(
-                                        colors: [slot.color, slot.gradientEnd],
-                                        startPoint: .topLeading, endPoint: .bottomTrailing))
-                                    : AnyShapeStyle(Color.white.opacity(0.15)))
-                                .frame(width: 30, height: 30)
-                                .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
-                                .shadow(color: slot.detected ? slot.color.opacity(0.5) : .clear, radius: 5)
+                            spoolDot(slot, size: 28)
                             Text(slot.detected ? slot.material : "–")
                                 .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(.white.opacity(slot.detected ? 0.85 : 0.4))
+                                .foregroundStyle(slot.detected ? .primary : .secondary)
                                 .lineLimit(1)
                         }
                         .frame(maxWidth: .infinity)
                     }
                 }
-                .padding(.horizontal, 6)
                 .padding(.vertical, 10)
-                .background(Color.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 14))
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.top, 8)
             }
-
             Spacer(minLength: 0)
         }
-        .padding(16)
-        .containerBackground(for: .widget) {
-            gradientBackground(data.themeColor)
-        }
+        .containerBackground(for: .widget) { modernBackground(data.themeColor) }
     }
 }
 
@@ -352,8 +351,7 @@ struct SpoolSmallWidgetView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(data.name)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.7))
+                .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
             Spacer(minLength: 0)
             let slots = data.spoolSlots.isEmpty
@@ -362,27 +360,16 @@ struct SpoolSmallWidgetView: View {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
                 ForEach(Array(slots.prefix(4).enumerated()), id: \.offset) { i, slot in
                     VStack(spacing: 4) {
-                        Circle()
-                            .fill(slot.detected
-                                ? AnyShapeStyle(LinearGradient(
-                                    colors: [slot.color, slot.gradientEnd],
-                                    startPoint: .topLeading, endPoint: .bottomTrailing))
-                                : AnyShapeStyle(Color.white.opacity(0.15)))
-                            .frame(width: 32, height: 32)
-                            .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
-                            .shadow(color: slot.detected ? slot.color.opacity(0.45) : .clear, radius: 5)
+                        spoolDot(slot, size: 34)
                         let temp = data.extruderTemps.indices.contains(i) ? data.extruderTemps[i] : 0
                         Text(temp > 0 ? "\(Int(temp))°" : "–")
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.65))
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
         }
-        .padding(13)
-        .containerBackground(for: .widget) {
-            gradientBackground(data.themeColor)
-        }
+        .containerBackground(for: .widget) { modernBackground(data.themeColor) }
     }
 }
 
@@ -392,8 +379,7 @@ struct SpoolMediumWidgetView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(data.name)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.7))
+                .font(.system(size: 12, weight: .semibold))
             Spacer(minLength: 0)
             let slots = data.spoolSlots.isEmpty
                 ? (0..<4).map { _ in SpoolSlotData(colorHex: "888888", material: "–", detected: false) }
@@ -401,43 +387,28 @@ struct SpoolMediumWidgetView: View {
             HStack(spacing: 0) {
                 ForEach(Array(slots.prefix(4).enumerated()), id: \.offset) { i, slot in
                     VStack(spacing: 6) {
-                        ZStack {
-                            Circle()
-                                .fill(slot.detected
-                                    ? AnyShapeStyle(LinearGradient(
-                                        colors: [slot.color, slot.gradientEnd],
-                                        startPoint: .topLeading, endPoint: .bottomTrailing))
-                                    : AnyShapeStyle(Color.white.opacity(0.12)))
-                                .frame(width: 44, height: 44)
-                                .shadow(color: slot.detected ? slot.color.opacity(0.5) : .clear, radius: 8, y: 3)
-                            Circle()
-                                .strokeBorder(Color.white.opacity(slot.detected ? 0.25 : 0.1), lineWidth: 1.5)
-                                .frame(width: 44, height: 44)
-                            if slot.detected {
-                                Circle().fill(Color.white.opacity(0.22)).frame(width: 14, height: 14)
-                            } else {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundStyle(.white.opacity(0.4))
+                        spoolDot(slot, size: 44)
+                            .overlay {
+                                if !slot.detected {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundStyle(.secondary)
+                                }
                             }
-                        }
                         Text(slot.detected ? slot.material : "–")
                             .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.white.opacity(slot.detected ? 0.85 : 0.4))
+                            .foregroundStyle(slot.detected ? .primary : .secondary)
                             .lineLimit(1)
                         let temp = data.extruderTemps.indices.contains(i) ? data.extruderTemps[i] : 0
                         Text(temp > 0 ? "\(Int(temp))°" : "–")
                             .font(.system(size: 9))
-                            .foregroundStyle(.white.opacity(0.5))
+                            .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity)
                 }
             }
         }
-        .padding(14)
-        .containerBackground(for: .widget) {
-            gradientBackground(data.themeColor)
-        }
+        .containerBackground(for: .widget) { modernBackground(data.themeColor) }
     }
 }
 

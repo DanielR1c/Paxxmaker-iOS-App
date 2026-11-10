@@ -226,22 +226,31 @@ private final class TuyaSession {
     }
 
     private func extractPacket() -> Data? {
+        // Skip bytes until a known prefix (a loop, not recursion — garbage
+        // input could otherwise recurse once per byte).
+        while receiveBuffer.count >= 4,
+              receiveBuffer.prefix(4) != PREFIX_55AA, receiveBuffer.prefix(4) != PREFIX_6699 {
+            receiveBuffer.removeFirst()
+        }
         guard receiveBuffer.count >= 16 else { return nil }
-        let p4 = receiveBuffer.prefix(4)
-        let is55 = p4 == PREFIX_55AA
-        let is66 = p4 == PREFIX_6699
-        guard is55 || is66 else { receiveBuffer.removeFirst(); return extractPacket() }
+        let is55 = receiveBuffer.prefix(4) == PREFIX_55AA
+        let is66 = !is55
         // 55AA: msgLen at byte 12 (header=16)
         // 6699: msgLen at byte 16 (header=20: prefix4+seqHi2+seqLo2+cmd4+retcode4+msgLen4)
         let lenOff = is55 ? 12 : 16
         guard receiveBuffer.count >= lenOff + 4 else { return nil }
-        let msgLen = receiveBuffer[lenOff..<(lenOff+4)].withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        // removeFirst() slices Data, so its startIndex is no longer 0 —
+        // offsets must be relative to startIndex. Bytes are assembled by hand
+        // because the length field isn't guaranteed to be 4-byte aligned.
+        let s = receiveBuffer.startIndex + lenOff
+        let msgLen = receiveBuffer[s..<(s + 4)].reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
         let headerLen = is55 ? 16 : 20
         // 6699: suffix (4 bytes) is NOT included in msgLen, so add separately
         let totalLen = headerLen + Int(msgLen) + (is66 ? 4 : 0)
         guard receiveBuffer.count >= totalLen else { return nil }
         let pkt = Data(receiveBuffer.prefix(totalLen))
-        receiveBuffer.removeFirst(totalLen)
+        // Re-base to a fresh Data so the buffer starts at index 0 again.
+        receiveBuffer = Data(receiveBuffer.dropFirst(totalLen))
         return pkt
     }
 }

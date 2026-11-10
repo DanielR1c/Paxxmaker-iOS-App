@@ -130,7 +130,8 @@ struct PrinterWidgetData {
         case "error":    return lzShared(en: "Error", de: "Fehler", fr: "Erreur", es: "Error", pt: "Erro", it: "Errore", zh: "错误")
         case "complete": return lzShared(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo", pt: "Concluído", it: "Fatto", zh: "完成")
         case "standby":  return lzShared(en: "Ready", de: "Bereit", fr: "Prêt", es: "Listo", pt: "Pronto", it: "Pronto", zh: "就绪")
-        default:         return "–"
+        // "unknown" = the app has not reached the printer yet (or not lately)
+        default:         return lzShared(en: "No connection", de: "Keine Verbindung", fr: "Pas de connexion", es: "Sin conexión", pt: "Sem conexão", it: "Nessuna connessione", zh: "未连接")
         }
     }
 
@@ -167,6 +168,23 @@ struct PrinterWidgetData {
     }
 
     var isActive: Bool { printState == "printing" || printState == "paused" }
+
+    /// The current print's thumbnail — the same file the app leaves for the
+    /// Live Activity (LiveActivityThumb), only when it belongs to this file.
+    var thumbnail: UIImage? {
+        guard isActive, !filename.isEmpty,
+              UserDefaults(suiteName: paxxAppGroupID)?.string(forKey: "la_thumb_for_\(name)") == filename,
+              let url = PaxxMakerWidgetAttributes.thumbnailURL(printer: name) else { return nil }
+        return UIImage(contentsOfFile: url.path)
+    }
+
+    /// "19 min left" — worded like the Live Activity.
+    var etaLeft: String? {
+        guard isActive, eta > 0 else { return nil }
+        let h = eta / 3600, m = (eta % 3600) / 60
+        let t = h > 0 ? "\(h) h \(m) min" : (m > 0 ? "\(m) min" : "< 1 min")
+        return lzShared(en: "\(t) left", de: "noch \(t)", fr: "encore \(t)", es: "faltan \(t)", pt: "faltam \(t)", it: "ancora \(t)", zh: "剩余 \(t)")
+    }
 }
 
 // MARK: - Live Activity attributes (must match definition in ContentView.swift)
@@ -180,6 +198,10 @@ struct PaxxMakerWidgetAttributes: ActivityAttributes {
         /// Position in the file, sent alongside the slicer estimate by the
         /// printer bridge. Optional: pushes from an older bridge still decode.
         var progressFile: Double? = nil
+        /// The file being printed. Optional and in the state (not only in the
+        /// attributes, which can't change): an activity started in the
+        /// background before the name was known shows it from the next update.
+        var filename: String? = nil
 
         /// What to display. Follows the user's choice in Settings → Extra
         /// Features; falls back to the slicer value when an older bridge
@@ -192,4 +214,41 @@ struct PaxxMakerWidgetAttributes: ActivityAttributes {
     }
     var printerName: String
     var filename: String
+
+    /// Last known file name per printer, written by the app — the fallback
+    /// while pushes from an older worker don't carry it.
+    static func rememberFile(_ name: String, printer: String) {
+        guard !name.isEmpty else { return }
+        UserDefaults(suiteName: "group.paxxmaker.u1")?.set(name, forKey: "la_file_\(printer)")
+    }
+
+    /// Where the app leaves the current print's thumbnail (LiveActivityThumb).
+    static func thumbnailURL(printer: String) -> URL? {
+        let safe = String(printer.map { $0.isLetter || $0.isNumber ? $0 : "_" })
+        return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.paxxmaker.u1")?
+            .appendingPathComponent("la_thumb_\(safe).png")
+    }
+
+    /// The current print's thumbnail, if the app has left it for this file.
+    func thumbnail(_ state: ContentState) -> UIImage? {
+        let d = UserDefaults(suiteName: "group.paxxmaker.u1")
+        var raw = state.filename ?? ""
+        if raw.isEmpty { raw = filename }
+        if raw.isEmpty { raw = d?.string(forKey: "la_file_\(printerName)") ?? "" }
+        guard !raw.isEmpty, d?.string(forKey: "la_thumb_for_\(printerName)") == raw,
+              let url = Self.thumbnailURL(printer: printerName) else { return nil }
+        return UIImage(contentsOfFile: url.path)
+    }
+
+    /// The print's name as shown: without folder and extension.
+    func shownFile(_ state: ContentState) -> String {
+        var raw = state.filename ?? ""
+        if raw.isEmpty { raw = filename }
+        if raw.isEmpty { raw = UserDefaults(suiteName: "group.paxxmaker.u1")?.string(forKey: "la_file_\(printerName)") ?? "" }
+        var n = raw.components(separatedBy: "/").last ?? raw
+        for ext in [".gcode", ".gco", ".g"] where n.lowercased().hasSuffix(ext) {
+            n = String(n.dropLast(ext.count)); break
+        }
+        return n
+    }
 }

@@ -2,6 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.paxxmaker.u1.statuscheck</string>
+		<string>com.paxxmaker.u1.lapoll</string>
+	</array>
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>de</string>
@@ -12,27 +17,22 @@
 		<string>pt-BR</string>
 		<string>zh-Hans</string>
 	</array>
-	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<key>CFBundleURLTypes</key>
 	<array>
-		<string>com.paxxmaker.u1.statuscheck</string>
-		<string>com.paxxmaker.u1.lapoll</string>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.paxxmaker.u1</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>paxxmaker</string>
+			</array>
+		</dict>
 	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>PaxxMaker steuert deine Smart-Steckdosen direkt über dein lokales Netzwerk, ruft ihren Status ab und findet PaxxMaker-Connect auf deinem Mac.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>Zum Scannen des QR-Codes von PaxxMaker-Connect und zum 3D-Scannen von Objekten für den PaxxMaker-Slicer.</string>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleURLName</key><string>com.paxxmaker.u1</string>
-			<key>CFBundleURLSchemes</key><array><string>paxxmaker</string></array>
-		</dict>
-	</array>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_paxxconnect._tcp</string>

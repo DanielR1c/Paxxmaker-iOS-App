@@ -1,0 +1,2728 @@
+import SwiftUI
+import Combine
+import Network
+import simd
+import VisionKit
+import Vision
+
+// MARK: - EasyPrint, stage 2: the Mac does the slicing.
+// PaxxMaker-Connect (separate project on the Desktop, a Mac menu bar app) wraps the installed OrcaSlicer in a
+// small HTTP API on the LAN. This file is the phone's side of it: finding the
+// Connect app, pairing with its code, listing Orca's profiles, running a job
+// with the plate from the viewer, and sending the G-code to the printer.
+
+// MARK: Client
+
+struct ConnectConfig: Codable, Equatable {
+    var host: String
+    var port: Int
+    var token: String
+    var name: String
+
+    static let key = "slicer_connect"
+    static func load() -> ConnectConfig? {
+        guard let d = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(ConnectConfig.self, from: d)
+    }
+    func save() { UserDefaults.standard.set(try? JSONEncoder().encode(self), forKey: Self.key) }
+    static func clear() { UserDefaults.standard.removeObject(forKey: key) }
+    /// IPv6 addresses only work in a URL inside brackets.
+    var baseURL: String {
+        let h = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        return "http://\(h):\(port)"
+    }
+
+    /// Is this something a URL can be built from at all?
+    static func usable(host: String) -> Bool {
+        let t = host.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty, !t.contains(" ") else { return false }
+        return ConnectConfig(host: t, port: 8765, token: "", name: "").baseURL.isEmpty == false
+            && URL(string: ConnectConfig(host: t, port: 8765, token: "", name: "").baseURL) != nil
+    }
+}
+
+struct SlicerProfiles: Decodable {
+    struct Preset: Decodable, Identifiable, Hashable {
+        var name: String
+        var origin: String
+        var inherits: String?
+        var compatible_printers: [String]?
+        var bed_x: Double?
+        var bed_y: Double?
+        var bed_z: Double?
+        var extruders: Int?
+        var printer_model: String?
+        /// Filaments (Connect 1.5): what the preset is, through its chain.
+        var filament_id: String?
+        var filament_vendor: String?
+        var filament_type: String?
+        var filament_colour: String?
+        var id: String { name }
+    }
+    var machine: [Preset]
+    var process: [Preset]
+    var filament: [Preset]
+}
+
+struct SliceJob: Decodable {
+    /// A failed slice in plain words. OrcaSlicer only reports a number
+    /// (Utils.hpp: negative codes, the process shows them as 256 + code), and
+    /// a bare number helps nobody — so the meaning is spelled out and the
+    /// number kept at the end, for a bug report.
+    static func explain(code: Int?, message: String?) -> String {
+        // PaxxMaker-Connect already prefixes its message with the number.
+        var detail = (message ?? "").trimmingCharacters(in: .whitespaces)
+        if let r = detail.range(of: #"^Orca Exit -?\d+\s*(–|-)?\s*"#, options: .regularExpression) {
+            detail.removeSubrange(r)
+        }
+        guard let code else { return detail.isEmpty ? unknownText : detail }
+        let orca = code >= 128 ? code - 256 : code
+        var out = text(orca) ?? unknownText
+        // Only when this side has nothing to say about the code: then the
+        // detail from the computer (log excerpt) is all there is.
+        if (text(orca) == nil || orca == -51 || orca == -69), !detail.isEmpty { out = orca == -51 ? detail : out + "\n" + detail }
+        out += "\n(OrcaSlicer \(code))"
+        return out
+    }
+
+    /// Kept for older call sites.
+    static func readable(code: Int?) -> String? { code.map { explain(code: $0, message: nil) } }
+
+    private static var unknownText: String {
+        lz(en: "OrcaSlicer stopped with an error of its own. The details are in the log of PaxxMaker-Connect on the computer.",
+           de: "OrcaSlicer hat mit einem eigenen Fehler abgebrochen. Einzelheiten stehen im Protokoll von PaxxMaker-Connect auf dem Computer.",
+           fr: "OrcaSlicer s'est arrêté sur une erreur interne. Les détails sont dans le journal de PaxxMaker-Connect sur l'ordinateur.",
+           es: "OrcaSlicer se detuvo con un error propio. Los detalles están en el registro de PaxxMaker-Connect en el ordenador.",
+           pt: "O OrcaSlicer parou com um erro próprio. Os detalhes estão no registo do PaxxMaker-Connect no computador.",
+           it: "OrcaSlicer si è interrotto con un errore interno. I dettagli sono nel registro di PaxxMaker-Connect sul computer.",
+           zh: "OrcaSlicer 因自身错误中止。详细信息在电脑上 PaxxMaker-Connect 的日志里。")
+    }
+
+    /// One sentence per exit code, with what to do where that is clear.
+    private static func text(_ code: Int) -> String? {
+        switch code {
+        case -1:
+            return lz(en: "OrcaSlicer could not start properly on the computer. Open it once by hand and try again.",
+                      de: "OrcaSlicer konnte auf dem Computer nicht richtig starten. Öffne es dort einmal von Hand und versuche es erneut.",
+                      fr: "OrcaSlicer n'a pas pu démarrer correctement sur l'ordinateur. Ouvre-le une fois à la main puis réessaie.",
+                      es: "OrcaSlicer no pudo arrancar bien en el ordenador. Ábrelo una vez a mano y vuelve a intentarlo.",
+                      pt: "O OrcaSlicer não conseguiu iniciar no computador. Abra-o uma vez à mão e tente de novo.",
+                      it: "OrcaSlicer non è riuscito ad avviarsi sul computer. Aprilo una volta a mano e riprova.",
+                      zh: "OrcaSlicer 在电脑上未能正常启动。请在电脑上手动打开一次后重试。")
+        case -2:
+            return lz(en: "OrcaSlicer rejected the instructions it was given. A setting in the slice screen probably holds a value it does not accept.",
+                      de: "OrcaSlicer hat die Anweisungen abgelehnt. Wahrscheinlich steht in einer Einstellung auf der Slice-Seite ein Wert, den es nicht annimmt.",
+                      fr: "OrcaSlicer a refusé les instructions reçues. Un réglage de la page de tranchage contient sans doute une valeur qu'il n'accepte pas.",
+                      es: "OrcaSlicer rechazó las instrucciones. Probablemente un ajuste de la página de laminado tiene un valor que no acepta.",
+                      pt: "O OrcaSlicer recusou as instruções. Provavelmente um ajuste na página de fatiamento tem um valor que ele não aceita.",
+                      it: "OrcaSlicer ha rifiutato le istruzioni. Probabilmente un'impostazione della pagina di slicing ha un valore che non accetta.",
+                      zh: "OrcaSlicer 拒绝了收到的指令。可能是切片页面上的某个设置填了它不接受的值。")
+        case -3, -4, -6:
+            return lz(en: "OrcaSlicer could not read a file it was handed. Send the model again.",
+                      de: "OrcaSlicer konnte eine übergebene Datei nicht lesen. Schicke das Modell noch einmal.",
+                      fr: "OrcaSlicer n'a pas pu lire un fichier transmis. Renvoie le modèle.",
+                      es: "OrcaSlicer no pudo leer un archivo recibido. Envía el modelo otra vez.",
+                      pt: "O OrcaSlicer não conseguiu ler um ficheiro recebido. Envie o modelo novamente.",
+                      it: "OrcaSlicer non è riuscito a leggere un file ricevuto. Invia di nuovo il modello.",
+                      zh: "OrcaSlicer 无法读取传过去的文件。请重新发送模型。")
+        case -5:
+            return lz(en: "OrcaSlicer rejected one of the profiles. Choose another filament or process profile — an incomplete filament profile is the usual cause on a multi-colour print.",
+                      de: "OrcaSlicer hat eines der Profile abgelehnt. Wähle ein anderes Filament- oder Prozessprofil — bei Mehrfarbdrucken ist meist ein unvollständiges Filamentprofil schuld.",
+                      fr: "OrcaSlicer a refusé l'un des profils. Choisis un autre profil de filament ou de processus — sur une impression multicolore, c'est souvent un profil de filament incomplet.",
+                      es: "OrcaSlicer rechazó uno de los perfiles. Elige otro perfil de filamento o de proceso: en impresiones multicolor suele ser un perfil de filamento incompleto.",
+                      pt: "O OrcaSlicer recusou um dos perfis. Escolha outro perfil de filamento ou de processo — em impressões multicolor costuma ser um perfil de filamento incompleto.",
+                      it: "OrcaSlicer ha rifiutato uno dei profili. Scegli un altro profilo di filamento o di processo — nelle stampe multicolore di solito è un profilo di filamento incompleto.",
+                      zh: "OrcaSlicer 拒绝了其中一个配置。请改用其他耗材或工艺配置——多色打印时通常是耗材配置不完整。")
+        case -7, -8:
+            return lz(en: "OrcaSlicer's command line does not support this printer or this operation.",
+                      de: "Die Kommandozeile von OrcaSlicer unterstützt diesen Drucker oder diesen Vorgang nicht.",
+                      fr: "La ligne de commande d'OrcaSlicer ne prend pas en charge cette imprimante ou cette opération.",
+                      es: "La línea de comandos de OrcaSlicer no admite esta impresora o esta operación.",
+                      pt: "A linha de comando do OrcaSlicer não suporta esta impressora ou esta operação.",
+                      it: "La riga di comando di OrcaSlicer non supporta questa stampante o questa operazione.",
+                      zh: "OrcaSlicer 的命令行不支持这台打印机或此操作。")
+        case -9, -10, -21, -22:
+            return lz(en: "OrcaSlicer could not place or scale the objects by itself. Arrange them on the plate by hand.",
+                      de: "OrcaSlicer konnte die Objekte nicht selbst anordnen oder skalieren. Ordne sie auf der Platte von Hand an.",
+                      fr: "OrcaSlicer n'a pas pu placer ou redimensionner les objets. Dispose-les à la main sur le plateau.",
+                      es: "OrcaSlicer no pudo colocar o escalar los objetos. Colócalos a mano en la placa.",
+                      pt: "O OrcaSlicer não conseguiu posicionar ou redimensionar os objetos. Organize-os à mão na mesa.",
+                      it: "OrcaSlicer non è riuscito a disporre o ridimensionare gli oggetti. Sistemali a mano sul piano.",
+                      zh: "OrcaSlicer 无法自动摆放或缩放对象。请在打印板上手动排列。")
+        case -11, -12, -13:
+            return lz(en: "OrcaSlicer could not write the result. Check that there is free space on the computer.",
+                      de: "OrcaSlicer konnte das Ergebnis nicht schreiben. Prüfe, ob auf dem Computer noch Platz frei ist.",
+                      fr: "OrcaSlicer n'a pas pu écrire le résultat. Vérifie l'espace libre sur l'ordinateur.",
+                      es: "OrcaSlicer no pudo escribir el resultado. Comprueba si queda espacio libre en el ordenador.",
+                      pt: "O OrcaSlicer não conseguiu gravar o resultado. Verifique se há espaço livre no computador.",
+                      it: "OrcaSlicer non è riuscito a scrivere il risultato. Controlla lo spazio libero sul computer.",
+                      zh: "OrcaSlicer 无法写出结果。请检查电脑上是否还有可用空间。")
+        case -14:
+            return lz(en: "OrcaSlicer ran out of memory. A smaller layer height or fewer objects helps.",
+                      de: "OrcaSlicer ist der Speicher ausgegangen. Weniger Objekte oder eine gröbere Layerhöhe helfen.",
+                      fr: "OrcaSlicer a manqué de mémoire. Moins d'objets ou une hauteur de couche plus grande aide.",
+                      es: "OrcaSlicer se quedó sin memoria. Ayuda reducir objetos o usar una altura de capa mayor.",
+                      pt: "O OrcaSlicer ficou sem memória. Ajuda usar menos objetos ou uma altura de camada maior.",
+                      it: "OrcaSlicer ha esaurito la memoria. Aiutano meno oggetti o un'altezza layer maggiore.",
+                      zh: "OrcaSlicer 内存不足。减少对象或加大层高会有帮助。")
+        case -15, -16, -18, -19, -23, -24:
+            return lz(en: "The data sent does not fit this printer or this OrcaSlicer version. Pick the printer profile again.",
+                      de: "Die übergebenen Daten passen nicht zu diesem Drucker oder zu dieser OrcaSlicer-Version. Wähle das Druckerprofil neu.",
+                      fr: "Les données envoyées ne correspondent pas à cette imprimante ou à cette version d'OrcaSlicer. Resélectionne le profil d'imprimante.",
+                      es: "Los datos enviados no encajan con esta impresora o versión de OrcaSlicer. Vuelve a elegir el perfil de impresora.",
+                      pt: "Os dados enviados não servem para esta impressora ou versão do OrcaSlicer. Escolha o perfil da impressora de novo.",
+                      it: "I dati inviati non corrispondono a questa stampante o versione di OrcaSlicer. Riseleziona il profilo stampante.",
+                      zh: "发送的数据与这台打印机或此 OrcaSlicer 版本不匹配。请重新选择打印机配置。")
+        case -17:
+            return lz(en: "The process profile does not fit this printer. Choose another one.",
+                      de: "Das Prozessprofil passt nicht zu diesem Drucker. Wähle ein anderes.",
+                      fr: "Le profil de processus ne convient pas à cette imprimante. Choisis-en un autre.",
+                      es: "El perfil de proceso no encaja con esta impresora. Elige otro.",
+                      pt: "O perfil de processo não serve para esta impressora. Escolha outro.",
+                      it: "Il profilo di processo non è adatto a questa stampante. Scegline un altro.",
+                      zh: "工艺配置与这台打印机不匹配。请选择其他配置。")
+        case -20, -52:
+            return lz(en: "An object sticks out of the print volume. Move it towards the middle or make it smaller.",
+                      de: "Ein Objekt ragt aus dem Druckraum. Schiebe es zur Mitte oder mache es kleiner.",
+                      fr: "Un objet dépasse du volume d'impression. Rapproche-le du centre ou réduis-le.",
+                      es: "Un objeto sobresale del volumen de impresión. Muévelo al centro o hazlo más pequeño.",
+                      pt: "Um objeto sai do volume de impressão. Mova-o para o centro ou reduza-o.",
+                      it: "Un oggetto esce dal volume di stampa. Spostalo verso il centro o rimpiccioliscilo.",
+                      zh: "有对象超出打印空间。请移向中间或缩小它。")
+        case -50, -60:
+            return lz(en: "Nothing printable is left on the plate.",
+                      de: "Auf der Platte ist nichts Druckbares übrig.",
+                      fr: "Il ne reste rien d'imprimable sur le plateau.",
+                      es: "No queda nada imprimible en la placa.",
+                      pt: "Não sobra nada imprimível na mesa.",
+                      it: "Sul piano non resta nulla di stampabile.",
+                      zh: "打印板上没有可打印的东西了。")
+        case -51:
+            return lz(en: "OrcaSlicer's own check refused the print. Often an object outside the plate or an impossible setting.",
+                      de: "Die eigene Prüfung von OrcaSlicer hat den Druck abgelehnt. Meist liegt ein Objekt außerhalb der Platte oder eine Einstellung ist unmöglich.",
+                      fr: "La vérification d'OrcaSlicer a refusé l'impression. Souvent un objet hors plateau ou un réglage impossible.",
+                      es: "La comprobación de OrcaSlicer rechazó la impresión. Suele ser un objeto fuera de la placa o un ajuste imposible.",
+                      pt: "A verificação do OrcaSlicer recusou a impressão. Normalmente um objeto fora da mesa ou um ajuste impossível.",
+                      it: "Il controllo di OrcaSlicer ha rifiutato la stampa. Di solito un oggetto fuori dal piano o un'impostazione impossibile.",
+                      zh: "OrcaSlicer 的自检拒绝了本次打印。通常是有对象超出打印板或某个设置无法实现。")
+        case -53, -54, -55, -56, -57:
+            return lz(en: "OrcaSlicer could not use its working folder on the computer. Restart PaxxMaker-Connect there.",
+                      de: "OrcaSlicer konnte seinen Arbeitsordner auf dem Computer nicht nutzen. Starte PaxxMaker-Connect dort neu.",
+                      fr: "OrcaSlicer n'a pas pu utiliser son dossier de travail. Redémarre PaxxMaker-Connect sur l'ordinateur.",
+                      es: "OrcaSlicer no pudo usar su carpeta de trabajo. Reinicia PaxxMaker-Connect en el ordenador.",
+                      pt: "O OrcaSlicer não conseguiu usar a sua pasta de trabalho. Reinicie o PaxxMaker-Connect no computador.",
+                      it: "OrcaSlicer non è riuscito a usare la sua cartella di lavoro. Riavvia PaxxMaker-Connect sul computer.",
+                      zh: "OrcaSlicer 无法使用它的工作文件夹。请在电脑上重新启动 PaxxMaker-Connect。")
+        case -58:
+            return lz(en: "Slicing took too long and was stopped. Fewer objects or a bigger layer height help.",
+                      de: "Das Slicen hat zu lange gedauert und wurde abgebrochen. Weniger Objekte oder eine gröbere Layerhöhe helfen.",
+                      fr: "Le tranchage a pris trop de temps et a été interrompu. Moins d'objets ou une couche plus épaisse aide.",
+                      es: "El laminado tardó demasiado y se detuvo. Ayuda usar menos objetos o capas más gruesas.",
+                      pt: "O fatiamento demorou demais e foi interrompido. Ajuda usar menos objetos ou camadas mais altas.",
+                      it: "Lo slicing ha impiegato troppo ed è stato interrotto. Aiutano meno oggetti o layer più spessi.",
+                      zh: "切片耗时过长已被中止。减少对象或加大层高会有帮助。")
+        case -59:
+            return lz(en: "The model has too many triangles for OrcaSlicer. Simplify it before sending.",
+                      de: "Das Modell hat zu viele Dreiecke für OrcaSlicer. Vereinfache es vor dem Senden.",
+                      fr: "Le modèle a trop de triangles pour OrcaSlicer. Simplifie-le avant l'envoi.",
+                      es: "El modelo tiene demasiados triángulos para OrcaSlicer. Simplifícalo antes de enviarlo.",
+                      pt: "O modelo tem triângulos demais para o OrcaSlicer. Simplifique-o antes de enviar.",
+                      it: "Il modello ha troppi triangoli per OrcaSlicer. Semplificalo prima di inviarlo.",
+                      zh: "模型三角面过多，OrcaSlicer 处理不了。请先简化后再发送。")
+        case -61:
+            return lz(en: "The filament does not go with the plate the printer uses. Choose another filament or another plate.",
+                      de: "Das Filament passt nicht zur eingestellten Druckplatte. Wähle ein anderes Filament oder eine andere Platte.",
+                      fr: "Le filament ne convient pas au plateau réglé. Choisis un autre filament ou un autre plateau.",
+                      es: "El filamento no va con la placa configurada. Elige otro filamento u otra placa.",
+                      pt: "O filamento não combina com a mesa configurada. Escolha outro filamento ou outra mesa.",
+                      it: "Il filamento non è adatto al piano impostato. Scegli un altro filamento o un altro piano.",
+                      zh: "耗材与所选打印板不匹配。请换耗材或换打印板。")
+        case -62:
+            return lz(en: "The chosen filaments need different bed temperatures and cannot be printed together.",
+                      de: "Die gewählten Filamente brauchen unterschiedliche Betttemperaturen und lassen sich nicht zusammen drucken.",
+                      fr: "Les filaments choisis demandent des températures de plateau différentes et ne peuvent pas être imprimés ensemble.",
+                      es: "Los filamentos elegidos necesitan temperaturas de cama distintas y no se pueden imprimir juntos.",
+                      pt: "Os filamentos escolhidos precisam de temperaturas de mesa diferentes e não podem ser impressos juntos.",
+                      it: "I filamenti scelti richiedono temperature del piano diverse e non si possono stampare insieme.",
+                      zh: "所选耗材需要不同的热床温度，无法一起打印。")
+        case -63:
+            return lz(en: "Printing object by object, the print head would hit an already printed part. Move the objects apart or print by layer.",
+                      de: "Beim Druck nach Objekt würde der Kopf ein fertiges Teil treffen. Objekte weiter auseinander stellen oder nach Layer drucken.",
+                      fr: "En impression objet par objet, la tête heurterait une pièce déjà imprimée. Écarte les objets ou imprime par couche.",
+                      es: "Imprimiendo objeto por objeto, el cabezal chocaría con una pieza ya impresa. Sepáralos o imprime por capa.",
+                      pt: "Imprimindo objeto a objeto, a cabeça bateria numa peça já impressa. Afaste os objetos ou imprima por camada.",
+                      it: "Stampando oggetto per oggetto, la testa colpirebbe un pezzo già stampato. Allontana gli oggetti o stampa per layer.",
+                      zh: "逐个打印时喷头会撞到已打印的部件。请把对象拉开距离，或改为逐层打印。")
+        case -64, -101:
+            return lz(en: "The print paths collide: objects are too close together, or one touches the prime tower. Move them apart.",
+                      de: "Die Druckpfade überschneiden sich: Objekte liegen zu nah beieinander, oder eines berührt den Reinigungsturm. Schiebe sie auseinander.",
+                      fr: "Les trajectoires se chevauchent : objets trop proches ou contact avec la tour de purge. Écarte-les.",
+                      es: "Las trayectorias chocan: los objetos están demasiado juntos o uno toca la torre de purga. Sepáralos.",
+                      pt: "Os percursos colidem: objetos muito próximos ou um toca na torre de purga. Afaste-os.",
+                      it: "I percorsi si sovrappongono: oggetti troppo vicini o contatto con la torre di spurgo. Allontanali.",
+                      zh: "打印路径相撞：对象之间太近，或碰到了擦料塔。请拉开距离。")
+        case -65:
+            return lz(en: "Spiral vase does not work with these settings — it needs one object, one wall and no top layers.",
+                      de: "Die Spiralvase passt nicht zu diesen Einstellungen — sie braucht ein Objekt, eine Wand und keine oberen Schichten.",
+                      fr: "Le mode vase spirale ne va pas avec ces réglages — il faut un objet, une paroi et aucune couche supérieure.",
+                      es: "El vaso en espiral no funciona con estos ajustes: necesita un objeto, una pared y ninguna capa superior.",
+                      pt: "O vaso espiral não funciona com estes ajustes: precisa de um objeto, uma parede e nenhuma camada superior.",
+                      it: "Il vaso a spirale non funziona con queste impostazioni: servono un oggetto, una parete e nessun layer superiore.",
+                      zh: "螺旋花瓶模式与当前设置冲突——需要单个对象、一层墙且没有顶层。")
+        case -66:
+            return lz(en: "The filaments could not be assigned to the heads. Check which head each object uses.",
+                      de: "Die Filamente ließen sich den Köpfen nicht zuordnen. Prüfe, welcher Kopf für welches Objekt eingestellt ist.",
+                      fr: "Impossible d'attribuer les filaments aux têtes. Vérifie la tête choisie pour chaque objet.",
+                      es: "No se pudieron asignar los filamentos a los cabezales. Revisa qué cabezal usa cada objeto.",
+                      pt: "Não foi possível atribuir os filamentos às cabeças. Verifique que cabeça cada objeto usa.",
+                      it: "Impossibile assegnare i filamenti alle teste. Controlla quale testa usa ogni oggetto.",
+                      zh: "无法把耗材分配到喷头。请检查每个对象使用的喷头。")
+        case -67:
+            return lz(en: "Only one TPU filament can be used per print.",
+                      de: "Pro Druck ist nur ein TPU-Filament möglich.",
+                      fr: "Un seul filament TPU par impression.",
+                      es: "Solo se puede usar un filamento TPU por impresión.",
+                      pt: "Só é possível um filamento TPU por impressão.",
+                      it: "È possibile un solo filamento TPU per stampa.",
+                      zh: "每次打印只能使用一种 TPU 耗材。")
+        case -69:
+            return lz(en: "Colour mixing refused: both mixed heads need the same material.",
+                      de: "Farbmischung abgelehnt: Beide gemischten Köpfe brauchen dasselbe Material.",
+                      fr: "Mélange refusé : les deux têtes mélangées doivent avoir le même matériau.",
+                      es: "Mezcla rechazada: ambos cabezales mezclados necesitan el mismo material.",
+                      pt: "Mistura recusada: as duas cabeças misturadas precisam do mesmo material.",
+                      it: "Miscelazione rifiutata: le due teste miscelate richiedono lo stesso materiale.",
+                      zh: "混色被拒绝：两个混合的喷头需要相同材料。")
+        case -68:
+            return lz(en: "One of the filaments does not suit the head it is meant for.",
+                      de: "Eines der Filamente passt nicht zu dem Kopf, für den es gedacht ist.",
+                      fr: "L'un des filaments ne convient pas à la tête prévue.",
+                      es: "Uno de los filamentos no es apto para el cabezal previsto.",
+                      pt: "Um dos filamentos não serve para a cabeça prevista.",
+                      it: "Uno dei filamenti non è adatto alla testa prevista.",
+                      zh: "其中一种耗材不适合指定的喷头。")
+        case -100:
+            return lz(en: "Slicing itself failed. Check the model in OrcaSlicer — broken geometry is the usual cause.",
+                      de: "Das Slicen selbst ist fehlgeschlagen. Prüfe das Modell in OrcaSlicer — meist ist die Geometrie defekt.",
+                      fr: "Le tranchage lui-même a échoué. Vérifie le modèle dans OrcaSlicer — souvent une géométrie défectueuse.",
+                      es: "El laminado falló. Revisa el modelo en OrcaSlicer: normalmente es geometría dañada.",
+                      pt: "O fatiamento falhou. Verifique o modelo no OrcaSlicer — normalmente é geometria defeituosa.",
+                      it: "Lo slicing è fallito. Controlla il modello in OrcaSlicer — di solito la geometria è difettosa.",
+                      zh: "切片本身失败。请在 OrcaSlicer 中检查模型——通常是几何数据损坏。")
+        case -102:
+            return lz(en: "The print paths leave the printable area. Move the object towards the middle.",
+                      de: "Die Druckpfade liegen außerhalb des Druckbereichs. Schiebe das Objekt weiter zur Mitte.",
+                      fr: "Les trajectoires sortent de la zone imprimable. Rapproche l'objet du centre.",
+                      es: "Las trayectorias salen del área imprimible. Acerca el objeto al centro.",
+                      pt: "Os percursos saem da área imprimível. Mova o objeto para o centro.",
+                      it: "I percorsi escono dall'area stampabile. Sposta l'oggetto verso il centro.",
+                      zh: "打印路径超出可打印区域。请把对象移向中间。")
+        default:
+            return nil
+        }
+    }
+
+    struct Result: Decodable {
+        var time_s: Int?
+        var filament_g: Double?
+        var filament_g_tools: [Double]?
+        var filament_mm: Double?
+        var cost: Double?
+        var layers: Int?
+        var height_mm: Double?
+        var gcode: String?
+        var size: Int?
+        var support: [String: String]?
+        /// OrcaSlicer 2.5's plate statistics (Connect 1.5).
+        var stats: SliceStats?
+        /// Objects Orca could not repair (only when a repair was asked for).
+        var repair_failed: Int?
+        /// The program that sliced, e.g. "Snapmaker Orca 2.4.1" (Connect 1.5).
+        var slicer: String?
+    }
+    var id: String
+    var state: String
+    var progress: Double
+    var stage: String
+    var error_code: Int?
+    var error: String?
+    var result: Result?
+}
+
+enum ConnectError: LocalizedError {
+    case unreachable, badCode, http(Int), decode, badAddress
+    var errorDescription: String? {
+        switch self {
+        case .unreachable: return lz(en: "PaxxMaker-Connect not reachable — is it running on the computer?", de: "PaxxMaker-Connect nicht erreichbar — läuft es am Computer?", fr: "PaxxMaker-Connect injoignable — tourne-t-il sur l'ordinateur ?", es: "PaxxMaker-Connect no accesible — ¿está en marcha en el ordenador?", pt: "PaxxMaker-Connect inacessível — está rodando no computador?", it: "PaxxMaker-Connect non raggiungibile — è in esecuzione sul computer?", zh: "无法连接 PaxxMaker-Connect——它在电脑上运行吗？")
+        case .badAddress: return lz(en: "That is not an address the app can reach. Enter the computer's IP address, for example 192.168.1.20.",
+                                    de: "Damit kann die App nichts anfangen. Gib die IP-Adresse des Computers ein, zum Beispiel 192.168.1.20.",
+                                    fr: "Ce n'est pas une adresse joignable. Saisis l'adresse IP de l'ordinateur, par exemple 192.168.1.20.",
+                                    es: "Esa no es una dirección que la app pueda usar. Escribe la IP del ordenador, por ejemplo 192.168.1.20.",
+                                    pt: "Esse não é um endereço utilizável. Digite o IP do computador, por exemplo 192.168.1.20.",
+                                    it: "Non è un indirizzo raggiungibile. Inserisci l'IP del computer, ad esempio 192.168.1.20.",
+                                    zh: "这不是可用的地址。请输入电脑的 IP 地址，例如 192.168.1.20。")
+        case .badCode: return lz(en: "Wrong pairing code.", de: "Falscher Kopplungscode.", fr: "Code d'appairage incorrect.", es: "Código de vinculación incorrecto.", pt: "Código de pareamento incorreto.", it: "Codice di associazione errato.", zh: "配对码错误。")
+        case .http(let c): return ConnectError.httpText(c)
+        case .decode: return lz(en: "Unexpected answer from PaxxMaker-Connect.", de: "Unerwartete Antwort von PaxxMaker-Connect.", fr: "Réponse inattendue de PaxxMaker-Connect.", es: "Respuesta inesperada de PaxxMaker-Connect.", pt: "Resposta inesperada do PaxxMaker-Connect.", it: "Risposta inattesa da PaxxMaker-Connect.", zh: "PaxxMaker-Connect 返回了意外的响应。")
+        }
+    }
+}
+
+extension ConnectError {
+    /// A web error number on its own tells nobody anything — say what it means
+    /// and keep the number for a bug report.
+    static func httpText(_ code: Int) -> String {
+        let meaning: String
+        switch code {
+        case 0:
+            meaning = lz(en: "the computer gave no answer", de: "der Computer hat nicht geantwortet", fr: "l'ordinateur n'a pas répondu", es: "el ordenador no respondió", pt: "o computador não respondeu", it: "il computer non ha risposto", zh: "电脑没有回应")
+        case 401, 403:
+            meaning = lz(en: "the pairing is no longer valid — pair the app with the computer again",
+                         de: "die Kopplung gilt nicht mehr — koppele die App erneut mit dem Computer",
+                         fr: "l'appairage n'est plus valable — réappaire l'app avec l'ordinateur",
+                         es: "la vinculación ya no vale — vuelve a vincular la app con el ordenador",
+                         pt: "o pareamento já não vale — pareie a app com o computador de novo",
+                         it: "l'associazione non è più valida — riassocia l'app al computer",
+                         zh: "配对已失效——请重新把 App 与电脑配对")
+        case 404:
+            meaning = lz(en: "the computer does not know this request — PaxxMaker-Connect there is probably older than the app",
+                         de: "der Computer kennt diese Anfrage nicht — PaxxMaker-Connect dort ist vermutlich älter als die App",
+                         fr: "l'ordinateur ne connaît pas cette requête — PaxxMaker-Connect y est sans doute plus ancien que l'app",
+                         es: "el ordenador no conoce esta petición — PaxxMaker-Connect allí es probablemente más antiguo que la app",
+                         pt: "o computador não conhece este pedido — o PaxxMaker-Connect lá deve ser mais antigo que a app",
+                         it: "il computer non conosce questa richiesta — PaxxMaker-Connect lì è probabilmente più vecchio dell'app",
+                         zh: "电脑不认识该请求——那边的 PaxxMaker-Connect 可能比 App 旧")
+        case 408, 504:
+            meaning = lz(en: "the computer took too long to answer", de: "der Computer hat zu lange gebraucht", fr: "l'ordinateur a mis trop de temps", es: "el ordenador tardó demasiado", pt: "o computador demorou demais", it: "il computer ha impiegato troppo", zh: "电脑响应超时")
+        case 413:
+            meaning = lz(en: "the model is too large to send", de: "das Modell ist zu groß zum Senden", fr: "le modèle est trop gros à envoyer", es: "el modelo es demasiado grande para enviarlo", pt: "o modelo é grande demais para enviar", it: "il modello è troppo grande da inviare", zh: "模型太大，无法发送")
+        case 500...599:
+            meaning = lz(en: "something went wrong inside PaxxMaker-Connect on the computer",
+                         de: "in PaxxMaker-Connect auf dem Computer ist etwas schiefgegangen",
+                         fr: "un problème est survenu dans PaxxMaker-Connect sur l'ordinateur",
+                         es: "algo falló dentro de PaxxMaker-Connect en el ordenador",
+                         pt: "algo correu mal dentro do PaxxMaker-Connect no computador",
+                         it: "qualcosa è andato storto in PaxxMaker-Connect sul computer",
+                         zh: "电脑上的 PaxxMaker-Connect 内部出错")
+        default:
+            meaning = lz(en: "the computer refused the request", de: "der Computer hat die Anfrage abgelehnt", fr: "l'ordinateur a refusé la requête", es: "el ordenador rechazó la petición", pt: "o computador recusou o pedido", it: "il computer ha rifiutato la richiesta", zh: "电脑拒绝了该请求")
+        }
+        return meaning.prefix(1).uppercased() + meaning.dropFirst() + " (HTTP \(code))."
+    }
+}
+
+struct ConnectClient {
+    let config: ConnectConfig
+    /// On a network failure, look for the computer again (see ConnectRediscovery).
+    var rediscover = true
+
+    private func request(_ path: String, method: String = "GET", body: Data? = nil, headers: [String: String] = [:], timeout: TimeInterval = 20) throws -> URLRequest {
+        // A Bonjour service name ("MacBook Air von Isabell") is not an address:
+        // with the space in it there is no URL, and forcing one crashed the app.
+        guard let url = URL(string: config.baseURL + path) else { throw ConnectError.badAddress }
+        var r = URLRequest(url: url, timeoutInterval: timeout)
+        r.httpMethod = method
+        r.setValue(config.token, forHTTPHeaderField: "X-Paxx-Token")
+        headers.forEach { r.setValue($0.value, forHTTPHeaderField: $0.key) }
+        r.httpBody = body
+        return r
+    }
+
+    /// Sends a request; if the computer does not answer at the saved address
+    /// (a new IP after sleep, a rotated IPv6 address), it is looked up again
+    /// via Bonjour and the request repeated once at the new address.
+    private func send(_ req: URLRequest) async throws -> (Data, URLResponse) {
+        do { return try await URLSession.shared.data(for: req) }
+        catch {
+            guard rediscover, let fresh = await ConnectRediscovery.refresh(config),
+                  let old = req.url, var c = URLComponents(url: old, resolvingAgainstBaseURL: false),
+                  let base = URLComponents(string: fresh.baseURL) else { throw ConnectError.unreachable }
+            c.scheme = base.scheme; c.host = base.host; c.port = base.port
+            guard let url = c.url else { throw ConnectError.unreachable }
+            var r = req
+            r.url = url
+            do { return try await URLSession.shared.data(for: r) } catch { throw ConnectError.unreachable }
+        }
+    }
+
+    private func run<T: Decodable>(_ req: URLRequest, as: T.Type) async throws -> T {
+        let (data, resp) = try await send(req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 401 { throw ConnectError.badCode }
+        guard (200..<300).contains(code) else { throw ConnectError.http(code) }
+        guard let v = try? JSONDecoder().decode(T.self, from: data) else { throw ConnectError.decode }
+        return v
+    }
+
+    struct Info: Decodable { var name: String; var version: String; var host: String; var orca: Bool; var apps: [String]
+        /// What this Connect can do beyond the basics (e.g. "ranges"); older ones send none.
+        var features: [String]? = nil
+        /// Connect 1.5: profile sources by name, the slicer each one uses, and
+        /// what each can do (statistics, repair and mixing need OrcaSlicer 2.5).
+        var app_names: [String: String]? = nil
+        var slicers: [String: String]? = nil
+        var features_by_app: [String: [String]]? = nil }
+    func info() async throws -> Info { try await run(try request("/v1/info", timeout: 6), as: Info.self) }
+
+    func profiles(app: String) async throws -> SlicerProfiles {
+        try await run(try request("/v1/profiles?app=\(app)"), as: SlicerProfiles.self)
+    }
+
+    /// One preset flattened through its inheritance chain (Orca's own keys and string values).
+    func profile(app: String, kind: String, name: String) async throws -> [String: Any] {
+        let n = name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? name
+        let (data, resp) = try await send(try request("/v1/profile?app=\(app)&kind=\(kind)&name=\(n)"))
+        guard (200..<300).contains((resp as? HTTPURLResponse)?.statusCode ?? 0),
+              let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw ConnectError.decode }
+        return d
+    }
+
+    struct Uploaded: Decodable { var model: String; var bytes: Int }
+    func upload(_ data: Data, ext: String) async throws -> String {
+        try await run(try request("/v1/models", method: "POST", body: data, headers: ["X-Paxx-Ext": ext], timeout: 120), as: Uploaded.self).model
+    }
+
+    func createJob(_ spec: [String: Any]) async throws -> SliceJob {
+        let body = try JSONSerialization.data(withJSONObject: spec)
+        return try await run(try request("/v1/jobs", method: "POST", body: body, headers: ["Content-Type": "application/json"]), as: SliceJob.self)
+    }
+
+    func job(_ id: String) async throws -> SliceJob { try await run(try request("/v1/jobs/\(id)", timeout: 10), as: SliceJob.self) }
+
+    func gcode(_ id: String) async throws -> Data {
+        let (data, resp) = try await send(try request("/v1/jobs/\(id)/gcode", timeout: 120))
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw ConnectError.http((resp as? HTTPURLResponse)?.statusCode ?? 0) }
+        return data
+    }
+}
+
+// MARK: Discovery (Bonjour)
+
+final class ConnectBrowser: ObservableObject {
+    struct Found: Identifiable, Hashable { let id: String; let name: String; let endpoint: NWEndpoint }
+    @Published var found: [Found] = []
+    private var browser: NWBrowser?
+
+    func start() {
+        stop()
+        let b = NWBrowser(for: .bonjour(type: "_paxxconnect._tcp", domain: nil), using: .tcp)
+        b.browseResultsChangedHandler = { [weak self] results, _ in
+            let list = results.compactMap { r -> Found? in
+                if case let .service(name, _, _, _) = r.endpoint { return Found(id: name, name: name, endpoint: r.endpoint) }
+                return nil
+            }
+            DispatchQueue.main.async { self?.found = list }
+        }
+        b.start(queue: .main)
+        browser = b
+    }
+    func stop() { browser?.cancel(); browser = nil }
+
+    /// Bonjour hands out a service endpoint; the HTTP client needs host:port.
+    /// A short TCP connect resolves it.
+    /// IPv4 first: at home it stays the same across sleep, while macOS keeps
+    /// swapping its temporary IPv6 addresses — a saved one stops working.
+    static func resolve(_ endpoint: NWEndpoint) async -> (String, Int)? {
+        if let v4 = await resolve(endpoint, v4Only: true) { return v4 }
+        return await resolve(endpoint, v4Only: false)
+    }
+
+    private static func resolve(_ endpoint: NWEndpoint, v4Only: Bool) async -> (String, Int)? {
+        final class Flag: @unchecked Sendable { nonisolated(unsafe) var done = false }
+        let params = NWParameters.tcp
+        if v4Only, let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options { ip.version = .v4 }
+        return await withCheckedContinuation { cont in
+            let c = NWConnection(to: endpoint, using: params)
+            let q = DispatchQueue(label: "paxxmaker.resolve")
+            let flag = Flag()
+            c.stateUpdateHandler = { st in
+                guard !flag.done else { return }
+                switch st {
+                case .ready:
+                    flag.done = true
+                    if case let .hostPort(host, port)? = c.currentPath?.remoteEndpoint {
+                        var h = "\(host)"
+                        if let i = h.firstIndex(of: "%") { h = String(h[..<i]) }      // strip scope id
+                        cont.resume(returning: (h, Int(port.rawValue)))
+                    } else { cont.resume(returning: nil) }
+                    c.cancel()
+                case .failed, .cancelled:
+                    flag.done = true; cont.resume(returning: nil)
+                default: break
+                }
+            }
+            c.start(queue: q)
+            q.asyncAfter(deadline: .now() + 5) {
+                if !flag.done { flag.done = true; c.cancel(); cont.resume(returning: nil) }
+            }
+        }
+    }
+}
+
+// MARK: Finding the computer again
+
+/// The paired computer answers no more at its saved address: browse Bonjour
+/// for PaxxMaker-Connect, take the one with the saved name (or the only one),
+/// check the saved code there and keep the new address. Several requests
+/// failing at once share one search.
+enum ConnectRediscovery {
+    private static var running: Task<ConnectConfig?, Never>? = nil
+
+    // MainActor-isolated, so the running-task bookkeeping is already serialized
+    // (the synchronous prologue runs atomically up to the first await) — no lock
+    // needed, and NSLock isn't usable across awaits anyway.
+    static func refresh(_ cfg: ConnectConfig) async -> ConnectConfig? {
+        let task: Task<ConnectConfig?, Never>
+        if let r = running { task = r } else {
+            task = Task { await search(cfg) }
+            running = task
+        }
+        let result = await task.value
+        if running == task { running = nil }
+        return result
+    }
+
+    private static func search(_ cfg: ConnectConfig) async -> ConnectConfig? {
+        let found = await browse(seconds: 3)
+        guard !found.isEmpty else { return nil }
+        let name = cfg.name.lowercased()
+        let matching = found.filter { f in
+            let n = f.name.lowercased()
+            return !name.isEmpty && (n == name || n.contains(name) || name.contains(n))
+        }
+        for f in (matching.isEmpty && found.count == 1 ? found : matching) {
+            guard let (host, port) = await ConnectBrowser.resolve(f.endpoint) else { continue }
+            let fresh = ConnectConfig(host: host, port: port, token: cfg.token, name: cfg.name)
+            let probe = ConnectClient(config: fresh, rediscover: false)
+            guard (try? await probe.info()) != nil else { continue }
+            // The saved code must still be valid there.
+            if case ConnectError.badCode? = await { () async -> Error? in
+                do { _ = try await probe.job("check"); return nil } catch { return error }
+            }() { continue }
+            if fresh.host != cfg.host || fresh.port != cfg.port { fresh.save() }
+            return fresh
+        }
+        return nil
+    }
+
+    private static func browse(seconds: Double) async -> [ConnectBrowser.Found] {
+        final class Box: @unchecked Sendable { nonisolated(unsafe) var list: [ConnectBrowser.Found] = [] }
+        return await withCheckedContinuation { cont in
+            let b = NWBrowser(for: .bonjour(type: "_paxxconnect._tcp", domain: nil), using: .tcp)
+            let box = Box()
+            let q = DispatchQueue(label: "paxxmaker.rediscover")
+            b.browseResultsChangedHandler = { results, _ in
+                box.list = results.compactMap { r in
+                    if case let .service(name, _, _, _) = r.endpoint { return ConnectBrowser.Found(id: name, name: name, endpoint: r.endpoint) }
+                    return nil
+                }
+            }
+            b.start(queue: q)
+            q.asyncAfter(deadline: .now() + seconds) { b.cancel(); cont.resume(returning: box.list) }
+        }
+    }
+}
+
+// MARK: QR pairing — paxxmaker://connect?host=…&port=…&code=…&name=…
+// Scanned with the iPhone's own camera; the app opens and pairs itself.
+
+extension Notification.Name {
+    static let paxxConnectPaired = Notification.Name("paxxmaker.connectPaired")
+    /// "Done" after a send: close the slicer screens and show that printer.
+    /// `object` is the printer's id as a string.
+    static let paxxShowPrinter = Notification.Name("paxxmaker.showPrinter")
+    /// A printer's dashboard layout was reset (object: the printer's id) —
+    /// its dashboard loads the default again.
+    static let paxxLayoutReset = Notification.Name("paxxmaker.layoutReset")
+}
+
+enum ConnectPairing {
+    static func handle(_ url: URL) async -> String? {
+        guard url.scheme == "paxxmaker", url.host == "connect",
+              let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return nil }
+        func q(_ k: String) -> String? { items.first { $0.name == k }?.value }
+        guard let host = q("host"), let code = q("code") else { return nil }
+        let cfg = ConnectConfig(host: host, port: Int(q("port") ?? "") ?? 8765, token: code.uppercased(),
+                                  name: q("name")?.removingPercentEncoding ?? host)
+        do {
+            let client = ConnectClient(config: cfg)
+            let info = try await client.info()
+            _ = try await client.profiles(app: info.apps.first ?? "orca")     // checks the code
+            cfg.save()
+            UserDefaults.standard.set(true, forKey: "show_slicer_tab")
+            NotificationCenter.default.post(name: .paxxConnectPaired, object: nil)
+            return lz(en: "Paired with \(cfg.name).", de: "Mit \(cfg.name) gekoppelt.", fr: "Appairé avec \(cfg.name).", es: "Vinculado con \(cfg.name).", pt: "Pareado com \(cfg.name).", it: "Associato a \(cfg.name).", zh: "已与 \(cfg.name) 配对。")
+        } catch {
+            return error.localizedDescription
+        }
+    }
+}
+
+// MARK: QR scanner (VisionKit) — reads PaxxMaker-Connect's QR in the app itself
+
+struct QRScannerView: UIViewControllerRepresentable {
+    var onCode: (String) -> Void
+
+    static var available: Bool { DataScannerViewController.isSupported && DataScannerViewController.isAvailable }
+
+    func makeUIViewController(context: Context) -> DataScannerViewController {
+        let vc = DataScannerViewController(recognizedDataTypes: [.barcode(symbologies: [.qr])],
+                                           qualityLevel: .balanced, isHighlightingEnabled: true)
+        vc.delegate = context.coordinator
+        try? vc.startScanning()
+        return vc
+    }
+    func updateUIViewController(_ vc: DataScannerViewController, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(onCode: onCode) }
+
+    final class Coordinator: NSObject, DataScannerViewControllerDelegate {
+        let onCode: (String) -> Void
+        var fired = false
+        init(onCode: @escaping (String) -> Void) { self.onCode = onCode }
+        func dataScanner(_ scanner: DataScannerViewController, didAdd added: [RecognizedItem], allItems: [RecognizedItem]) {
+            guard !fired else { return }
+            for item in added {
+                if case let .barcode(b) = item, let s = b.payloadStringValue {
+                    fired = true
+                    scanner.stopScanning()
+                    onCode(s)
+                    return
+                }
+            }
+        }
+    }
+}
+
+struct QRPairSheet: View {
+    var onResult: (String?) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var busy = false
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                if QRScannerView.available {
+                    QRScannerView { code in
+                        guard !busy else { return }
+                        busy = true
+                        Task {
+                            let msg = await ConnectPairing.handle(URL(string: code) ?? URL(string: "paxxmaker://none")!)
+                            await MainActor.run {
+                                onResult(msg ?? lz(en: "That is not a PaxxMaker-Connect code.", de: "Das ist kein PaxxMaker-Connect-Code.", fr: "Ce n'est pas un code PaxxMaker-Connect.", es: "No es un código de PaxxMaker-Connect.", pt: "Não é um código do PaxxMaker-Connect.", it: "Non è un codice PaxxMaker-Connect.", zh: "这不是 PaxxMaker-Connect 的二维码。"))
+                                busy = false
+                                dismiss()
+                            }
+                        }
+                    }
+                    .ignoresSafeArea()
+                } else {
+                    Text(lz(en: "Camera not available on this device.", de: "Kamera auf diesem Gerät nicht verfügbar.", fr: "Caméra indisponible sur cet appareil.", es: "Cámara no disponible en este dispositivo.", pt: "Câmera indisponível neste dispositivo.", it: "Fotocamera non disponibile su questo dispositivo.", zh: "此设备无法使用相机。"))
+                }
+                if busy { ProgressView().scaleEffect(1.5) }
+                VStack {
+                    Spacer()
+                    Text(lz(en: "Point the camera at the QR code that PaxxMaker-Connect shows on the computer.", de: "Kamera auf den QR-Code richten, den PaxxMaker-Connect am Computer anzeigt.", fr: "Vise le QR code affiché par PaxxMaker-Connect sur l'ordinateur.", es: "Apunta la cámara al código QR que PaxxMaker-Connect muestra en el ordenador.", pt: "Aponte a câmera para o QR code que o PaxxMaker-Connect mostra no computador.", it: "Inquadra il QR code che PaxxMaker-Connect mostra sul computer.", zh: "将相机对准电脑上 PaxxMaker-Connect 显示的二维码。"))
+                        .font(.footnote).multilineTextAlignment(.center)
+                        .padding(12).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10)).padding()
+                }
+            }
+            .navigationTitle(lz(en: "Scan QR code", de: "QR-Code scannen", fr: "Scanner le QR code", es: "Escanear código QR", pt: "Ler QR code", it: "Scansiona QR code", zh: "扫描二维码"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button(lz(en: "Cancel", de: "Abbrechen", fr: "Annuler", es: "Cancelar", pt: "Cancelar", it: "Annulla", zh: "取消")) { dismiss() } } }
+        }
+    }
+}
+
+// MARK: Pairing UI (lives in the slicer tab)
+
+struct ConnectSection: View {
+    @AppStorage("app_language") private var appLanguage: String = "en"
+    @State private var config = ConnectConfig.load()
+    @State private var showScanner = false
+    @State private var scanMessage: String? = nil
+    @State private var pendingMessage: String? = nil
+
+    // Presentation modifiers must sit on ONE view: inside a Form a modifier on
+    // the Section is applied to every row, which presented the scanner several
+    // times at once and left it stuck. So the sheet and alerts live on single
+    // rows below; only the (idempotent) notification handler stays up here.
+    var body: some View {
+        pairingSection
+            // On the section itself: the QR rows vanish the moment pairing
+            // succeeds, and an alert hung on them was left pending — it popped
+            // up later, on unpairing, when those rows came back.
+            .alert(lz(en: "PaxxMaker-Connect", de: "PaxxMaker-Connect", fr: "PaxxMaker-Connect", es: "PaxxMaker-Connect", pt: "PaxxMaker-Connect", it: "PaxxMaker-Connect", zh: "PaxxMaker-Connect"),
+                   isPresented: Binding(get: { scanMessage != nil }, set: { if !$0 { scanMessage = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: { Text(scanMessage ?? "") }
+            .onReceive(NotificationCenter.default.publisher(for: .paxxConnectPaired)) { _ in
+                config = ConnectConfig.load()
+                // Unpaired: nothing from an earlier pairing is left to say.
+                if config == nil { scanMessage = nil; pendingMessage = nil }
+            }
+    }
+
+    /// The scan result is shown once the scanner sheet is gone; an alert on
+    /// top of the sheet would fight its dismissal.
+    private func showPendingResult() {
+        guard let m = pendingMessage else { return }
+        pendingMessage = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { scanMessage = m }
+    }
+
+    // Unpaired: two doors — QR code, or the manual page with the network
+    // search and address entry. Both on one screen next to each other
+    // confused people ("scan, or is the MacBook already there?").
+    private var pairingSection: some View {
+        Section {
+            pairingRows
+        } footer: {
+            if config == nil {
+                // The address is a tap target, not something to type off the
+                // screen — markdown needs Text(.init(…)) to become a link.
+                let link = "https://github.com/DanielR1c/PaxxMaker-Connect"
+                Text(.init(lz(
+                    en: "Install \"PaxxMaker-Connect\" on your Mac or Windows PC ([tap here](\(link))) and open it — it shows a QR code for pairing. Slicing then uses the OrcaSlicer installed there, with your own profiles, so the computer has to be switched on and awake while you slice.",
+                    de: "„PaxxMaker-Connect“ auf dem Mac oder Windows-PC installieren ([hier klicken](\(link))) und öffnen — es zeigt einen QR-Code zum Koppeln. Gesliced wird dann mit dem dort installierten OrcaSlicer und deinen eigenen Profilen: Der Computer muss dabei laufen und darf nicht schlafen.",
+                    fr: "Installe « PaxxMaker-Connect » sur ton Mac ou PC Windows ([cliquer ici](\(link))) et ouvre-le — il affiche un QR code pour l'appairage. Le tranchage utilise ensuite l'OrcaSlicer installé, avec tes profils : l'ordinateur doit donc être allumé et éveillé.",
+                    es: "Instala «PaxxMaker-Connect» en tu Mac o PC con Windows ([pulsa aquí](\(link))) y ábrelo — muestra un código QR para vincular. El laminado usa entonces el OrcaSlicer instalado, con tus perfiles: el ordenador tiene que estar encendido y despierto.",
+                    pt: "Instale o \"PaxxMaker-Connect\" no seu Mac ou PC com Windows ([toque aqui](\(link))) e abra-o — ele mostra um QR code para parear. O fatiamento usa então o OrcaSlicer instalado, com seus perfis: o computador precisa estar ligado e acordado.",
+                    it: "Installa «PaxxMaker-Connect» sul Mac o su un PC Windows ([tocca qui](\(link))) e aprilo — mostra un QR code per l'associazione. Lo slicing usa poi l'OrcaSlicer installato, con i tuoi profili: il computer deve restare acceso e sveglio.",
+                    zh: "在 Mac 或 Windows 电脑上安装“PaxxMaker-Connect”（[点这里](\(link))）并打开——它会显示用于配对的二维码。之后使用那里安装的 OrcaSlicer 和你自己的配置进行切片：切片时电脑必须开机且未休眠。")))
+            }
+        }
+    }
+
+    @ViewBuilder private var pairingRows: some View {
+        if config != nil {
+            ConnectStatusView()
+        } else {
+            if QRScannerView.available {
+                Button { showScanner = true } label: {
+                    HStack {
+                        Image(systemName: "qrcode.viewfinder").foregroundColor(.accentColor).frame(width: 28)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(lz(en: "Connect with QR code", de: "Per QR-Code verbinden", fr: "Connecter par QR code", es: "Conectar con código QR", pt: "Conectar por QR code", it: "Connetti con QR code", zh: "通过二维码连接"))
+                            Text(lz(en: "Scan the code in the PaxxMaker-Connect window", de: "Den Code im PaxxMaker-Connect-Fenster scannen", fr: "Scanner le code de la fenêtre PaxxMaker-Connect", es: "Escanear el código de la ventana de PaxxMaker-Connect", pt: "Ler o código na janela do PaxxMaker-Connect", it: "Scansiona il codice nella finestra di PaxxMaker-Connect", zh: "扫描 PaxxMaker-Connect 窗口中的二维码"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .sheet(isPresented: $showScanner, onDismiss: showPendingResult) {
+                    QRPairSheet { msg in pendingMessage = msg }
+                }
+            }
+            NavigationLink {
+                ManualPairPage()
+            } label: {
+                HStack {
+                    Image(systemName: "network").foregroundColor(.accentColor).frame(width: 28)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(lz(en: "Connect manually", de: "Manuell verbinden", fr: "Connecter manuellement", es: "Conectar manualmente", pt: "Conectar manualmente", it: "Connetti manualmente", zh: "手动连接"))
+                        Text(lz(en: "Find the computer on the network or enter its address, then the code", de: "Computer im Netzwerk suchen oder Adresse eingeben, dann den Code", fr: "Chercher l'ordinateur sur le réseau ou saisir son adresse, puis le code", es: "Buscar el ordenador en la red o escribir su dirección, luego el código", pt: "Procurar o computador na rede ou digitar o endereço, depois o código", it: "Cerca il computer nella rete o inserisci l'indirizzo, poi il codice", zh: "在网络中查找电脑或输入地址，然后输入配对码"))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+}
+
+/// Manual pairing: the Macs found via Bonjour, or an address typed in; both
+/// end in the code prompt. Pops back once the Mac answered.
+/// The computer this app is paired with: name, state, version — and the hint
+/// when a newer PaxxMaker-Connect is out. Used on the slicer page and, since
+/// that is where people look for it, in Settings under the slicer switch.
+struct ConnectStatusView: View {
+    /// Called after unpairing, so the surrounding view can refresh.
+    var onUnpair: () -> Void = {}
+    @AppStorage("app_language") private var appLanguage: String = "en"
+    @State private var config: ConnectConfig? = ConnectConfig.load()
+    @State private var online: Bool? = nil
+    @State private var info: ConnectClient.Info? = nil
+
+    var body: some View {
+        if let c = config {
+            HStack {
+                Image(systemName: online == true ? "desktopcomputer" : "desktopcomputer.trianglebadge.exclamationmark")
+                    .foregroundColor(online == true ? .green : (online == nil ? .secondary : .orange)).frame(width: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(c.name.isEmpty ? c.host : c.name)
+                    // Engine and profiles both come from the installed OrcaSlicer.
+                    Text(statusLine)
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let v = info?.version, !v.isEmpty {
+                        Text("PaxxMaker-Connect \(v)").font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Button(lz(en: "Unpair", de: "Trennen", fr: "Dissocier", es: "Desvincular", pt: "Desparear", it: "Dissocia", zh: "解除配对")) {
+                    ConnectConfig.clear(); config = nil; online = nil; info = nil
+                    NotificationCenter.default.post(name: .paxxConnectPaired, object: nil)
+                    onUnpair()
+                }
+                .font(.caption).foregroundColor(.red).buttonStyle(.plain)
+            }
+            .task(id: c) { await check(c) }
+            .onReceive(NotificationCenter.default.publisher(for: .paxxConnectPaired)) { _ in
+                config = ConnectConfig.load(); online = nil; info = nil
+            }
+            if let newer = ConnectUpdate.newer(than: info?.version), let url = URL(string: newer.url) {
+                Link(destination: url) {
+                    HStack {
+                        Image(systemName: "arrow.down.circle.fill").foregroundColor(.orange).frame(width: 28)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(lz(en: "Version \(newer.version) available", de: "Version \(newer.version) verfügbar", fr: "Version \(newer.version) disponible", es: "Versión \(newer.version) disponible", pt: "Versão \(newer.version) disponível", it: "Versione \(newer.version) disponibile", zh: "有新版本 \(newer.version)"))
+                            Text(lz(en: "Update PaxxMaker-Connect on the computer", de: "PaxxMaker-Connect am Computer aktualisieren", fr: "Mets à jour PaxxMaker-Connect sur l'ordinateur", es: "Actualiza PaxxMaker-Connect en el ordenador", pt: "Atualize o PaxxMaker-Connect no computador", it: "Aggiorna PaxxMaker-Connect sul computer", zh: "请在电脑上更新 PaxxMaker-Connect"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: "arrow.up.right.square").foregroundStyle(.secondary).font(.caption)
+                    }
+                }
+            }
+        }
+    }
+
+    private var statusLine: String {
+        guard online == true else {
+            return online == nil ? "…" : lz(en: "not reachable", de: "nicht erreichbar", fr: "injoignable", es: "no accesible", pt: "inacessível", it: "non raggiungibile", zh: "无法连接")
+        }
+        guard let i = info else { return "" }
+        return i.orca
+            ? "OrcaSlicer ✓ · " + lz(en: "profiles found", de: "Profile gefunden", fr: "profils trouvés", es: "perfiles encontrados", pt: "perfis encontrados", it: "profili trovati", zh: "已找到配置")
+            : "OrcaSlicer ✗"
+    }
+
+    private func check(_ c: ConnectConfig) async {
+        online = nil
+        if let i = try? await ConnectClient(config: c).info() { info = i; online = true } else { online = false }
+    }
+}
+
+struct ManualPairPage: View {
+    @AppStorage("app_language") private var appLanguage: String = "en"
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var browser = ConnectBrowser()
+    @State private var pairing: ConnectBrowser.Found? = nil
+    @State private var manualHost = ""
+    @State private var code = ""
+    @State private var busy = false
+    @State private var error: String? = nil
+
+    var body: some View {
+        Form {
+            Section(lz(en: "Found on the network", de: "Im Netzwerk gefunden", fr: "Trouvés sur le réseau", es: "Encontrados en la red", pt: "Encontrados na rede", it: "Trovati nella rete", zh: "网络中找到")) {
+                ForEach(browser.found) { f in
+                    Button { pairing = f } label: {
+                        HStack {
+                            Image(systemName: "desktopcomputer").foregroundColor(.blue).frame(width: 28)
+                            Text(f.name)
+                            Spacer()
+                            Text(lz(en: "Pair", de: "Koppeln", fr: "Appairer", es: "Vincular", pt: "Parear", it: "Associa", zh: "配对")).foregroundColor(.accentColor)
+                        }
+                    }
+                }
+                if browser.found.isEmpty {
+                    HStack {
+                        ProgressView().frame(width: 28)
+                        Text(lz(en: "Looking for PaxxMaker-Connect on the network…", de: "Suche PaxxMaker-Connect im Netzwerk…", fr: "Recherche de PaxxMaker-Connect sur le réseau…", es: "Buscando PaxxMaker-Connect en la red…", pt: "Procurando PaxxMaker-Connect na rede…", it: "Cerco PaxxMaker-Connect nella rete…", zh: "正在网络中查找 PaxxMaker-Connect…"))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Section {
+                HStack {
+                    Image(systemName: "network").foregroundColor(.secondary).frame(width: 28)
+                    TextField(lz(en: "IP address, e.g. 192.168.1.20", de: "IP-Adresse, z. B. 192.168.1.20", fr: "Adresse IP, ex. 192.168.1.20", es: "Dirección IP, p. ej. 192.168.1.20", pt: "Endereço IP, ex. 192.168.1.20", it: "Indirizzo IP, es. 192.168.1.20", zh: "IP 地址，例如 192.168.1.20"), text: $manualHost)
+                        .textInputAutocapitalization(.never).disableAutocorrection(true).keyboardType(.URL)
+                    if !manualHost.isEmpty {
+                        Button(lz(en: "Pair", de: "Koppeln", fr: "Appairer", es: "Vincular", pt: "Parear", it: "Associa", zh: "配对")) {
+                            let h = manualHost.trimmingCharacters(in: .whitespaces)
+                            guard ConnectConfig.usable(host: h) else { error = ConnectError.badAddress.errorDescription; return }
+                            error = nil
+                            pairing = ConnectBrowser.Found(id: h, name: h, endpoint: .hostPort(host: NWEndpoint.Host(h), port: 8765))
+                        }
+                    }
+                }
+                .alert(lz(en: "Pairing code", de: "Kopplungscode", fr: "Code d'appairage", es: "Código de vinculación", pt: "Código de pareamento", it: "Codice di associazione", zh: "配对码"),
+                       isPresented: Binding(get: { pairing != nil }, set: { if !$0 { pairing = nil } }), presenting: pairing) { f in
+                    TextField("ABC123", text: $code).textInputAutocapitalization(.characters).disableAutocorrection(true)
+                    Button(lz(en: "Pair", de: "Koppeln", fr: "Appairer", es: "Vincular", pt: "Parear", it: "Associa", zh: "配对")) { Task { await pair(f) } }
+                    Button(lz(en: "Cancel", de: "Abbrechen", fr: "Annuler", es: "Cancelar", pt: "Cancelar", it: "Annulla", zh: "取消"), role: .cancel) {}
+                } message: { f in
+                    Text(lz(en: "The code that PaxxMaker-Connect shows on the computer.", de: "Der Code, den PaxxMaker-Connect am Computer anzeigt.", fr: "Le code affiché par PaxxMaker-Connect sur l'ordinateur.", es: "El código que muestra PaxxMaker-Connect en el ordenador.", pt: "O código mostrado pelo PaxxMaker-Connect no computador.", it: "Il codice mostrato da PaxxMaker-Connect sul computer.", zh: "电脑上 PaxxMaker-Connect 显示的代码。"))
+                }
+            } header: {
+                Text(lz(en: "Or by address", de: "Oder per Adresse", fr: "Ou par adresse", es: "O por dirección", pt: "Ou por endereço", it: "Oppure per indirizzo", zh: "或通过地址"))
+            } footer: {
+                Text(lz(en: "Computer and iPhone must be on the same Wi-Fi. The 6-character code is shown by PaxxMaker-Connect (Mac: the window of the menu bar cube, Windows: the page in the browser).",
+                        de: "Computer und iPhone müssen im selben WLAN sein. Den 6-stelligen Code zeigt PaxxMaker-Connect an (Mac: Fenster des Würfels in der Menüleiste, Windows: Seite im Browser).",
+                        fr: "L'ordinateur et l'iPhone doivent être sur le même Wi-Fi. Le code à 6 caractères est affiché par PaxxMaker-Connect (Mac : fenêtre du cube dans la barre des menus, Windows : page dans le navigateur).",
+                        es: "El ordenador y el iPhone deben estar en la misma Wi-Fi. PaxxMaker-Connect muestra el código de 6 caracteres (Mac: ventana del cubo en la barra de menús, Windows: página en el navegador).",
+                        pt: "Computador e iPhone precisam estar no mesmo Wi-Fi. O PaxxMaker-Connect mostra o código de 6 caracteres (Mac: janela do cubo na barra de menus, Windows: página no navegador).",
+                        it: "Computer e iPhone devono essere nella stessa rete Wi-Fi. PaxxMaker-Connect mostra il codice a 6 caratteri (Mac: finestra del cubo nella barra dei menu, Windows: pagina nel browser).",
+                        zh: "电脑和 iPhone 必须在同一 Wi-Fi 中。PaxxMaker-Connect 会显示 6 位配对码（Mac：菜单栏立方体的窗口；Windows：浏览器页面）。"))
+            }
+            if busy {
+                HStack { ProgressView().frame(width: 28); Text(lz(en: "Pairing…", de: "Koppeln…", fr: "Appairage…", es: "Vinculando…", pt: "Pareando…", it: "Associazione…", zh: "正在配对…")).foregroundStyle(.secondary) }
+            }
+            if let e = error { Text(e).font(.caption).foregroundColor(.orange) }
+        }
+        .keyboardDismissable()
+        .navigationTitle(lz(en: "Connect manually", de: "Manuell verbinden", fr: "Connecter manuellement", es: "Conectar manualmente", pt: "Conectar manualmente", it: "Connetti manualmente", zh: "手动连接"))
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { browser.start() }
+        .onDisappear { browser.stop() }
+    }
+
+    private func pair(_ f: ConnectBrowser.Found) async {
+        busy = true; error = nil
+        defer { busy = false }
+        var host = "", port = 8765
+        if case let .hostPort(h, p) = f.endpoint {
+            host = "\(h)"
+            if let i = host.firstIndex(of: "%") { host = String(host[..<i]) }   // strip the scope id
+            port = Int(p.rawValue)
+        } else if let r = await ConnectBrowser.resolve(f.endpoint) {
+            host = r.0; port = r.1
+        }
+        // Bonjour sometimes hands out no address at all (it happens in the
+        // simulator). macOS builds its local name from the computer name by
+        // turning the spaces into hyphens, so that is worth a try before
+        // giving up.
+        if !ConnectConfig.usable(host: host) {
+            let guess = f.name.replacingOccurrences(of: " ", with: "-") + ".local"
+            if ConnectConfig.usable(host: guess) { host = guess; port = 8765 }
+        }
+        // Without an address there is nothing to talk to — the name from the
+        // network browser is not one.
+        guard ConnectConfig.usable(host: host) else {
+            error = lz(en: "The computer's address could not be found. Enter its IP address below.",
+                       de: "Die Adresse des Computers war nicht zu ermitteln. Trage unten seine IP-Adresse ein.",
+                       fr: "L'adresse de l'ordinateur n'a pas pu être déterminée. Saisis son adresse IP ci-dessous.",
+                       es: "No se pudo averiguar la dirección del ordenador. Escribe su IP abajo.",
+                       pt: "Não foi possível descobrir o endereço do computador. Digite o IP dele abaixo.",
+                       it: "Non è stato possibile ricavare l'indirizzo del computer. Inserisci il suo IP qui sotto.",
+                       zh: "无法获取电脑的地址。请在下方输入它的 IP 地址。")
+            return
+        }
+        let cfg = ConnectConfig(host: host, port: port, token: code.trimmingCharacters(in: .whitespaces).uppercased(), name: f.name)
+        do {
+            _ = try await ConnectClient(config: cfg).profiles(app: "orca")
+            cfg.save(); code = ""
+            NotificationCenter.default.post(name: .paxxConnectPaired, object: nil)
+            dismiss()
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+}
+
+// MARK: Slice settings + job
+
+/// Orca's "simple mode" process settings — what the sidebar shows without
+/// switching to advanced. Filled from the chosen process preset, edited
+/// here, sent back as CLI overrides.
+struct QuickSettings: Codable, Equatable {
+    var process = ""                    // the preset these values came from
+    var layerHeight = "0.2"
+    var firstLayerHeight = "0.2"
+    var seam = "aligned"
+    var walls = 2
+    var topLayers = 4
+    var bottomLayers = 3
+    var infill: Double = 15
+    var infillPattern = "grid"
+    var support = false
+    var tree = true
+    var plateOnly = false
+    var thresholdAngle = 30
+    var brimType = "auto_brim"
+    var brimWidth = "5"
+    var brimGap = "0.1"
+    var skirtLoops = 0
+    var spiral = false
+    var sequence = "by layer"
+
+    static let seams: [(String, String)] = [
+        ("aligned", orcaLz(en: "Aligned", de: "Ausgerichtet", fr: "Alignée", es: "Alineada", pt: "Alinhada", it: "Allineata", zh: "对齐")),
+        ("aligned_back", orcaLz(en: "Aligned back", de: "Ausgerichtet hinten", fr: "Alignée arrière", es: "Alineada atrás", pt: "Alinhada atrás", it: "Allineata dietro", zh: "对齐后侧")),
+        ("nearest", orcaLz(en: "Nearest", de: "Nächste", fr: "Plus proche", es: "Más cercana", pt: "Mais próxima", it: "Più vicina", zh: "最近")),
+        ("back", orcaLz(en: "Back", de: "Hinten", fr: "Arrière", es: "Atrás", pt: "Atrás", it: "Dietro", zh: "后侧")),
+        ("random", orcaLz(en: "Random", de: "Zufällig", fr: "Aléatoire", es: "Aleatoria", pt: "Aleatória", it: "Casuale", zh: "随机")),
+    ]
+    static let patterns: [(String, String)] = [
+        ("grid", orcaLz(en: "Grid", de: "Gitter", fr: "Grille", es: "Rejilla", pt: "Grade", it: "Griglia", zh: "网格")),
+        ("gyroid", "Gyroid"),
+        ("cubic", orcaLz(en: "Cubic", de: "Kubisch", fr: "Cubique", es: "Cúbico", pt: "Cúbico", it: "Cubico", zh: "立方体")),
+        ("adaptivecubic", orcaLz(en: "Adaptive cubic", de: "Adaptiv kubisch", fr: "Cubique adaptatif", es: "Cúbico adaptativo", pt: "Cúbico adaptativo", it: "Cubico adattivo", zh: "自适应立方体")),
+        ("crosshatch", orcaLz(en: "Cross hatch", de: "Kreuzschraffur", fr: "Hachures croisées", es: "Trama cruzada", pt: "Hachura cruzada", it: "Tratteggio incrociato", zh: "交叉线")),
+        ("triangles", orcaLz(en: "Triangles", de: "Dreiecke", fr: "Triangles", es: "Triángulos", pt: "Triângulos", it: "Triangoli", zh: "三角形")),
+        ("tri-hexagon", "Tri-Hexagon"),
+        ("honeycomb", orcaLz(en: "Honeycomb", de: "Waben", fr: "Nid d'abeille", es: "Panal", pt: "Favo", it: "Nido d'ape", zh: "蜂窝")),
+        ("3dhoneycomb", orcaLz(en: "3D honeycomb", de: "3D-Waben", fr: "Nid d'abeille 3D", es: "Panal 3D", pt: "Favo 3D", it: "Nido d'ape 3D", zh: "3D 蜂窝")),
+        ("lightning", "Lightning"),
+        ("zig-zag", orcaLz(en: "Rectilinear", de: "Geradlinig", fr: "Rectiligne", es: "Rectilíneo", pt: "Retilíneo", it: "Rettilineo", zh: "直线")),
+        ("alignedrectilinear", orcaLz(en: "Aligned rectilinear", de: "Ausgerichtet geradlinig", fr: "Rectiligne aligné", es: "Rectilíneo alineado", pt: "Retilíneo alinhado", it: "Rettilineo allineato", zh: "对齐直线")),
+        ("line", orcaLz(en: "Line", de: "Linie", fr: "Ligne", es: "Línea", pt: "Linha", it: "Linea", zh: "线")),
+        ("concentric", orcaLz(en: "Concentric", de: "Konzentrisch", fr: "Concentrique", es: "Concéntrico", pt: "Concêntrico", it: "Concentrico", zh: "同心")),
+        ("supportcubic", orcaLz(en: "Support cubic", de: "Support kubisch", fr: "Cubique support", es: "Cúbico soporte", pt: "Cúbico suporte", it: "Cubico supporto", zh: "支撑立方体")),
+    ]
+    static let brims: [(String, String)] = [
+        ("auto_brim", orcaLz(en: "Auto", de: "Automatisch", fr: "Auto", es: "Auto", pt: "Auto", it: "Auto", zh: "自动")),
+        ("outer_only", orcaLz(en: "Outer only", de: "Nur außen", fr: "Extérieur", es: "Solo exterior", pt: "Só externa", it: "Solo esterna", zh: "仅外侧")),
+        ("inner_only", orcaLz(en: "Inner only", de: "Nur innen", fr: "Intérieur", es: "Solo interior", pt: "Só interna", it: "Solo interna", zh: "仅内侧")),
+        ("outer_and_inner", orcaLz(en: "Outer and inner", de: "Außen und innen", fr: "Extérieur et intérieur", es: "Exterior e interior", pt: "Externa e interna", it: "Esterna e interna", zh: "内外侧")),
+        ("brim_ears", orcaLz(en: "Mouse ears", de: "Mausohren", fr: "Oreilles", es: "Orejas", pt: "Orelhas", it: "Orecchie", zh: "鼠耳")),
+        ("no_brim", orcaLz(en: "No brim", de: "Kein Rand", fr: "Sans bordure", es: "Sin borde", pt: "Sem borda", it: "Nessun brim", zh: "无")),
+    ]
+
+    /// Orca stores everything as strings ("15%", "1", "tree(auto)").
+    static func from(profile d: [String: Any], process: String) -> QuickSettings {
+        func str(_ k: String) -> String? {
+            if let v = d[k] as? String { return v }
+            if let v = d[k] as? NSNumber { return v.stringValue }
+            return nil
+        }
+        func num(_ k: String) -> Double? { str(k).flatMap { Double($0.replacingOccurrences(of: "%", with: "")) } }
+        func bool(_ k: String) -> Bool? { str(k).map { $0 == "1" || $0.lowercased() == "true" } }
+        var q = QuickSettings()
+        q.process = process
+        if let v = str("layer_height") { q.layerHeight = v }
+        if let v = str("initial_layer_print_height") { q.firstLayerHeight = v }
+        if let v = str("seam_position") { q.seam = v }
+        if let v = num("wall_loops") { q.walls = Int(v) }
+        if let v = num("top_shell_layers") { q.topLayers = Int(v) }
+        if let v = num("bottom_shell_layers") { q.bottomLayers = Int(v) }
+        if let v = num("sparse_infill_density") { q.infill = v }
+        if let v = str("sparse_infill_pattern") { q.infillPattern = v }
+        if let v = bool("enable_support") { q.support = v }
+        if let v = str("support_type") { q.tree = v.hasPrefix("tree") }
+        if let v = bool("support_on_build_plate_only") { q.plateOnly = v }
+        if let v = num("support_threshold_angle") { q.thresholdAngle = Int(v) }
+        if let v = str("brim_type") { q.brimType = v }
+        if let v = str("brim_width") { q.brimWidth = v }
+        if let v = str("brim_object_gap") { q.brimGap = v }
+        if let v = num("skirt_loops") { q.skirtLoops = Int(v) }
+        if let v = bool("spiral_mode") { q.spiral = v }
+        if let v = str("print_sequence") { q.sequence = v }
+        return q
+    }
+
+    /// An object's own settings follow a change of the general ones wherever
+    /// the object still had the general value — only what was changed on the
+    /// object itself stays. (Before, an object kept a copy of the general values
+    /// from the moment "own settings" was switched on: support switched off in
+    /// general later stayed on for that object.)
+    mutating func follow(_ old: QuickSettings, to new: QuickSettings) {
+        if walls == old.walls { walls = new.walls }
+        if topLayers == old.topLayers { topLayers = new.topLayers }
+        if bottomLayers == old.bottomLayers { bottomLayers = new.bottomLayers }
+        if infill == old.infill { infill = new.infill }
+        if infillPattern == old.infillPattern { infillPattern = new.infillPattern }
+        if support == old.support { support = new.support }
+        if tree == old.tree { tree = new.tree }
+        if plateOnly == old.plateOnly { plateOnly = new.plateOnly }
+        if thresholdAngle == old.thresholdAngle { thresholdAngle = new.thresholdAngle }
+        if seam == old.seam { seam = new.seam }
+        if brimType == old.brimType { brimType = new.brimType }
+        if layerHeight == old.layerHeight { layerHeight = new.layerHeight }
+        if brimWidth == old.brimWidth { brimWidth = new.brimWidth }
+        if brimGap == old.brimGap { brimGap = new.brimGap }
+    }
+
+    /// Only what differs from the general settings — what the object really overrides.
+    func objectOverrides(over general: QuickSettings) -> [String: String] {
+        let g = general.objectOverrides
+        return objectOverrides.filter { g[$0.key] != $0.value }
+    }
+
+    private static func mm(_ s: String) -> Double? { Double(s.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")) }
+
+    /// The object-level subset as Orca's own keys and value spellings, for
+    /// an object's entry in model_settings.config.
+    var objectOverrides: [String: String] {
+        var o: [String: String] = [
+            "wall_loops": "\(walls)", "top_shell_layers": "\(topLayers)", "bottom_shell_layers": "\(bottomLayers)",
+            "sparse_infill_density": "\(Int(infill))%", "sparse_infill_pattern": infillPattern,
+            "enable_support": support ? "1" : "0", "support_type": tree ? "tree(auto)" : "normal(auto)",
+            "support_on_build_plate_only": plateOnly ? "1" : "0", "support_threshold_angle": "\(thresholdAngle)",
+            "seam_position": seam, "brim_type": brimType,
+        ]
+        if let v = Self.mm(layerHeight), v > 0 { o["layer_height"] = String(format: "%g", v) }
+        if let v = Self.mm(brimWidth), v >= 0 { o["brim_width"] = String(format: "%g", v) }
+        if let v = Self.mm(brimGap), v >= 0 { o["brim_object_gap"] = String(format: "%g", v) }
+        return o
+    }
+
+    var overrides: [String: Any] {
+        var o: [String: Any] = [
+            "seam_position": seam, "wall_loops": walls, "top_shell_layers": topLayers, "bottom_shell_layers": bottomLayers,
+            "sparse_infill_density": infill, "sparse_infill_pattern": infillPattern,
+            "enable_support": support, "support_type": tree ? "tree(auto)" : "normal(auto)",
+            "support_on_build_plate_only": plateOnly, "support_threshold_angle": thresholdAngle,
+            "brim_type": brimType, "skirt_loops": skirtLoops, "spiral_mode": spiral, "print_sequence": sequence,
+        ]
+        if let v = Self.mm(layerHeight), v > 0 { o["layer_height"] = v }
+        if let v = Self.mm(firstLayerHeight), v > 0 { o["initial_layer_print_height"] = v }
+        if let v = Self.mm(brimWidth), v >= 0 { o["brim_width"] = v }
+        if let v = Self.mm(brimGap), v >= 0 { o["brim_object_gap"] = v }
+        return o
+    }
+}
+
+struct SliceSettingsSheet: View {
+    @ObservedObject var plate: PlateModel
+    let printer: PrinterConfig
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var printerServices: PrinterServicesManager
+    @AppStorage("app_language") private var appLanguage: String = "en"
+
+    @State private var profiles: SlicerProfiles? = nil
+    @State private var loadError: String? = nil
+    /// The profile source PaxxMaker-Connect serves — the installed OrcaSlicer.
+    @State private var app = "orca"
+    @State private var machine = ""
+    @State private var process = ""
+    @State private var filaments = ["", "", "", ""]
+    @State private var q = QuickSettings()
+    @State private var loadingProfile = false
+    /// How the middle of this screen is arranged — the user's own order,
+    /// groups and choice of settings ("Edit" at the bottom).
+    @State private var layout = SliceLayout.load()
+    @State private var showEditor = false
+    /// Every value the chosen process profile holds, for the settings that
+    /// have no row of their own.
+    @State private var profileValues: [String: String] = [:]
+    /// Version of the paired PaxxMaker-Connect ("" until known).
+    @State private var connectVersion = ""
+    @State private var connectFeatures: [String]? = nil
+    /// The machine profile's machine_pause_gcode (U1: M600), else Klipper's PAUSE.
+    @State private var pauseGcode = "PAUSE"
+    /// What was changed on top of the profile, by Orca key.
+    @State private var edits: [String: String] = [:]
+    /// The profile's own values, to tell a changed setting from an untouched
+    /// one (changed ones are shown in colour and can be reset one by one).
+    @State private var baseQ = QuickSettings()
+    @State private var baseNozzleTemps: [Int] = [0, 0, 0, 0]
+    @State private var baseBedTemp = 0
+    /// Temperatures shown next to the filaments: nozzle per head, bed once.
+    /// They start at the filament's own values and go to Orca as they stand.
+    @State private var nozzleTemps: [Int] = [0, 0, 0, 0]
+    /// Material per head ("PETG", "PLA" …) — part of the file name.
+    @State private var filamentTypes: [String] = ["", "", "", ""]
+    /// The colour the chosen filament carries in OrcaSlicer, for the preview.
+    @State private var filamentColors: [String] = ["", "", "", ""]
+    @State private var bedTemp = 0
+    @State private var bedTypeName = ""
+    @FocusState private var tempFocus: Int?
+
+    @State private var running = false
+    @State private var progress: Double = 0
+    @State private var stage = ""
+    @State private var job: SliceJob? = nil
+    @State private var jobError: String? = nil
+    @State private var printing = false
+    @State private var printed = false
+    /// Whether the last send also started the print (Orca: "Send" vs "Print").
+    @State private var printStarted = false
+    @State private var askPrint = false
+    @State private var gcodeData: Data? = nil
+    @State private var showPreview = false
+    @State private var fetchingPreview = false
+    /// Colour mixing of two heads (U1, Connect 1.5 with OrcaSlicer 2.5).
+    /// Open edges per object, from the model check (nil = not checked yet).
+    @State private var openEdges: [UUID: Int] = [:]
+    @State private var checkingModels = false
+    @State private var repairModels = true
+    /// Profile sources the computer offers (OrcaSlicer / Snapmaker Orca).
+    @State private var sources: [String] = []
+    @State private var sourceNames: [String: String] = [:]
+    @State private var slicerNames: [String: String] = [:]
+    @State private var chosenSource = ""
+
+    private var config: ConnectConfig? { ConnectConfig.load() }
+    /// Last choices per printer — and per profile source, since the names
+    /// differ between OrcaSlicer and Snapmaker Orca.
+    private var key: String { app == "orca" ? "slicer_last_\(printer.name)" : "slicer_last_\(printer.name)_\(app)" }
+    private var isU1: Bool { printer.type == .snapmakerU1 }
+    /// Heads the plate uses (U1): each object's own plus painted regions.
+    /// Several heads = a multi-material slice; one head is sliced as T0 and
+    /// rewritten by PaxxMaker-Connect.
+    private var usedHeads: [Int] {
+        guard isU1 else { return [1] }
+        var set = Set<Int>()
+        let mixing = mixActive
+        for o in plate.objects {
+            set.insert(o.extruder)
+            set.formUnion(o.paintedHeads)
+            // A mixed object prints with its second head as well.
+            if mixing, let m = o.mix { set.insert(m.head) }
+        }
+        set.formUnion(plate.activeBands.map(\.head))
+        return set.isEmpty ? [1] : set.sorted()
+    }
+    private var multi: Bool { usedHeads.count > 1 }
+    private func has(_ feature: String) -> Bool { connectFeatures?.contains(feature) ?? false }
+    /// Objects mixed with a second head (set on the plate) — sliced as such
+    /// only by a Connect whose slicer can (OrcaSlicer 2.5).
+    private var mixedObjects: [ModelPlacement] { isU1 ? plate.objects.filter { $0.mix.map { $0.head != 0 } ?? false } : [] }
+    private var mixActive: Bool { !mixedObjects.isEmpty && has("mix") }
+    private var head: Int { usedHeads.first ?? 1 }
+    private var usedExtruders: [Int] { usedHeads }
+
+    private var machinePresets: [SlicerProfiles.Preset] {
+        guard let p = profiles else { return [] }
+        // Same printer family first (user presets on top), everything else below.
+        let want = isU1 ? "U1" : nil
+        return p.machine.sorted { a, b in
+            let am = want.map { a.name.contains($0) || (a.printer_model ?? "").contains($0) } ?? true
+            let bm = want.map { b.name.contains($0) || (b.printer_model ?? "").contains($0) } ?? true
+            if am != bm { return am }
+            if (a.origin == "user") != (b.origin == "user") { return a.origin == "user" }
+            return a.name < b.name
+        }
+    }
+    /// Orca's drop-down rule (Preset.cpp is_compatible_with_printer): a preset
+    /// without `compatible_printers` fits every printer; otherwise the list
+    /// must name the selected printer or, for a user printer, its parent.
+    private func compatible(_ list: [SlicerProfiles.Preset]) -> [SlicerProfiles.Preset] {
+        let m = machinePresets.first { $0.name == machine }
+        var names: Set<String> = [machine]
+        if let m, m.origin == "user", let parent = m.inherits, !parent.isEmpty { names.insert(parent) }
+        return list.filter { p in
+            guard let c = p.compatible_printers, !c.isEmpty else { return true }
+            return !names.isDisjoint(with: c)
+        }.sorted { a, b in
+            let au = a.origin == "user", bu = b.origin == "user"
+            if au != bu { return au }
+            return a.name < b.name
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let e = loadError {
+                    Section { Label(e, systemImage: "exclamationmark.triangle.fill").foregroundColor(.orange) }
+                } else if profiles == nil {
+                    Section { HStack { ProgressView(); Text(lz(en: "Loading profiles from the computer…", de: "Lade Profile vom Computer…", fr: "Chargement des profils depuis l'ordinateur…", es: "Cargando perfiles del ordenador…", pt: "Carregando perfis do computador…", it: "Carico i profili dal computer…", zh: "正在从电脑加载配置…")) } }
+                } else if let p = profiles {
+                    profileSection(p)
+                    if !mixedObjects.isEmpty { mixSection }
+                    layoutSections
+                    perObjectSection
+                    if has("repair") { modelCheckSection }
+                }
+                // Layer colours need a Connect that writes height ranges.
+                if !plate.activeBands.isEmpty, let f = connectFeatures, !f.contains("ranges") {
+                    Section {
+                        Label(lz(en: "Layer colours need the latest PaxxMaker-Connect on the computer — this one leaves them out.",
+                                 de: "Schichtfarben brauchen das neueste PaxxMaker-Connect auf dem Computer — dieses lässt sie weg.",
+                                 fr: "Les couleurs par couche nécessitent le dernier PaxxMaker-Connect sur l'ordinateur — celui-ci les ignore.",
+                                 es: "Los colores por capa necesitan el PaxxMaker-Connect más reciente en el ordenador; este los omite.",
+                                 pt: "As cores por camada precisam do PaxxMaker-Connect mais recente no computador — este as ignora.",
+                                 it: "I colori per strato richiedono l'ultimo PaxxMaker-Connect sul computer — questo li ignora.",
+                                 zh: "分层颜色需要电脑上最新的 PaxxMaker-Connect——当前版本会忽略它们。"),
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote).foregroundColor(.orange)
+                    }
+                }
+                // Older Connect versions drop painted fuzzy skin without a word.
+                if plate.objects.contains(where: \.hasFuzzy), !connectVersion.isEmpty,
+                   ConnectUpdate.compare("1.4", connectVersion) > 0 {
+                    Section {
+                        Label(lz(en: "Painted fuzzy skin needs PaxxMaker-Connect 1.4 on the computer — version \(connectVersion) leaves it out.",
+                                 de: "Gemaltes Fuzzy Skin braucht PaxxMaker-Connect 1.4 auf dem Computer — Version \(connectVersion) lässt es weg.",
+                                 fr: "Le fuzzy skin peint nécessite PaxxMaker-Connect 1.4 sur l'ordinateur — la version \(connectVersion) l'ignore.",
+                                 es: "El fuzzy skin pintado necesita PaxxMaker-Connect 1.4 en el ordenador — la versión \(connectVersion) lo omite.",
+                                 pt: "O fuzzy skin pintado precisa do PaxxMaker-Connect 1.4 no computador — a versão \(connectVersion) o ignora.",
+                                 it: "Il fuzzy skin dipinto richiede PaxxMaker-Connect 1.4 sul computer — la versione \(connectVersion) lo ignora.",
+                                 zh: "绘制的 Fuzzy Skin 需要电脑上的 PaxxMaker-Connect 1.4——版本 \(connectVersion) 会忽略它。"),
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote).foregroundColor(.orange)
+                    }
+                }
+                resultSection
+                bottomBar
+            }
+            .navigationTitle(lz(en: "Slice", de: "Slicen", fr: "Trancher", es: "Laminar", pt: "Fatiar", it: "Slice", zh: "切片"))
+            .navigationBarTitleDisplayMode(.inline)
+            .keyboardDismissable()
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(lz(en: "Close", de: "Schließen", fr: "Fermer", es: "Cerrar", pt: "Fechar", it: "Chiudi", zh: "关闭")) { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(lz(en: "Slice", de: "Slicen", fr: "Trancher", es: "Laminar", pt: "Fatiar", it: "Slice", zh: "切片")) { Task { await slice() } }
+                        .disabled(running || profiles == nil || machine.isEmpty || process.isEmpty || usedExtruders.contains { filaments[$0 - 1].isEmpty })
+                }
+            }
+            .task { await load() }
+            .sheet(isPresented: $showEditor, onDismiss: { layout.save() }) {
+                SliceLayoutEditor(layout: $layout, options: SliceCatalog.all(extraKeys: profileValues))
+            }
+            .fullScreenCover(isPresented: $showPreview) {
+                if let d = gcodeData {
+                    // The preview shows what was sliced, so the filament
+                    // picked here gives the colour — not what happens to be
+                    // in the printer.
+                    GCodePreviewView(gcode: d, bed: BedSize.for(printer), printerName: printer.name,
+                                     toolColorHexes: previewColorHexes, colorsFromSlicer: true,
+                                     printerService: printerServices.services.first { $0.name == printer.name }) { start in Task { await sendToPrinter(start: start) } }
+                }
+            }
+            .onChange(of: machine) { _, _ in
+                // Keep the pickers valid when the printer changes.
+                if let p = profiles, !compatible(p.process).contains(where: { $0.name == process }) { process = compatible(p.process).first?.name ?? "" }
+            }
+            .onChange(of: process) { _, new in
+                // A different preset brings its own values.
+                if profiles != nil, q.process != new { Task { await fillFromProfile() } }
+            }
+            .onChange(of: chosenSource) { _, new in
+                // Another source = other profiles: remember the choice, load anew.
+                guard !new.isEmpty, new != app else { return }
+                remember()
+                UserDefaults.standard.set(new, forKey: "slicer_source_\(printer.name)")
+                profiles = nil; job = nil; jobError = nil
+                Task { await load() }
+            }
+            .onChange(of: filaments) { _, _ in
+                // A different filament brings its own temperatures.
+                guard profiles != nil else { return }
+                Task { for e in usedExtruders { await loadTemps(head: e) } }
+            }
+            .onChange(of: machine) { _, _ in
+                guard profiles != nil else { return }
+                Task { await loadBedType(); for e in usedExtruders { await loadTemps(head: e) } }
+            }
+            // Objects with own settings follow the general ones except where
+            // they were changed on the object itself.
+            .onChange(of: q) { old, new in
+                for o in plate.objects {
+                    guard var own = o.settings else { continue }
+                    own.follow(old, to: new)
+                    if own != o.settings { o.settings = own }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func profileSection(_ p: SlicerProfiles) -> some View {
+                    Section {
+                        if sources.count > 1 {
+                            Picker(lz(en: "Profiles from", de: "Profile aus", fr: "Profils de", es: "Perfiles de", pt: "Perfis de", it: "Profili da", zh: "配置来源"), selection: $chosenSource) {
+                                ForEach(sources, id: \.self) { Text(sourceNames[$0] ?? $0).tag($0) }
+                            }
+                        }
+                        Picker(lz(en: "Printer", de: "Drucker", fr: "Imprimante", es: "Impresora", pt: "Impressora", it: "Stampante", zh: "打印机"), selection: $machine) {
+                            ForEach(machinePresets) { m in Text(m.name).tag(m.name) }
+                        }
+                        Picker(lz(en: "Process", de: "Prozess", fr: "Processus", es: "Proceso", pt: "Processo", it: "Processo", zh: "工艺"), selection: $process) {
+                            ForEach(compatible(p.process)) { m in Text(m.name).tag(m.name) }
+                        }
+                        ForEach(usedExtruders, id: \.self) { e in
+                            Picker(isU1 ? lz(en: "Filament head \(e)", de: "Filament Kopf \(e)", fr: "Filament tête \(e)", es: "Filamento cabezal \(e)", pt: "Filamento cabeça \(e)", it: "Filamento testa \(e)", zh: "喷头 \(e) 耗材") : lz(en: "Filament", de: "Filament", fr: "Filament", es: "Filamento", pt: "Filamento", it: "Filamento", zh: "耗材"),
+                                   selection: $filaments[e - 1]) {
+                                ForEach(compatible(p.filament)) { m in Text(m.name).tag(m.name) }
+                            }
+                            if isU1, filamentMismatch(e) {
+                                // The printer only maps a filament to heads with the same material.
+                                Label(lz(en: "Head \(e) has \(loadedMaterial(e)) loaded — the printer won't use it for this profile.",
+                                         de: "In Kopf \(e) ist \(loadedMaterial(e)) geladen — der Drucker nimmt ihn für dieses Profil nicht.",
+                                         fr: "La tête \(e) contient du \(loadedMaterial(e)) — l'imprimante ne l'utilisera pas pour ce profil.",
+                                         es: "El cabezal \(e) tiene \(loadedMaterial(e)) — la impresora no lo usará con este perfil.",
+                                         pt: "A cabeça \(e) tem \(loadedMaterial(e)) — a impressora não a usará com este perfil.",
+                                         it: "La testa \(e) ha \(loadedMaterial(e)) — la stampante non la userà con questo profilo.",
+                                         zh: "喷头 \(e) 装的是 \(loadedMaterial(e))——打印机不会为此配置使用它。"),
+                                      systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption).foregroundColor(.orange)
+                            }
+                            tempRow(lz(en: "Nozzle", de: "Düse", fr: "Buse", es: "Boquilla", pt: "Bico", it: "Ugello", zh: "喷嘴")
+                                    + (isU1 && usedExtruders.count > 1 ? " \(e)" : ""),
+                                    value: Binding(get: { nozzleTemps[e - 1] }, set: { nozzleTemps[e - 1] = $0 }), tag: e, key: "nozzle_\(e)")
+                        }
+                        tempRow(lz(en: "Heated bed", de: "Heizbett", fr: "Plateau", es: "Cama", pt: "Mesa", it: "Piano", zh: "热床"),
+                                value: $bedTemp, tag: 0, key: "bed_temp")
+                        if anyChanged {
+                            Button(lz(en: "Reset to profile values", de: "Auf Profilwerte zurücksetzen", fr: "Rétablir les valeurs du profil", es: "Restablecer valores del perfil", pt: "Repor valores do perfil", it: "Ripristina valori del profilo", zh: "恢复配置值")) {
+                                edits.removeAll()
+                                nozzleTemps = baseNozzleTemps
+                                bedTemp = baseBedTemp
+                                Task { await fillFromProfile() }
+                            }
+                            .disabled(loadingProfile || process.isEmpty)
+                        }
+                    } header: {
+                        Text(lz(en: "Profiles", de: "Profile", fr: "Profils", es: "Perfiles", pt: "Perfis", it: "Profili", zh: "配置"))
+                    } footer: {
+                        Text(lz(en: "Temperatures come from the filament profile — change them here for this print. Picking another filament brings its values back.",
+                                de: "Die Temperaturen kommen aus dem Filamentprofil — hier für diesen Druck änderbar. Ein anderes Filament setzt wieder dessen Werte.",
+                                fr: "Les températures viennent du profil de filament — modifiables ici pour cette impression. Un autre filament rétablit ses valeurs.",
+                                es: "Las temperaturas vienen del perfil de filamento — cámbialas aquí para esta impresión. Otro filamento restablece sus valores.",
+                                pt: "As temperaturas vêm do perfil de filamento — altere-as aqui para esta impressão. Outro filamento traz os valores dele.",
+                                it: "Le temperature vengono dal profilo del filamento — modificabili qui per questa stampa. Un altro filamento riporta i suoi valori.",
+                                zh: "温度来自耗材配置——可在此为本次打印修改。换用其他耗材会恢复该耗材的数值。"))
+                    }
+    }
+
+    // MARK: colour mixing (Connect 1.5 / OrcaSlicer 2.5)
+
+    private func headName(_ h: Int) -> String {
+        lz(en: "Head \(h)", de: "Kopf \(h)", fr: "Tête \(h)", es: "Cabezal \(h)", pt: "Cabeça \(h)", it: "Testa \(h)", zh: "喷头 \(h)")
+    }
+
+    /// The material of the filament chosen for a head (profile type).
+    private func chosenType(_ head: Int) -> String {
+        let name = filaments[safe: head - 1] ?? ""
+        if let t = profiles?.filament.first(where: { $0.name == name })?.filament_type, !t.isEmpty { return t }
+        let t = filamentTypes[safe: head - 1] ?? ""
+        return t.isEmpty ? (Self.material(inName: name) ?? "").uppercased() : t
+    }
+
+    /// What the plate mixes — set per object with the "Head" tool there.
+    @ViewBuilder private var mixSection: some View {
+        Section {
+            ForEach(mixedObjects) { o in
+                if let m = o.mix {
+                    let ta = chosenType(o.extruder), tb = chosenType(m.head)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 8) {
+                            mixSwatch(o.extruder, m.head, m)
+                            Text(o.name).lineLimit(1)
+                            Spacer()
+                            Text("\(headName(o.extruder)) + \(headName(m.head))").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text(m.gradient
+                             ? lz(en: "Gradient \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", de: "Verlauf \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", fr: "Dégradé \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", es: "Degradado \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", pt: "Gradiente \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", it: "Sfumatura \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))", zh: "渐变 \(Int(m.share))/\(100 - Int(m.share)) → \(Int(m.shareTop))/\(100 - Int(m.shareTop))")
+                             : lz(en: "Even \(Int(m.share))/\(100 - Int(m.share))", de: "Gleichmäßig \(Int(m.share))/\(100 - Int(m.share))", fr: "Uniforme \(Int(m.share))/\(100 - Int(m.share))", es: "Uniforme \(Int(m.share))/\(100 - Int(m.share))", pt: "Uniforme \(Int(m.share))/\(100 - Int(m.share))", it: "Uniforme \(Int(m.share))/\(100 - Int(m.share))", zh: "均匀 \(Int(m.share))/\(100 - Int(m.share))"))
+                            .font(.caption).foregroundStyle(.secondary)
+                        if Self.baseMaterial(ta) != Self.baseMaterial(tb) {
+                            Label(lz(en: "Both heads need the same material (\(ta) / \(tb)).", de: "Beide Köpfe brauchen dasselbe Material (\(ta) / \(tb)).", fr: "Les deux têtes doivent avoir le même matériau (\(ta) / \(tb)).", es: "Ambos cabezales necesitan el mismo material (\(ta) / \(tb)).", pt: "As duas cabeças precisam do mesmo material (\(ta) / \(tb)).", it: "Entrambe le teste richiedono lo stesso materiale (\(ta) / \(tb)).", zh: "两个喷头需要相同材料（\(ta) / \(tb)）。"),
+                                  systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption).foregroundColor(.orange)
+                        }
+                    }
+                }
+            }
+            if !has("mix") {
+                Label(lz(en: "Colour mixing needs OrcaSlicer 2.5 as the slicer on the computer — this slice prints each object with its own head only.",
+                         de: "Farbmischung braucht OrcaSlicer 2.5 als Slicer auf dem Computer — dieser Slice druckt jedes Objekt nur mit seinem eigenen Kopf.",
+                         fr: "Le mélange de couleurs nécessite OrcaSlicer 2.5 sur l'ordinateur — ce tranchage imprime chaque objet avec sa propre tête.",
+                         es: "La mezcla de colores necesita OrcaSlicer 2.5 en el ordenador; este laminado imprime cada objeto solo con su cabezal.",
+                         pt: "A mistura de cores precisa do OrcaSlicer 2.5 no computador — este fatiamento imprime cada objeto só com a sua cabeça.",
+                         it: "La miscelazione richiede OrcaSlicer 2.5 sul computer — questo slicing stampa ogni oggetto solo con la propria testa.",
+                         zh: "混色需要电脑上的 OrcaSlicer 2.5——本次切片每个对象只用自己的喷头打印。"),
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote).foregroundColor(.orange)
+            }
+        } header: {
+            Text(lz(en: "Colour mixing", de: "Farbmischung", fr: "Mélange de couleurs", es: "Mezcla de colores", pt: "Mistura de cores", it: "Miscelazione colori", zh: "混色"))
+        } footer: {
+            Text(lz(en: "Set on the plate with the \"Head\" tool. The two heads take turns every layer — the print takes much longer and the prime tower gets about 10 cm deep.",
+                    de: "Eingestellt auf der Platte mit dem Werkzeug „Kopf\". Die beiden Köpfe wechseln sich jede Schicht ab — der Druck dauert deutlich länger und der Reinigungsturm wird ca. 10 cm tief.",
+                    fr: "Réglé sur le plateau avec l'outil « Tête ». Les deux têtes alternent à chaque couche — l'impression est bien plus longue et la tour de purge fait environ 10 cm.",
+                    es: "Se ajusta en la placa con la herramienta «Cabezal». Los dos cabezales se turnan cada capa: la impresión tarda mucho más y la torre de purga mide unos 10 cm.",
+                    pt: "Definido na mesa com a ferramenta \"Cabeça\". As duas cabeças alternam a cada camada — a impressão demora bem mais e a torre de purga fica com cerca de 10 cm.",
+                    it: "Impostato sul piano con lo strumento «Testa». Le due teste si alternano a ogni strato — la stampa dura molto di più e la torre di spurgo arriva a circa 10 cm.",
+                    zh: "在打印板上用“喷头”工具设置。两个喷头每层轮流打印——打印时间明显更长，擦拭塔约 10 厘米深。"))
+        }
+    }
+
+    /// Own head's colour, the blend, the second head's colour.
+    private func mixSwatch(_ a: Int, _ b: Int, _ m: ObjectMix) -> some View {
+        let ca = UIColor(Color(hex: previewColorHexes[safe: a - 1] ?? "") ?? .gray)
+        let cb = UIColor(Color(hex: previewColorHexes[safe: b - 1] ?? "") ?? .gray)
+        let lo = ObjectMix.blend(ca, cb, share: m.share)
+        let hi = m.gradient ? ObjectMix.blend(ca, cb, share: m.shareTop) : lo
+        return RoundedRectangle(cornerRadius: 5)
+            .fill(LinearGradient(colors: [Color(hi), Color(lo)], startPoint: .top, endPoint: .bottom))
+            .frame(width: 22, height: 22)
+            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.primary.opacity(0.3), lineWidth: 0.5))
+    }
+
+    // MARK: model check (Connect 1.5 / OrcaSlicer 2.5)
+
+    @ViewBuilder private var modelCheckSection: some View {
+        let broken = plate.objects.filter { (openEdges[$0.id] ?? 0) > 0 }
+        Section {
+            if checkingModels {
+                HStack { ProgressView(); Text(lz(en: "Checking models…", de: "Modelle werden geprüft…", fr: "Vérification des modèles…", es: "Comprobando modelos…", pt: "Verificando modelos…", it: "Controllo dei modelli…", zh: "正在检查模型…")) }
+            } else if broken.isEmpty, !openEdges.isEmpty {
+                Label(lz(en: "Models are closed — no holes found.", de: "Modelle sind geschlossen — keine Löcher gefunden.", fr: "Modèles fermés — aucun trou trouvé.", es: "Modelos cerrados — sin agujeros.", pt: "Modelos fechados — nenhum furo encontrado.", it: "Modelli chiusi — nessun buco trovato.", zh: "模型是封闭的——未发现孔洞。"),
+                      systemImage: "checkmark.seal.fill")
+                    .foregroundStyle(.green).font(.footnote)
+            } else {
+                ForEach(broken) { o in
+                    Label(lz(en: "\(o.name): \(openEdges[o.id] ?? 0) open edges (holes or cracks)",
+                             de: "\(o.name): \(openEdges[o.id] ?? 0) offene Kanten (Löcher oder Risse)",
+                             fr: "\(o.name) : \(openEdges[o.id] ?? 0) arêtes ouvertes (trous ou fissures)",
+                             es: "\(o.name): \(openEdges[o.id] ?? 0) aristas abiertas (agujeros o grietas)",
+                             pt: "\(o.name): \(openEdges[o.id] ?? 0) arestas abertas (furos ou fissuras)",
+                             it: "\(o.name): \(openEdges[o.id] ?? 0) spigoli aperti (buchi o crepe)",
+                             zh: "\(o.name)：\(openEdges[o.id] ?? 0) 条开放边（孔洞或裂缝）"),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange).font(.footnote)
+                }
+                if !broken.isEmpty {
+                    Toggle(lz(en: "Repair when slicing", de: "Beim Slicen reparieren", fr: "Réparer au tranchage", es: "Reparar al laminar", pt: "Reparar ao fatiar", it: "Ripara durante lo slicing", zh: "切片时修复"), isOn: $repairModels)
+                }
+            }
+        } header: {
+            Text(lz(en: "Model check", de: "Modell-Check", fr: "Vérification du modèle", es: "Comprobación del modelo", pt: "Verificação do modelo", it: "Controllo modello", zh: "模型检查"))
+        } footer: {
+            if !broken.isEmpty {
+                Text(lz(en: "OrcaSlicer's \"Fix Model\" closes holes and cracks, turns flipped faces outward and removes self-intersections.",
+                        de: "OrcaSlicers „Modell reparieren\" schließt Löcher und Risse, dreht verkehrte Flächen nach außen und entfernt Selbstüberschneidungen.",
+                        fr: "« Réparer le modèle » d'OrcaSlicer ferme trous et fissures, réoriente les faces et supprime les auto-intersections.",
+                        es: "«Reparar modelo» de OrcaSlicer cierra agujeros y grietas, orienta las caras hacia fuera y elimina autointersecciones.",
+                        pt: "O \"Reparar modelo\" do OrcaSlicer fecha furos e fissuras, vira faces para fora e remove autointerseções.",
+                        it: "«Ripara modello» di OrcaSlicer chiude buchi e crepe, orienta le facce verso l'esterno e rimuove le auto-intersezioni.",
+                        zh: "OrcaSlicer 的“修复模型”会封闭孔洞和裂缝、把翻转的面朝外并去除自相交。"))
+            }
+        }
+    }
+
+    /// Open edges of every object on the plate, off the main thread.
+    private func checkModels() async {
+        let todo = plate.objects.filter { openEdges[$0.id] == nil }.map { ($0.id, $0.mesh) }
+        guard !todo.isEmpty else { return }
+        checkingModels = true
+        let found = await Task.detached(priority: .utility) {
+            todo.map { ($0.0, MeshCheck.openEdges($0.1)) }
+        }.value
+        for (id, n) in found { openEdges[id] = n }
+        checkingModels = false
+    }
+
+    // MARK: the arrangeable middle
+
+    /// The groups as the user put them together; a group without a visible
+    /// setting is left out entirely.
+    @ViewBuilder private var layoutSections: some View {
+        ForEach(layout.groups) { g in
+            if !g.keys.isEmpty {
+                Section {
+                    ForEach(g.keys, id: \.self) { key in
+                        settingRow(key)
+                    }
+                } header: {
+                    HStack {
+                        Text(layout.title(of: g))
+                        Spacer()
+                        if loadingProfile { ProgressView().controlSize(.mini) }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Objects can carry their own settings — that list is not part of the
+    /// arrangement, it belongs to the plate.
+    @ViewBuilder private var perObjectSection: some View {
+        // Also with a single object once it has own settings — they apply
+        // either way and must not be invisible.
+        if plate.objects.count > 1 || plate.objects.contains(where: { $0.settings != nil }) {
+            Section {
+                ForEach(plate.objects) { o in
+                    NavigationLink {
+                        ObjectSettingsPage(object: o, general: q)
+                    } label: {
+                        HStack {
+                            Text(o.name).lineLimit(1)
+                            Spacer()
+                            Text(o.settings == nil
+                                 ? lz(en: "general", de: "allgemein", fr: "général", es: "general", pt: "geral", it: "generale", zh: "通用")
+                                 : ownLabel(o.settings!))
+                                .foregroundStyle(o.settings == nil ? .secondary : Color.accentColor).font(.footnote)
+                        }
+                    }
+                }
+            } header: {
+                Text(lz(en: "Per object", de: "Je Objekt", fr: "Par objet", es: "Por objeto", pt: "Por objeto", it: "Per oggetto", zh: "按对象"))
+            } footer: {
+                Text(lz(en: "An object can override the general settings above (walls, infill, support, seam, brim, layer height).",
+                        de: "Ein Objekt kann die allgemeinen Einstellungen oben überschreiben (Wände, Infill, Support, Naht, Rand, Layerhöhe).",
+                        fr: "Un objet peut remplacer les réglages généraux ci-dessus (parois, remplissage, supports, couture, bordure, hauteur de couche).",
+                        es: "Un objeto puede sobrescribir los ajustes generales (paredes, relleno, soportes, costura, borde, altura de capa).",
+                        pt: "Um objeto pode sobrepor os ajustes gerais (paredes, preenchimento, suportes, costura, borda, altura de camada).",
+                        it: "Un oggetto può sovrascrivere le impostazioni generali (pareti, riempimento, supporti, cucitura, brim, altezza layer).",
+                        zh: "对象可以覆盖上面的通用设置（墙、填充、支撑、接缝、Brim、层高）。"))
+            }
+        }
+    }
+
+    /// "own" — and, as support is the one that surprises, whether it differs.
+    private func ownLabel(_ own: QuickSettings) -> String {
+        let base = lz(en: "own", de: "eigene", fr: "propres", es: "propios", pt: "próprios", it: "proprie", zh: "自定义")
+        guard own.support != q.support else { return base }
+        return base + " · " + (own.support
+            ? lz(en: "support on", de: "Support an", fr: "supports activés", es: "soportes activados", pt: "suportes ativados", it: "supporti attivi", zh: "支撑开")
+            : lz(en: "support off", de: "Support aus", fr: "supports désactivés", es: "soportes desactivados", pt: "suportes desativados", it: "supporti disattivati", zh: "支撑关"))
+    }
+
+    /// Below the result: back to the profile's values, and the editor.
+    @ViewBuilder private var bottomBar: some View {
+        Section {
+            Button {
+                showEditor = true
+            } label: {
+                Label(lz(en: "Edit", de: "Bearbeiten", fr: "Modifier", es: "Editar", pt: "Editar", it: "Modifica", zh: "编辑"),
+                      systemImage: "slider.horizontal.3")
+            }
+        } footer: {
+            Text(lz(en: "\"Edit\" arranges this screen: show or hide settings, group them, change the order. Everything OrcaSlicer's command line offers is available there.",
+                    de: "„Bearbeiten\" richtet diese Seite ein: Einstellungen ein- oder ausblenden, gruppieren, Reihenfolge ändern. Dort steht alles zur Verfügung, was die OrcaSlicer-Kommandozeile kann.",
+                    fr: "« Modifier » organise cette page : afficher ou masquer des réglages, les grouper, changer l'ordre. Tout ce que propose la ligne de commande d'OrcaSlicer s'y trouve.",
+                    es: "«Editar» organiza esta página: mostrar u ocultar ajustes, agruparlos, cambiar el orden. Allí está todo lo que ofrece la línea de comandos de OrcaSlicer.",
+                    pt: "\"Editar\" organiza esta página: mostrar ou ocultar ajustes, agrupá-los, mudar a ordem. Lá está tudo o que a linha de comando do OrcaSlicer oferece.",
+                    it: "«Modifica» organizza questa pagina: mostrare o nascondere impostazioni, raggrupparle, cambiarne l'ordine. Lì c'è tutto ciò che offre la riga di comando di OrcaSlicer.",
+                    zh: "“编辑”用于安排此页面：显示或隐藏设置、分组、调整顺序。那里提供 OrcaSlicer 命令行支持的全部设置。"))
+        }
+    }
+
+    // MARK: one row
+
+    @ViewBuilder private func settingRow(_ key: String) -> some View {
+        Group {
+            if let row = builtInRow(key) {
+                row
+            } else if let o = catalogOption(key) {
+                genericRow(o)
+            }
+        }
+        .modifier(ResetOnLongPress(armed: isChanged(key), title: settingTitle(key)) { reset(key) })
+    }
+
+    private func catalogOption(_ key: String) -> SliceOption? {
+        SliceCatalog.option(for: key, profileValue: profileValues[key])
+    }
+
+    /// The rows the screen always had — they keep their own look and write
+    /// straight into the quick settings. A changed value is shown in colour.
+    private func builtInRow(_ key: String) -> AnyView? {
+        switch key {
+        case "layer_height":
+            return AnyView(numberRow(label(key, orcaLz(en: "Layer height", de: "Layerhöhe", fr: "Hauteur de couche", es: "Altura de capa", pt: "Altura de camada", it: "Altezza layer", zh: "层高")), text: $q.layerHeight, unit: "mm", placeholder: "0.2"))
+        case "initial_layer_print_height":
+            return AnyView(numberRow(label(key, orcaLz(en: "First layer height", de: "Erste Layerhöhe", fr: "Hauteur 1re couche", es: "Altura 1.ª capa", pt: "Altura 1.ª camada", it: "Altezza 1° layer", zh: "首层层高")), text: $q.firstLayerHeight, unit: "mm", placeholder: "0.2"))
+        case "seam_position":
+            return AnyView(Picker(selection: $q.seam) {
+                ForEach(QuickSettings.seams, id: \.0) { Text($0.1).tag($0.0) }
+                if !QuickSettings.seams.contains(where: { $0.0 == q.seam }) { Text(q.seam).tag(q.seam) }
+            } label: { label(key, orcaLz(en: "Seam", de: "Naht", fr: "Couture", es: "Costura", pt: "Costura", it: "Cucitura", zh: "接缝")) })
+        case "wall_loops":
+            return AnyView(Stepper(value: $q.walls, in: 1...10) {
+                HStack { label(key, orcaLz(en: "Walls", de: "Wände", fr: "Parois", es: "Paredes", pt: "Paredes", it: "Pareti", zh: "墙")); Spacer(); Text("\(q.walls)").foregroundStyle(.secondary) }
+            })
+        case "top_shell_layers":
+            return AnyView(Stepper(value: $q.topLayers, in: 0...15) {
+                HStack { label(key, orcaLz(en: "Top layers", de: "Obere Schichten", fr: "Couches sup.", es: "Capas superiores", pt: "Camadas superiores", it: "Layer superiori", zh: "顶层")); Spacer(); Text("\(q.topLayers)").foregroundStyle(.secondary) }
+            })
+        case "bottom_shell_layers":
+            return AnyView(Stepper(value: $q.bottomLayers, in: 0...15) {
+                HStack { label(key, orcaLz(en: "Bottom layers", de: "Untere Schichten", fr: "Couches inf.", es: "Capas inferiores", pt: "Camadas inferiores", it: "Layer inferiori", zh: "底层")); Spacer(); Text("\(q.bottomLayers)").foregroundStyle(.secondary) }
+            })
+        case "sparse_infill_density":
+            return AnyView(HStack {
+                label(key, orcaLz(en: "Infill", de: "Infill", fr: "Remplissage", es: "Relleno", pt: "Preenchimento", it: "Riempimento", zh: "填充"))
+                Slider(value: $q.infill, in: 0...100, step: 5)
+                Text("\(Int(q.infill)) %").frame(width: 48, alignment: .trailing).monospacedDigit()
+            })
+        case "sparse_infill_pattern":
+            return AnyView(Picker(selection: $q.infillPattern) {
+                ForEach(QuickSettings.patterns, id: \.0) { Text($0.1).tag($0.0) }
+                if !QuickSettings.patterns.contains(where: { $0.0 == q.infillPattern }) { Text(q.infillPattern).tag(q.infillPattern) }
+            } label: { label(key, orcaLz(en: "Infill pattern", de: "Infill-Muster", fr: "Motif", es: "Patrón", pt: "Padrão", it: "Motivo", zh: "填充图案")) })
+        case "enable_support":
+            return AnyView(Toggle(isOn: $q.support) { label(key, orcaLz(en: "Enable support", de: "Support aktivieren", fr: "Activer les supports", es: "Activar soportes", pt: "Ativar suportes", it: "Attiva supporti", zh: "启用支撑")) })
+        case "support_type":
+            return AnyView(Picker(selection: $q.tree) {
+                Text(orcaLz(en: "Tree", de: "Baum", fr: "Arbre", es: "Árbol", pt: "Árvore", it: "Albero", zh: "树状")).tag(true)
+                Text("Normal").tag(false)
+            } label: { label(key, orcaLz(en: "Type", de: "Art", fr: "Type", es: "Tipo", pt: "Tipo", it: "Tipo", zh: "类型")) }.pickerStyle(.segmented))
+        case "support_on_build_plate_only":
+            return AnyView(Toggle(isOn: $q.plateOnly) { label(key, orcaLz(en: "On build plate only", de: "Nur auf Druckbett", fr: "Sur le plateau uniquement", es: "Solo sobre la cama", pt: "Somente na mesa", it: "Solo sul piano", zh: "仅在打印板上")) })
+        case "support_threshold_angle":
+            return AnyView(Stepper(value: $q.thresholdAngle, in: 0...90, step: 5) {
+                HStack { label(key, orcaLz(en: "Threshold angle", de: "Schwellwinkel", fr: "Angle seuil", es: "Ángulo umbral", pt: "Ângulo limite", it: "Angolo soglia", zh: "临界角")); Spacer(); Text("\(q.thresholdAngle)°").foregroundStyle(.secondary) }
+            })
+        case "brim_type":
+            return AnyView(Picker(selection: $q.brimType) {
+                ForEach(QuickSettings.brims, id: \.0) { Text($0.1).tag($0.0) }
+                if !QuickSettings.brims.contains(where: { $0.0 == q.brimType }) { Text(q.brimType).tag(q.brimType) }
+            } label: { label(key, orcaLz(en: "Brim type", de: "Rand-Typ", fr: "Type de bordure", es: "Tipo de borde", pt: "Tipo de borda", it: "Tipo di brim", zh: "Brim 类型")) })
+        case "brim_width":
+            return AnyView(numberRow(label(key, orcaLz(en: "Brim width", de: "Randbreite", fr: "Largeur", es: "Ancho", pt: "Largura", it: "Larghezza", zh: "宽度")), text: $q.brimWidth, unit: "mm", placeholder: "5"))
+        case "brim_object_gap":
+            return AnyView(numberRow(label(key, orcaLz(en: "Brim-object gap", de: "Abstand zum Objekt", fr: "Écart objet", es: "Separación", pt: "Distância", it: "Distanza", zh: "与模型间距")), text: $q.brimGap, unit: "mm", placeholder: "0.1"))
+        case "skirt_loops":
+            return AnyView(Stepper(value: $q.skirtLoops, in: 0...10) {
+                HStack { label(key, orcaLz(en: "Skirt loops", de: "Skirt-Schleifen", fr: "Boucles de jupe", es: "Vueltas de falda", pt: "Voltas da saia", it: "Giri skirt", zh: "裙边圈数")); Spacer(); Text("\(q.skirtLoops)").foregroundStyle(.secondary) }
+            })
+        case "spiral_mode":
+            return AnyView(Toggle(isOn: $q.spiral) { label(key, orcaLz(en: "Spiral vase", de: "Spiralvase", fr: "Vase spirale", es: "Vaso en espiral", pt: "Vaso espiral", it: "Vaso a spirale", zh: "螺旋花瓶")) })
+        case "print_sequence":
+            return AnyView(Picker(selection: $q.sequence) {
+                Text(orcaLz(en: "By layer", de: "Nach Layer", fr: "Par couche", es: "Por capa", pt: "Por camada", it: "Per layer", zh: "逐层")).tag("by layer")
+                Text(orcaLz(en: "By object", de: "Nach Objekt", fr: "Par objet", es: "Por objeto", pt: "Por objeto", it: "Per oggetto", zh: "逐个")).tag("by object")
+            } label: { label(key, orcaLz(en: "Print sequence", de: "Druckreihenfolge", fr: "Ordre d'impression", es: "Secuencia", pt: "Sequência", it: "Sequenza", zh: "打印顺序")) }.pickerStyle(.segmented))
+        default:
+            return nil
+        }
+    }
+
+    /// Is anything at all different from the profile? Only then is there
+    /// something to reset.
+    private var anyChanged: Bool {
+        var keys = SliceCatalog.builtInKeys
+        keys.insert("bed_temp")
+        for i in 1...4 { keys.insert("nozzle_\(i)") }
+        keys.formUnion(edits.keys)
+        return keys.contains { isChanged($0) }
+    }
+
+    /// A setting's name, in colour when it no longer matches the profile.
+    private func label(_ key: String, _ text: String) -> Text {
+        Text(text).foregroundColor(isChanged(key) ? .accentColor : .primary)
+    }
+
+    private func settingTitle(_ key: String) -> String {
+        if key.hasPrefix("nozzle_") {
+            return lz(en: "Nozzle", de: "Düse", fr: "Buse", es: "Boquilla", pt: "Bico", it: "Ugello", zh: "喷嘴")
+        }
+        if key == "bed_temp" {
+            return lz(en: "Heated bed", de: "Heizbett", fr: "Plateau", es: "Cama", pt: "Mesa", it: "Piano", zh: "热床")
+        }
+        return catalogOption(key)?.title ?? SliceCatalog.prettify(key)
+    }
+
+    /// Does this setting still hold what the profile says?
+    private func isChanged(_ key: String) -> Bool {
+        func same(_ a: String, _ b: String) -> Bool {
+            if let x = Double(a.replacingOccurrences(of: ",", with: ".")),
+               let y = Double(b.replacingOccurrences(of: ",", with: ".")) { return abs(x - y) < 1e-6 }
+            return a == b
+        }
+        switch key {
+        case "layer_height":                 return !same(q.layerHeight, baseQ.layerHeight)
+        case "initial_layer_print_height":   return !same(q.firstLayerHeight, baseQ.firstLayerHeight)
+        case "seam_position":                return q.seam != baseQ.seam
+        case "wall_loops":                   return q.walls != baseQ.walls
+        case "top_shell_layers":             return q.topLayers != baseQ.topLayers
+        case "bottom_shell_layers":          return q.bottomLayers != baseQ.bottomLayers
+        case "sparse_infill_density":        return abs(q.infill - baseQ.infill) > 0.01
+        case "sparse_infill_pattern":        return q.infillPattern != baseQ.infillPattern
+        case "enable_support":               return q.support != baseQ.support
+        case "support_type":                 return q.tree != baseQ.tree
+        case "support_on_build_plate_only":  return q.plateOnly != baseQ.plateOnly
+        case "support_threshold_angle":      return q.thresholdAngle != baseQ.thresholdAngle
+        case "brim_type":                    return q.brimType != baseQ.brimType
+        case "brim_width":                   return !same(q.brimWidth, baseQ.brimWidth)
+        case "brim_object_gap":              return !same(q.brimGap, baseQ.brimGap)
+        case "skirt_loops":                  return q.skirtLoops != baseQ.skirtLoops
+        case "spiral_mode":                  return q.spiral != baseQ.spiral
+        case "print_sequence":               return q.sequence != baseQ.sequence
+        case "bed_temp":                     return baseBedTemp > 0 && bedTemp != baseBedTemp
+        default:
+            if key.hasPrefix("nozzle_"), let i = Int(key.dropFirst(7)), i >= 1, i <= 4 {
+                return baseNozzleTemps[i - 1] > 0 && nozzleTemps[i - 1] != baseNozzleTemps[i - 1]
+            }
+            guard let e = edits[key] else { return false }
+            return e != (profileValues[key] ?? "")
+        }
+    }
+
+    /// Long press on a changed setting: back to the profile's value.
+    private func reset(_ key: String) {
+        switch key {
+        case "layer_height":                 q.layerHeight = baseQ.layerHeight
+        case "initial_layer_print_height":   q.firstLayerHeight = baseQ.firstLayerHeight
+        case "seam_position":                q.seam = baseQ.seam
+        case "wall_loops":                   q.walls = baseQ.walls
+        case "top_shell_layers":             q.topLayers = baseQ.topLayers
+        case "bottom_shell_layers":          q.bottomLayers = baseQ.bottomLayers
+        case "sparse_infill_density":        q.infill = baseQ.infill
+        case "sparse_infill_pattern":        q.infillPattern = baseQ.infillPattern
+        case "enable_support":               q.support = baseQ.support
+        case "support_type":                 q.tree = baseQ.tree
+        case "support_on_build_plate_only":  q.plateOnly = baseQ.plateOnly
+        case "support_threshold_angle":      q.thresholdAngle = baseQ.thresholdAngle
+        case "brim_type":                    q.brimType = baseQ.brimType
+        case "brim_width":                   q.brimWidth = baseQ.brimWidth
+        case "brim_object_gap":              q.brimGap = baseQ.brimGap
+        case "skirt_loops":                  q.skirtLoops = baseQ.skirtLoops
+        case "spiral_mode":                  q.spiral = baseQ.spiral
+        case "print_sequence":               q.sequence = baseQ.sequence
+        case "bed_temp":                     bedTemp = baseBedTemp
+        default:
+            if key.hasPrefix("nozzle_"), let i = Int(key.dropFirst(7)), i >= 1, i <= 4 {
+                nozzleTemps[i - 1] = baseNozzleTemps[i - 1]
+            } else {
+                edits[key] = nil
+            }
+        }
+    }
+
+    private func numberRow(_ title: Text, text: Binding<String>, unit: String, placeholder: String) -> some View {
+        HStack {
+            title
+            Spacer()
+            TextField(placeholder, text: text).keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 70)
+            if !unit.isEmpty { Text(unit).foregroundStyle(.secondary) }
+        }
+    }
+
+    /// A setting without a row of its own: type taken from the profile value,
+    /// sent to OrcaSlicer as `--key=value` when it was touched.
+    private func genericRow(_ o: SliceOption) -> AnyView {
+        let title = label(o.key, o.title)
+        let text = Binding<String>(get: { edits[o.key] ?? profileValues[o.key] ?? "" },
+                                   set: { edits[o.key] = $0 })
+        switch o.kind {
+        case .toggle:
+            let on = Binding<Bool>(get: { (edits[o.key] ?? profileValues[o.key] ?? "0") == "1" },
+                                   set: { edits[o.key] = $0 ? "1" : "0" })
+            return AnyView(Toggle(isOn: on) { title })
+        case .stepper(let range):
+            let v = Binding<Int>(get: { Int(Double(edits[o.key] ?? profileValues[o.key] ?? "0") ?? 0) },
+                                 set: { edits[o.key] = "\($0)" })
+            return AnyView(Stepper(value: v, in: range) {
+                HStack { title; Spacer(); Text("\(v.wrappedValue)").foregroundStyle(.secondary) }
+            })
+        case .percent:
+            let v = Binding<Double>(get: { Double((edits[o.key] ?? profileValues[o.key] ?? "0").replacingOccurrences(of: "%", with: "")) ?? 0 },
+                                    set: { edits[o.key] = "\(Int($0))%" })
+            return AnyView(HStack {
+                title
+                Slider(value: v, in: 0...100, step: 5)
+                Text("\(Int(v.wrappedValue)) %").frame(width: 48, alignment: .trailing).monospacedDigit()
+            })
+        case .decimal(let unit):
+            return AnyView(HStack {
+                title
+                Spacer()
+                TextField("", text: text).keyboardType(.numbersAndPunctuation).multilineTextAlignment(.trailing).frame(width: 80)
+                if !unit.isEmpty { Text(unit).foregroundStyle(.secondary) }
+            })
+        case .choice(let options):
+            let sel = Binding<String>(get: { edits[o.key] ?? profileValues[o.key] ?? options.first?.0 ?? "" },
+                                      set: { edits[o.key] = $0 })
+            return AnyView(Picker(selection: sel) {
+                ForEach(options, id: \.0) { Text($0.1).tag($0.0) }
+                if !options.contains(where: { $0.0 == sel.wrappedValue }) { Text(sel.wrappedValue).tag(sel.wrappedValue) }
+            } label: { title })
+        case .text:
+            return AnyView(HStack {
+                title
+                Spacer()
+                TextField("", text: text).multilineTextAlignment(.trailing).frame(maxWidth: 140)
+            })
+        }
+    }
+
+    @ViewBuilder private var resultSection: some View {
+                if running || job != nil || jobError != nil {
+                    Section(lz(en: "Result", de: "Ergebnis", fr: "Résultat", es: "Resultado", pt: "Resultado", it: "Risultato", zh: "结果")) {
+                        if running {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ProgressView(value: progress)
+                                Text(stageText).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        if let e = jobError {
+                            Label { Text(e).fixedSize(horizontal: false, vertical: true) }
+                            icon: { Image(systemName: "xmark.octagon.fill") }
+                                .foregroundColor(.red).font(.footnote)
+                        }
+                        if let r = job?.result {
+                            row(lz(en: "Print time", de: "Druckzeit", fr: "Durée", es: "Tiempo", pt: "Tempo", it: "Tempo", zh: "打印时间"), r.time_s.map { EnergyLog.duration($0) } ?? "—")
+                            row(lz(en: "Filament", de: "Filament", fr: "Filament", es: "Filamento", pt: "Filamento", it: "Filamento", zh: "耗材"),
+                                r.filament_g.map { String(format: "%.1f g", $0) } ?? "—")
+                            if r.stats == nil, let t = r.filament_g_tools, t.count > 1 {
+                                row("", perToolText(t))
+                            }
+                            row(lz(en: "Filament cost", de: "Filamentkosten", fr: "Coût filament", es: "Coste filamento", pt: "Custo filamento", it: "Costo filamento", zh: "耗材费用"), r.cost.map { EnergyLog.money($0, printer.energyCurrency) } ?? "—")
+                            row(lz(en: "Layers", de: "Layer", fr: "Couches", es: "Capas", pt: "Camadas", it: "Layer", zh: "层数"), r.layers.map(String.init) ?? "—")
+                            if let sl = r.slicer, !sl.isEmpty {
+                                row(lz(en: "Sliced with", de: "Gesliced mit", fr: "Tranché avec", es: "Laminado con", pt: "Fatiado com", it: "Slicing con", zh: "切片程序"), sl)
+                            }
+                            if let st = r.stats {
+                                SliceStatsRows(stats: st, currency: printer.energyCurrency, isU1: isU1)
+                            }
+                            if let f = r.repair_failed, f > 0 {
+                                Label(lz(en: "OrcaSlicer could not repair every model — check the preview.",
+                                         de: "OrcaSlicer konnte nicht jedes Modell reparieren — prüfe die Vorschau.",
+                                         fr: "OrcaSlicer n'a pas pu réparer tous les modèles — vérifie l'aperçu.",
+                                         es: "OrcaSlicer no pudo reparar todos los modelos — revisa la vista previa.",
+                                         pt: "O OrcaSlicer não conseguiu reparar todos os modelos — verifique a pré-visualização.",
+                                         it: "OrcaSlicer non ha potuto riparare tutti i modelli — controlla l'anteprima.",
+                                         zh: "OrcaSlicer 未能修复所有模型——请检查预览。"),
+                                      systemImage: "exclamationmark.triangle.fill")
+                                    .font(.footnote).foregroundColor(.orange)
+                            }
+                            row("Support", supportText(r.support))
+                            Button {
+                                Task { await openPreview() }
+                            } label: {
+                                HStack {
+                                    Spacer()
+                                    if fetchingPreview { ProgressView().padding(.trailing, 6) }
+                                    Label(lz(en: "Preview", de: "Vorschau", fr: "Aperçu", es: "Vista previa", pt: "Pré-visualização", it: "Anteprima", zh: "预览"), systemImage: "cube.transparent")
+                                    Spacer()
+                                }
+                            }
+                            .disabled(fetchingPreview || printing)
+                            Button {
+                                askPrint = true
+                            } label: {
+                                HStack {
+                                    Spacer()
+                                    if printing { ProgressView().padding(.trailing, 6) }
+                                    Text(printed
+                                         ? (printStarted
+                                            ? lz(en: "Sent — print started", de: "Gesendet — Druck gestartet", fr: "Envoyé — impression lancée", es: "Enviado — impresión iniciada", pt: "Enviado — impressão iniciada", it: "Inviato — stampa avviata", zh: "已发送——打印已开始")
+                                            : lz(en: "Sent to \(printer.name)", de: "An \(printer.name) gesendet", fr: "Envoyé à \(printer.name)", es: "Enviado a \(printer.name)", pt: "Enviado para \(printer.name)", it: "Inviato a \(printer.name)", zh: "已发送到 \(printer.name)"))
+                                         : lz(en: "Print on \(printer.name)", de: "Auf \(printer.name) drucken", fr: "Imprimer sur \(printer.name)", es: "Imprimir en \(printer.name)", pt: "Imprimir em \(printer.name)", it: "Stampa su \(printer.name)", zh: "在 \(printer.name) 上打印"))
+                                        .fontWeight(.semibold)
+                                    Spacer()
+                                }
+                            }
+                            .disabled(printing || printed)
+                            .confirmationDialog(printer.name, isPresented: $askPrint, titleVisibility: .visible) {
+                                Button(lz(en: "Send and print", de: "Senden und drucken", fr: "Envoyer et imprimer", es: "Enviar e imprimir", pt: "Enviar e imprimir", it: "Invia e stampa", zh: "发送并打印")) { Task { await sendToPrinter(start: true) } }
+                                Button(lz(en: "Send to printer only", de: "Nur an Drucker senden", fr: "Envoyer seulement", es: "Solo enviar a la impresora", pt: "Apenas enviar para a impressora", it: "Invia soltanto", zh: "仅发送到打印机")) { Task { await sendToPrinter(start: false) } }
+                                Button(lz(en: "Cancel", de: "Abbrechen", fr: "Annuler", es: "Cancelar", pt: "Cancelar", it: "Annulla", zh: "取消"), role: .cancel) {}
+                            } message: {
+                                Text(lz(en: "Upload the G-code to the printer and start right away, or just store it there.",
+                                        de: "G-Code an den Drucker übertragen und sofort starten – oder nur dort ablegen.",
+                                        fr: "Envoyer le G-code à l'imprimante et lancer tout de suite, ou seulement l'y déposer.",
+                                        es: "Subir el G-code a la impresora y empezar ya, o solo guardarlo allí.",
+                                        pt: "Enviar o G-code para a impressora e começar já, ou apenas guardá-lo lá.",
+                                        it: "Invia il G-code alla stampante e avvia subito, oppure salvalo soltanto.",
+                                        zh: "将 G-code 上传到打印机并立即开始，或仅保存到打印机。"))
+                            }
+                            if printed {
+                                // Sent — the way on is to the printer that got
+                                // the file, not back through the slicer screens.
+                                Button {
+                                    dismiss()
+                                    // Let the sheet close first, then the plate
+                                    // view, then change the tab underneath.
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                        NotificationCenter.default.post(name: .paxxShowPrinter, object: printer.id.uuidString)
+                                    }
+                                } label: {
+                                    VStack(spacing: 2) {
+                                        Label(lz(en: "Done", de: "Fertig", fr: "Terminé", es: "Listo", pt: "Concluído", it: "Fine", zh: "完成"),
+                                              systemImage: "checkmark.circle.fill")
+                                            .font(.headline)
+                                        Text(lz(en: "Takes you to \(printer.name)", de: "Bringt dich zu \(printer.name)", fr: "T'amène à \(printer.name)", es: "Te lleva a \(printer.name)", pt: "Leva você a \(printer.name)", it: "Ti porta a \(printer.name)", zh: "带你前往 \(printer.name)"))
+                                            .font(.caption2).opacity(0.85)
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 4)
+                                }
+                                // A real filled button, not a list row with text.
+                                .buttonStyle(.borderedProminent)
+                                .buttonBorderShape(.capsule)
+                                .controlSize(.large)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 2, trailing: 0))
+                                .listRowSeparator(.hidden)
+                            }
+                        }
+                    }
+                }
+    }
+
+    private var stageText: String {
+        switch stage {
+        case "prepare": return lz(en: "Preparing profiles…", de: "Profile werden vorbereitet…", fr: "Préparation des profils…", es: "Preparando perfiles…", pt: "Preparando perfis…", it: "Preparo i profili…", zh: "正在准备配置…")
+        case "model": return lz(en: "Sending models…", de: "Modelle werden übertragen…", fr: "Envoi des modèles…", es: "Enviando modelos…", pt: "Enviando modelos…", it: "Invio dei modelli…", zh: "正在发送模型…")
+        case "slice": return lz(en: "OrcaSlicer is slicing…", de: "OrcaSlicer sliced…", fr: "OrcaSlicer tranche…", es: "OrcaSlicer está laminando…", pt: "OrcaSlicer está fatiando…", it: "OrcaSlicer sta facendo lo slicing…", zh: "OrcaSlicer 正在切片…")
+        case "download": return lz(en: "Fetching G-code…", de: "G-Code wird geholt…", fr: "Récupération du G-code…", es: "Obteniendo G-code…", pt: "Buscando G-code…", it: "Recupero il G-code…", zh: "正在获取 G-code…")
+        default: return stage
+        }
+    }
+
+    /// What Orca actually used, from the G-code — so a setting that did not
+    /// take is visible here instead of only in the print.
+    private func supportText(_ s: [String: String]?) -> String {
+        guard let s, s["enable_support"] == "1" else { return lz(en: "off", de: "aus", fr: "désactivé", es: "desactivado", pt: "desativado", it: "disattivato", zh: "关闭") }
+        var parts: [String] = []
+        parts.append((s["support_type"] ?? "").hasPrefix("tree") ? lz(en: "Tree", de: "Baum", fr: "Arbre", es: "Árbol", pt: "Árvore", it: "Albero", zh: "树状") : "Normal")
+        if s["support_on_build_plate_only"] == "1" { parts.append(lz(en: "plate only", de: "nur Druckbett", fr: "plateau seul", es: "solo cama", pt: "só mesa", it: "solo piano", zh: "仅打印板")) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func perToolText(_ t: [Double]) -> String {
+        var parts: [String] = []
+        for (i, g) in t.enumerated() where g > 0 { parts.append(String(format: "K%d %.1f g", i + 1, g)) }
+        return parts.joined(separator: " · ")
+    }
+
+    @ViewBuilder private func row(_ l: String, _ v: String) -> some View {
+        HStack { Text(l); Spacer(); Text(v).foregroundStyle(.secondary).multilineTextAlignment(.trailing) }
+    }
+
+    private func load() async {
+        guard let cfg = config else {
+            loadError = lz(en: "PaxxMaker-Connect not paired — see the slicer tab.", de: "PaxxMaker-Connect nicht gekoppelt — siehe Slicer-Tab.", fr: "PaxxMaker-Connect non appairé — voir l'onglet slicer.", es: "PaxxMaker-Connect no vinculado — ver la pestaña del slicer.", pt: "PaxxMaker-Connect não pareado — veja a aba do slicer.", it: "PaxxMaker-Connect non associato — vedi la scheda slicer.", zh: "未配对 PaxxMaker-Connect——请查看切片标签页。")
+            return
+        }
+        let client = ConnectClient(config: cfg)
+        do {
+            let info = try await client.info()
+            sources = info.apps
+            sourceNames = info.app_names ?? [:]
+            slicerNames = info.slicers ?? [:]
+            // The source picked for this printer, else the computer's choice.
+            let mine = UserDefaults.standard.string(forKey: "slicer_source_\(printer.name)") ?? ""
+            app = info.apps.contains(mine) ? mine : (info.apps.first ?? "orca")
+            chosenSource = app
+            connectVersion = info.version
+            connectFeatures = info.features_by_app?[app] ?? info.features ?? []
+            let p = try await client.profiles(app: app)
+            profiles = p
+            // Last choice for this printer, else the first fitting preset.
+            if let saved = UserDefaults.standard.dictionary(forKey: key) {
+                machine = saved["machine"] as? String ?? ""
+                process = saved["process"] as? String ?? ""
+                filaments = saved["filaments"] as? [String] ?? filaments
+                if let js = saved["quick"] as? String, let d = js.data(using: .utf8), let sq = try? JSONDecoder().decode(QuickSettings.self, from: d) { q = sq }
+                if let e = saved["edits"] as? [String: String] { edits = e }
+            }
+            if !machinePresets.contains(where: { $0.name == machine }) { machine = machinePresets.first?.name ?? "" }
+            if !compatible(p.process).contains(where: { $0.name == process }) { process = compatible(p.process).first?.name ?? "" }
+            let fil = compatible(p.filament)
+            for i in 0..<4 where !fil.contains(where: { $0.name == filaments[i] }) { filaments[i] = fil.first?.name ?? "" }
+            // Each head gets the profile of what is loaded in it — at least
+            // the same material. A wrong material can not even be mapped on
+            // the printer (a PETG print is offered only PETG heads).
+            if isU1 { for i in 0..<4 { matchLoadedFilament(head: i + 1, presets: fil) } }
+            // Remembered tweaks belong to the preset they were made on. On the
+            // same preset they stay; the profile is still read, because the
+            // rows without a field of their own start from its values.
+            await fillFromProfile(keepTweaks: q.process == process)
+            await loadBedType()
+            for e in usedExtruders { await loadTemps(head: e) }
+            if has("repair") { await checkModels() }
+        } catch {
+            loadError = error.localizedDescription
+        }
+    }
+
+    private func remember() {
+        let js = (try? JSONEncoder().encode(q)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        UserDefaults.standard.set(["machine": machine, "process": process, "filaments": filaments,
+                                   "quick": js, "edits": edits], forKey: key)
+    }
+
+    /// The chosen preset's own values, flattened by PaxxMaker-Connect.
+    /// Print time the way the printer names its files: "3h52m", else "46m37s".
+    static func duration(_ seconds: Int) -> String {
+        let h = seconds / 3600, m = (seconds % 3600) / 60, s = seconds % 60
+        return h > 0 ? "\(h)h\(m)m" : "\(m)m\(s)s"
+    }
+
+    /// One temperature line: label, value in °C, editable.
+    @ViewBuilder private func tempRow(_ text: String, value: Binding<Int>, tag: Int, key: String) -> some View {
+        HStack {
+            label(key, text)
+            Spacer()
+            TextField("0", value: value, format: .number)
+                .keyboardType(.numberPad).multilineTextAlignment(.trailing)
+                .frame(width: 58).focused($tempFocus, equals: tag)
+                .monospacedDigit()
+            Text("°C").foregroundStyle(.secondary)
+        }
+        .modifier(ResetOnLongPress(armed: isChanged(key), title: settingTitle(key)) { reset(key) })
+    }
+
+    /// The filament's own temperatures: nozzle, and the bed value of the plate
+    /// this printer uses (Orca keeps one per plate type).
+    private func loadTemps(head: Int) async {
+        guard let cfg = config else { return }
+        let name = filaments[head - 1]
+        filamentColors[head - 1] = ""
+        guard !name.isEmpty, let d = try? await ConnectClient(config: cfg).profile(app: app, kind: "filament", name: name) else { return }
+        func first(_ key: String) -> Int? {
+            if let a = d[key] as? [String], let v = a.first { return Int(Double(v) ?? 0) }
+            if let v = d[key] as? String { return Int(Double(v) ?? 0) }
+            return nil
+        }
+        if let n = first("nozzle_temperature"), n > 0 { nozzleTemps[head - 1] = n; baseNozzleTemps[head - 1] = n }
+        if let t = (d["filament_type"] as? [String])?.first ?? d["filament_type"] as? String { filamentTypes[head - 1] = t }
+        if let c = (d["filament_colour"] as? [String])?.first ?? d["filament_colour"] as? String {
+            filamentColors[head - 1] = c.trimmingCharacters(in: CharacterSet(charactersIn: "# "))
+        }
+        let key: String
+        switch bedTypeName.lowercased() {
+        case let t where t.contains("textured"): key = "textured_plate_temp"
+        case let t where t.contains("engineering"): key = "eng_plate_temp"
+        case let t where t.contains("cool"), let t where t.contains("supertack"): key = "cool_plate_temp"
+        default: key = "hot_plate_temp"
+        }
+        if let b = first(key), b > 0 { bedTemp = b; baseBedTemp = b }
+    }
+
+    /// Which plate the printer uses — it decides which bed temperature counts.
+    private func loadBedType() async {
+        guard let cfg = config, !machine.isEmpty else { return }
+        if let d = try? await ConnectClient(config: cfg).profile(app: app, kind: "machine", name: machine),
+           let t = d["default_bed_type"] as? String {
+            bedTypeName = t
+            // The printer's own pause command, as Orca would use it.
+            let pg = (d["machine_pause_gcode"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            pauseGcode = pg.isEmpty ? "PAUSE" : pg
+        }
+    }
+
+    private func fillFromProfile(keepTweaks: Bool = false) async {
+        guard let cfg = config, !process.isEmpty else { return }
+        loadingProfile = true
+        defer { loadingProfile = false }
+        if let d = try? await ConnectClient(config: cfg).profile(app: app, kind: "process", name: process) {
+            baseQ = QuickSettings.from(profile: d, process: process)
+            if !keepTweaks { q = baseQ }
+            // Every value the preset holds — the rows that have no field of
+            // their own read their starting value from here.
+            // Only plain values: a per-extruder list must keep its length, so
+            // those are not offered as a single field.
+            profileValues = d.compactMapValues { v -> String? in
+                if let s = v as? String { return s }
+                if let n = v as? NSNumber { return n.stringValue }
+                return nil
+            }
+            // The tower on the plate takes its width and brim from the profile.
+            if let w = Double(profileValues["prime_tower_width"] ?? ""), w > 5 { UserDefaults.standard.set(w, forKey: "prime_tower_width") }
+            if let b = Double(profileValues["prime_tower_brim_width"] ?? ""), b >= 0 { UserDefaults.standard.set(b, forKey: "prime_tower_brim_width") }
+            if !keepTweaks { edits.removeAll() }
+        } else if !keepTweaks {
+            q.process = process
+        }
+    }
+
+    private func slice() async {
+        guard let cfg = config else { return }
+        remember()
+        // New slice = new G-code: drop the cached one, or the preview and the
+        // print would keep using the previous result.
+        running = true; job = nil; jobError = nil; printed = false; gcodeData = nil; progress = 0.02; stage = "model"
+        let client = ConnectClient(config: cfg)
+        do {
+            var spec: [String: Any] = ["app": app, "machine": machine, "process": process]
+            if multi {
+                // One filament per head in head order; heads that are not
+                // printed get a used one so Orca sees four profiles.
+                spec["multi"] = true
+                // The prime tower where the plate shows it (dragged or automatic).
+                let tower = plate.towerRect.min
+                spec["wipe_tower"] = [Double(tower.x), Double(tower.y)]
+                let fallback = filaments[head - 1]
+                spec["filaments"] = (0..<4).map { usedHeads.contains($0 + 1) && !filaments[$0].isEmpty ? filaments[$0] : fallback }
+            } else {
+                // One filament: the one loaded in the chosen head. The
+                // Connect app slices for T0 and rewrites the G-code to that head.
+                spec["head"] = head
+                spec["filaments"] = [filaments[head - 1]]
+            }
+            // The settings with their own rows go as before; everything added
+            // in the editor rides along as its Orca key.
+            var overrides = q.overrides
+            for (k, v) in edits where !SliceCatalog.builtInKeys.contains(k) && !v.isEmpty { overrides[k] = v }
+            // Painted fuzzy skin only shows when Fuzzy Skin is not "Disabled";
+            // Orca's "Painted only" (none) then roughens just those faces.
+            if plate.objects.contains(where: \.hasFuzzy),
+               ((overrides["fuzzy_skin"] as? String) ?? profileValues["fuzzy_skin"] ?? "disabled_fuzzy") == "disabled_fuzzy" {
+                overrides["fuzzy_skin"] = "none"
+            }
+            spec["overrides"] = overrides
+            // Each height range needs a layer height of its own (Orca crashes
+            // without one) — the one this slice uses.
+            if !plate.activeBands.isEmpty {
+                let lh = (overrides["layer_height"] as? Double) ?? (overrides["layer_height"] as? Float).map(Double.init)
+                    ?? Double(profileValues["layer_height"] ?? "") ?? 0.2
+                spec["range_layer_height"] = lh
+            }
+            // Temperatures as shown in the sheet (0 = leave the profile alone).
+            spec["nozzle_temps"] = (0..<4).map { usedHeads.contains($0 + 1) ? nozzleTemps[$0] : 0 }
+            spec["bed_temp"] = bedTemp
+            // The colours loaded in the printer, per head — Orca's CLI needs a
+            // colour per filament and the preview shows the print in them.
+            spec["filament_colours"] = toolColorHexes.map { $0.isEmpty ? "" : "#" + $0 }
+            // Each object goes as the STL held here (same triangle order on
+            // both sides) with its placement, head and painted faces.
+            var objs: [[String: Any]] = []
+            for o in plate.objects {
+                // Lowered into the bed: the part above it, already cut on the
+                // phone — OrcaSlicer would put a sunk object back on the bed.
+                let part = o.printedPart()
+                let mid = try await client.upload(part.mesh.stlData, ext: "stl")
+                let m = part.transform
+                let flat: [Double] = (0..<4).flatMap { c in (0..<4).map { r in Double(m[c][r]) } }
+                var d: [String: Any] = ["name": o.name, "model": mid, "transform": flat, "extruder": multi ? o.extruder : 1]
+                if let own = o.settings {
+                    let diff = own.objectOverrides(over: q)
+                    if !diff.isEmpty { d["settings"] = diff }
+                }
+                if multi {
+                    let strings = part.paint
+                    if !strings.isEmpty { d["paint"] = Dictionary(uniqueKeysWithValues: strings.map { (String($0.key), $0.value) }) }
+                }
+                // Layer colours: the plate's height ranges, cut to this
+                // object's height — Orca's height range modifiers with an
+                // extruder of their own (Connect writes layer_config_ranges).
+                if multi {
+                    let objTop = o.placedSize.z - o.sink
+                    let ranges: [[Double]] = plate.activeBands.compactMap { b in
+                        guard b.from < objTop else { return nil }
+                        return [Double(b.from), Double(min(b.to, objTop)), Double(b.head)]
+                    }
+                    if !ranges.isEmpty { d["ranges"] = ranges }
+                }
+                // Painted fuzzy skin works with one head as well (Connect 1.4+).
+                if !part.fuzzy.isEmpty { d["fuzzy"] = Dictionary(uniqueKeysWithValues: part.fuzzy.map { (String($0.key), $0.value) }) }
+                objs.append(d)
+            }
+            spec["objects"] = objs
+            // Holes found by the model check: OrcaSlicer's "Fix Model" closes them.
+            if has("repair"), repairModels, openEdges.values.contains(where: { $0 > 0 }) { spec["repair"] = true }
+            if mixActive {
+                // One blend per distinct (own head, mix) — objects alike share it.
+                var groups: [(head: Int, mix: ObjectMix, objects: [Int])] = []
+                for (i, o) in plate.objects.enumerated() {
+                    guard let m = o.mix, m.head != o.extruder else { continue }
+                    if let g = groups.firstIndex(where: { $0.head == o.extruder && $0.mix == m }) { groups[g].objects.append(i) }
+                    else { groups.append((o.extruder, m, [i])) }
+                }
+                spec["mixes"] = groups.map { g -> [String: Any] in
+                    let ca = UIColor(Color(hex: previewColorHexes[safe: g.head - 1] ?? "") ?? .gray)
+                    let cb = UIColor(Color(hex: previewColorHexes[safe: g.mix.head - 1] ?? "") ?? .gray)
+                    let c = ObjectMix.blend(ca, cb, share: g.mix.share)
+                    var r: CGFloat = 0, gg: CGFloat = 0, b: CGFloat = 0, al: CGFloat = 0
+                    c.getRed(&r, green: &gg, blue: &b, alpha: &al)
+                    var m: [String: Any] = ["components": [g.head, g.mix.head], "objects": g.objects,
+                                            "gradient": g.mix.gradient, "sublayer": g.mix.sublayer || g.mix.gradient,
+                                            "colour": String(format: "#%02X%02X%02X", Int(r * 255), Int(gg * 255), Int(b * 255))]
+                    if g.mix.gradient { m["range"] = [g.mix.share / 100, g.mix.shareTop / 100] }
+                    else { m["ratios"] = [g.mix.share / 100, 1 - g.mix.share / 100] }
+                    return m
+                }
+            }
+            stage = "slice"; progress = 0.15
+            var j = try await client.createJob(spec)
+            while j.state == "queued" || j.state == "running" {
+                try? await Task.sleep(nanoseconds: 700_000_000)
+                j = try await client.job(j.id)
+                progress = max(progress, 0.15 + j.progress * 0.8)
+                if !j.stage.isEmpty { stage = j.stage == "done" ? "slice" : j.stage }
+            }
+            if j.state == "failed" { jobError = SliceJob.explain(code: j.error_code, message: j.error) }
+            job = j
+        } catch {
+            jobError = error.localizedDescription
+        }
+        running = false; progress = 1
+    }
+
+    /// What the preview paints with: the colour of the filament chosen for
+    /// each head, falling back to the one loaded in the printer.
+    private var previewColorHexes: [String] {
+        // One entry per head the printer has — a single-nozzle machine must
+        // not end up with a per-head legend.
+        (0..<(printer.type == .snapmakerU1 ? 4 : 1)).map { i in
+            let own = filamentColors[safe: i] ?? ""
+            return own.isEmpty ? (toolColorHexes[safe: i] ?? "") : own
+        }
+    }
+
+    /// Colours of the filaments loaded in the printer's heads, for "by head".
+    private var toolColorHexes: [String] {
+        printerServices.services.first(where: { $0.name == printer.name })?.slotColorHexes ?? []
+    }
+
+    // MARK: filament per head from what is loaded
+
+    private static let materialWords = ["pla", "petg", "abs", "asa", "tpu", "pa", "pc", "pet", "pva", "hips", "pp", "pctg", "tpe", "flex", "nylon"]
+
+    /// The material a profile name speaks of ("eSUN - PLA Schwarz" → "pla").
+    private static func material(inName name: String) -> String? {
+        let tokens = name.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        return materialWords.first { w in tokens.contains { $0 == w } }
+    }
+
+    /// "PLA+" and "PLA" are the same material for this purpose.
+    private static func baseMaterial(_ t: String) -> String {
+        var s = t.lowercased().trimmingCharacters(in: .whitespaces)
+        while s.hasSuffix("+") { s.removeLast() }
+        if let dash = s.firstIndex(of: "-") { s = String(s[..<dash]) }      // PLA-CF → pla
+        return s
+    }
+
+    /// Colour words in profile names, per rough colour.
+    private static func colourWords(_ hex: String) -> [String] {
+        guard hex.count >= 6, let v = Int(hex.prefix(6), radix: 16) else { return [] }
+        let r = Double((v >> 16) & 255), g = Double((v >> 8) & 255), b = Double(v & 255)
+        let mx = max(r, g, b), mn = min(r, g, b)
+        if mx < 60 { return ["schwarz", "black", "noir", "negro", "nero"] }
+        if mn > 200 { return ["weiß", "weiss", "white", "blanc", "blanco", "bianco"] }
+        if mx - mn < 30 { return ["grau", "grey", "gray", "silber", "silver"] }
+        if r > 180 && g > 110 && b < 90 { return ["gold", "orange", "gelb", "yellow"] }
+        if r > 150 && g < 90 { return ["rot", "red", "feuerrot", "rouge", "rojo"] }
+        if g > r && g > b { return ["grün", "gruen", "green", "vert", "verde"] }
+        if b > r && b > g { return ["blau", "blue", "bleu", "azul"] }
+        return []
+    }
+
+    /// Material loaded in a head (as the printer reports it), "" if unknown.
+    private func loadedMaterial(_ head: Int) -> String {
+        printerServices.services.first(where: { $0.name == printer.name })?.slotMaterials[safe: head - 1] ?? ""
+    }
+
+    /// The chosen profile's material does not fit what is loaded in the head.
+    private func filamentMismatch(_ head: Int) -> Bool {
+        let loaded = baseMaterialOrEmpty(loadedMaterial(head))
+        guard !loaded.isEmpty, let own = presetMaterial(filaments[head - 1]) else { return false }
+        return own != loaded
+    }
+
+    /// A preset's material: its profile's filament_type (Connect 1.5), else
+    /// the word in its name.
+    private func presetMaterial(_ name: String) -> String? {
+        if let t = profiles?.filament.first(where: { $0.name == name })?.filament_type, !t.isEmpty { return Self.baseMaterial(t) }
+        return Self.material(inName: name)
+    }
+
+    private func baseMaterialOrEmpty(_ t: String) -> String {
+        let b = Self.baseMaterial(t)
+        return b == "none" ? "" : b
+    }
+
+    /// Picks the best profile for a head when none fits its loaded material.
+    /// Same material required; then OrcaSlicer's filament id — the product
+    /// the spool is (maker + material + sub-type, minted as Orca does) — then
+    /// the same maker, sub-type and colour.
+    private func matchLoadedFilament(head: Int, presets: [SlicerProfiles.Preset]) {
+        let svc = printerServices.services.first(where: { $0.name == printer.name })
+        let rawType = svc?.slotMaterials[safe: head - 1] ?? ""
+        let loaded = baseMaterialOrEmpty(rawType)
+        guard !loaded.isEmpty else { return }
+        let current = filaments[head - 1]
+        if !current.isEmpty, presetMaterial(current) == loaded { return }      // already fits
+        let vendorRaw = svc?.slotVendors[safe: head - 1] ?? ""
+        let vendor = vendorRaw.lowercased()
+        let sub = svc?.slotSubtypes[safe: head - 1] ?? ""
+        let colourHex = svc?.slotColorHexes[safe: head - 1] ?? ""
+        let colours = Self.colourWords(colourHex)
+        // The ids this spool may carry, in the maker spellings the profiles use.
+        let spellings = presets.compactMap(\.filament_vendor).filter { OrcaFilamentID.sameVendor($0, vendorRaw) }
+        let ids = vendorRaw.isEmpty ? [] : OrcaFilamentID.candidates(vendor: vendorRaw, type: rawType, subtype: sub, vendorSpellings: spellings)
+        var best: (name: String, score: Int)? = nil
+        for p in presets {
+            guard presetMaterial(p.name) == loaded else { continue }
+            let n = p.name.lowercased()
+            var score = 10
+            if let id = p.filament_id, ids.contains(id) { score += 8 }
+            if let v = p.filament_vendor, OrcaFilamentID.sameVendor(v, vendorRaw) { score += 5 }
+            else if !vendor.isEmpty, vendor != "none", n.contains(vendor) { score += 5 }
+            if !sub.isEmpty, n.contains(sub.lowercased()) { score += 3 }
+            if colours.contains(where: { n.contains($0) }) { score += 3 }
+            else if let c = p.filament_colour, Self.colourWords(c.trimmingCharacters(in: CharacterSet(charactersIn: "#"))) == colours, !colours.isEmpty { score += 2 }
+            if p.origin == "user" { score += 1 }
+            if best == nil || score > best!.score { best = (p.name, score) }
+        }
+        if let b = best { filaments[head - 1] = b.name }
+    }
+
+    /// The G-code is fetched once and shared by preview and print.
+    private func fetchGcode() async throws -> Data {
+        if let d = gcodeData { return d }
+        guard let cfg = config, let j = job, j.state == "done" else { throw ConnectError.decode }
+        let d = try await ConnectClient(config: cfg).gcode(j.id)
+        gcodeData = d
+        // The real tower of this slice, for the plate next time.
+        if multi, mixActive {
+            // The deep tower of colour mixing — the plate shows that one next time.
+            Task.detached(priority: .utility) {
+                if let t = Self.measureTower(d) { await MainActor.run { PlateModel.rememberMixTower(width: t.x, depth: t.y) } }
+            }
+        } else if multi {
+            let heads = usedHeads.count
+            Task.detached(priority: .utility) {
+                if let t = Self.measureTower(d) { await MainActor.run { PlateModel.rememberTower(width: t.x, depth: t.y, heads: heads) } }
+            }
+        }
+        return d
+    }
+
+    private func openPreview() async {
+        fetchingPreview = true; jobError = nil
+        defer { fetchingPreview = false }
+        do { _ = try await fetchGcode(); showPreview = true } catch { jobError = error.localizedDescription }
+    }
+
+    /// Pauses at heights: the pause command goes right before the first layer
+    /// above each height (";LAYER_CHANGE" with its ";Z:"), so everything up to
+    /// that height is printed, then the printer waits. OrcaSlicer's own way
+    /// (pause entries in the 3MF) is ignored by its command line — tested.
+    static func insertPauses(_ data: Data, at heights: [Float], command: String) -> Data {
+        guard !heights.isEmpty, let text = String(data: data, encoding: .utf8) else { return data }
+        var pending = heights.sorted()
+        var out = ""
+        out.reserveCapacity(text.utf8.count + 256)
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)[...]
+        while let line = lines.popFirst() {
+            if !pending.isEmpty, line.hasPrefix(";LAYER_CHANGE"),
+               let zLine = lines.first, zLine.hasPrefix(";Z:"), let z = Float(zLine.dropFirst(3).trimmingCharacters(in: .whitespaces)) {
+                var hit: [Float] = []
+                while let p = pending.first, z > p + 0.001 { hit.append(p); pending.removeFirst() }
+                if let p = hit.last {
+                    out += "; PAXXMAKER PAUSE at \(String(format: "%.2f", p)) mm\n" + command + "\n"
+                }
+            }
+            out += line
+            if !lines.isEmpty { out += "\n" }
+        }
+        return Data(out.utf8)
+    }
+
+    /// Width and depth of the prime tower in a G-code: the extrusions marked
+    /// ";TYPE:Prime tower" (not its brim), from the 1st to the 99th percentile
+    /// — the few wipe moves that run off the tower are left out.
+    nonisolated static func measureTower(_ data: Data) -> SIMD2<Float>? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        var xs: [Float] = [], ys: [Float] = []
+        var inTower = false, inBrim = false
+        var x: Float? = nil, y: Float? = nil
+        text.enumerateLines { line, _ in
+            if line.hasPrefix(";TYPE:") { inTower = line.hasPrefix(";TYPE:Prime tower"); return }
+            if line.hasPrefix("; WIPE_TOWER_BRIM_START") { inBrim = true; return }
+            if line.hasPrefix("; WIPE_TOWER_BRIM_END") { inBrim = false; return }
+            guard line.hasPrefix("G1 ") else { return }
+            var nx = x, ny = y, e: Float = 0
+            for part in line.split(separator: " ") {
+                guard let c = part.first else { continue }
+                if c == "X" { nx = Float(part.dropFirst()) }
+                else if c == "Y" { ny = Float(part.dropFirst()) }
+                else if c == "E" { e = Float(part.dropFirst()) ?? 0 }
+                else if c == ";" { break }
+            }
+            if inTower, !inBrim, e > 0, let px = x, let py = y, let qx = nx, let qy = ny {
+                xs.append(px); xs.append(qx); ys.append(py); ys.append(qy)
+            }
+            x = nx; y = ny
+        }
+        guard xs.count > 50 else { return nil }
+        xs.sort(); ys.sort()
+        func p(_ a: [Float], _ q: Double) -> Float { a[Int(q * Double(a.count - 1))] }
+        return SIMD2(p(xs, 0.99) - p(xs, 0.01), p(ys, 0.99) - p(ys, 0.01))
+    }
+
+    /// The U1 only lets a filament of the G-code go to a head with exactly
+    /// the same material type. OrcaSlicer has no "PLA+" (its own PLA+
+    /// profiles say PLA), but the printer registers e.g. eSun PLA+ as "PLA+"
+    /// — so such a head could never be chosen. Where the two differ only by
+    /// that "+", the printer's spelling goes into the G-code header; any other
+    /// difference (PLA against PETG) is left for the printer to point out.
+    static func matchFilamentTypes(_ data: Data, printerTypes: [String]) -> Data {
+        let key = Data("; filament_type = ".utf8)
+        guard let r = data.range(of: key),
+              let end = data[r.upperBound...].firstIndex(of: UInt8(ascii: "\n")),
+              let line = String(data: data[r.upperBound..<end], encoding: .utf8) else { return data }
+        var types = line.trimmingCharacters(in: .whitespaces).components(separatedBy: ";")
+        func base(_ s: String) -> String {
+            var t = s.trimmingCharacters(in: .whitespaces).uppercased()
+            while t.hasSuffix("+") { t.removeLast() }
+            return t
+        }
+        var changed = false
+        for i in types.indices {
+            let own = types[i].trimmingCharacters(in: .whitespaces)
+            let loaded = (printerTypes[safe: i] ?? "").trimmingCharacters(in: .whitespaces)
+            guard !loaded.isEmpty, !own.isEmpty, own.uppercased() != loaded.uppercased(),
+                  base(own) == base(loaded) else { continue }
+            types[i] = loaded
+            changed = true
+        }
+        guard changed else { return data }
+        var out = data
+        out.replaceSubrange(r.upperBound..<end, with: Data(types.joined(separator: ";").utf8))
+        return out
+    }
+
+    /// Upload the G-code to the printer; `start` also begins the print
+    /// (Orca's "Print" versus "Send").
+    private func sendToPrinter(start: Bool) async {
+        guard job?.state == "done",
+              let svc = printerServices.services.first(where: { $0.name == printer.name }) else { return }
+        printing = true; jobError = nil
+        defer { printing = false }
+        do {
+            stage = "download"
+            var data = try await fetchGcode()
+            // Orca cannot render thumbnails without a screen, so the plate is
+            // drawn here and written into the G-code — that is the picture the
+            // printer shows in its file list.
+            let colours: [UIColor] = (0..<4).map { i in
+                let hex = toolColorHexes[safe: i] ?? ""
+                return hex.isEmpty ? UIColor.systemGray : UIColor(Color(hex: hex) ?? .gray)
+            }
+            if let shot = PlateThumbnail.render(plate: plate, headColors: colours,
+                                                accent: UIColor(Color(hex: printer.themeColor) ?? .blue)) {
+                data = PlateThumbnail.inject(into: data, image: shot)
+            }
+            data = Self.matchFilamentTypes(data, printerTypes: svc.slotMaterials)
+            data = Self.insertPauses(data, at: plate.pauseHeights, command: pauseGcode)
+            // Named like a normal upload: model, material and print time —
+            // e.g. "laptop_stand_PETG_3h52m". A number is only added when the
+            // printer already holds a file of that name.
+            var parts = [(plate.objects.first?.name ?? "PaxxMaker").asPrintFileName]
+            let material = filamentTypes[max(0, head - 1)].trimmingCharacters(in: .whitespaces)
+            if !material.isEmpty { parts.append(material) }
+            if let secs = job?.result?.time_s, secs > 0 { parts.append(Self.duration(secs)) }
+            let base = parts.joined(separator: "_")
+            var name = base + ".gcode"
+            if svc.files.contains(where: { $0.filename == name }) {
+                var n = 2
+                while svc.files.contains(where: { $0.filename == "\(base)_\(n).gcode" }) { n += 1 }
+                name = "\(base)_\(n).gcode"
+            }
+            let ok = await withCheckedContinuation { cont in svc.uploadFileData(filename: name, data: data) { cont.resume(returning: $0) } }
+            guard ok else { jobError = lz(en: "Upload to the printer failed.", de: "Upload zum Drucker fehlgeschlagen.", fr: "Échec de l'envoi à l'imprimante.", es: "Error al subir a la impresora.", pt: "Falha no envio para a impressora.", it: "Invio alla stampante non riuscito.", zh: "上传到打印机失败。"); return }
+            if start { svc.startPrint(filename: name) }
+            svc.fetchFiles()
+            printed = true; printStarted = start
+        } catch {
+            jobError = error.localizedDescription
+        }
+    }
+}
+
+/// Orca's simple-mode process fields for one set of values: the general
+/// ones in the slice sheet, or one object's own (`perObject` hides what
+/// only exists print-wide).
+struct ProcessFields: View {
+    @Binding var q: QuickSettings
+    var loading = false
+    var perObject = false
+
+    var body: some View {
+        Section {
+            HStack {
+                Text(lz(en: "Layer height", de: "Layerhöhe", fr: "Hauteur de couche", es: "Altura de capa", pt: "Altura de camada", it: "Altezza layer", zh: "层高"))
+                Spacer()
+                TextField("0.2", text: $q.layerHeight).keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 60)
+                Text("mm").foregroundStyle(.secondary)
+            }
+            if !perObject {
+                HStack {
+                    Text(lz(en: "First layer height", de: "Erste Layerhöhe", fr: "Hauteur 1re couche", es: "Altura 1.ª capa", pt: "Altura 1.ª camada", it: "Altezza 1° layer", zh: "首层层高"))
+                    Spacer()
+                    TextField("0.2", text: $q.firstLayerHeight).keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 60)
+                    Text("mm").foregroundStyle(.secondary)
+                }
+            }
+            Picker(lz(en: "Seam", de: "Naht", fr: "Couture", es: "Costura", pt: "Costura", it: "Cucitura", zh: "接缝"), selection: $q.seam) {
+                ForEach(QuickSettings.seams, id: \.0) { Text($0.1).tag($0.0) }
+                if !QuickSettings.seams.contains(where: { $0.0 == q.seam }) { Text(q.seam).tag(q.seam) }
+            }
+        } header: {
+            HStack {
+                Text(lz(en: "Quality", de: "Qualität", fr: "Qualité", es: "Calidad", pt: "Qualidade", it: "Qualità", zh: "质量"))
+                Spacer()
+                if loading { ProgressView().controlSize(.mini) }
+            }
+        }
+        Section(lz(en: "Strength", de: "Stärke", fr: "Résistance", es: "Resistencia", pt: "Resistência", it: "Resistenza", zh: "强度")) {
+            Stepper(value: $q.walls, in: 1...10) {
+                HStack { Text(lz(en: "Walls", de: "Wände", fr: "Parois", es: "Paredes", pt: "Paredes", it: "Pareti", zh: "墙")); Spacer(); Text("\(q.walls)").foregroundStyle(.secondary) }
+            }
+            Stepper(value: $q.topLayers, in: 0...15) {
+                HStack { Text(lz(en: "Top layers", de: "Obere Schichten", fr: "Couches sup.", es: "Capas superiores", pt: "Camadas superiores", it: "Layer superiori", zh: "顶层")); Spacer(); Text("\(q.topLayers)").foregroundStyle(.secondary) }
+            }
+            Stepper(value: $q.bottomLayers, in: 0...15) {
+                HStack { Text(lz(en: "Bottom layers", de: "Untere Schichten", fr: "Couches inf.", es: "Capas inferiores", pt: "Camadas inferiores", it: "Layer inferiori", zh: "底层")); Spacer(); Text("\(q.bottomLayers)").foregroundStyle(.secondary) }
+            }
+            HStack {
+                Text(lz(en: "Infill", de: "Infill", fr: "Remplissage", es: "Relleno", pt: "Preenchimento", it: "Riempimento", zh: "填充"))
+                Slider(value: $q.infill, in: 0...100, step: 5)
+                Text("\(Int(q.infill)) %").frame(width: 48, alignment: .trailing).monospacedDigit()
+            }
+            Picker(lz(en: "Infill pattern", de: "Infill-Muster", fr: "Motif", es: "Patrón", pt: "Padrão", it: "Motivo", zh: "填充图案"), selection: $q.infillPattern) {
+                ForEach(QuickSettings.patterns, id: \.0) { Text($0.1).tag($0.0) }
+                if !QuickSettings.patterns.contains(where: { $0.0 == q.infillPattern }) { Text(q.infillPattern).tag(q.infillPattern) }
+            }
+        }
+        Section("Support") {
+            Toggle(lz(en: "Enable support", de: "Support aktivieren", fr: "Activer les supports", es: "Activar soportes", pt: "Ativar suportes", it: "Attiva supporti", zh: "启用支撑"), isOn: $q.support)
+            if q.support {
+                Picker(lz(en: "Type", de: "Art", fr: "Type", es: "Tipo", pt: "Tipo", it: "Tipo", zh: "类型"), selection: $q.tree) {
+                    Text(lz(en: "Tree", de: "Baum", fr: "Arbre", es: "Árbol", pt: "Árvore", it: "Albero", zh: "树状")).tag(true)
+                    Text("Normal").tag(false)
+                }.pickerStyle(.segmented)
+                Toggle(lz(en: "On build plate only", de: "Nur auf Druckbett", fr: "Sur le plateau uniquement", es: "Solo sobre la cama", pt: "Somente na mesa", it: "Solo sul piano", zh: "仅在打印板上"), isOn: $q.plateOnly)
+                Stepper(value: $q.thresholdAngle, in: 0...90, step: 5) {
+                    HStack { Text(lz(en: "Threshold angle", de: "Schwellwinkel", fr: "Angle seuil", es: "Ángulo umbral", pt: "Ângulo limite", it: "Angolo soglia", zh: "临界角")); Spacer(); Text("\(q.thresholdAngle)°").foregroundStyle(.secondary) }
+                }
+            }
+        }
+        Section(perObject ? lz(en: "Brim", de: "Rand", fr: "Bordure", es: "Borde", pt: "Borda", it: "Brim", zh: "Brim")
+                          : lz(en: "Brim & skirt", de: "Rand & Skirt", fr: "Bordure & jupe", es: "Borde y falda", pt: "Borda e saia", it: "Brim e skirt", zh: "裙边与 Brim")) {
+            Picker(lz(en: "Brim type", de: "Rand-Typ", fr: "Type de bordure", es: "Tipo de borde", pt: "Tipo de borda", it: "Tipo di brim", zh: "Brim 类型"), selection: $q.brimType) {
+                ForEach(QuickSettings.brims, id: \.0) { Text($0.1).tag($0.0) }
+                if !QuickSettings.brims.contains(where: { $0.0 == q.brimType }) { Text(q.brimType).tag(q.brimType) }
+            }
+            if q.brimType != "no_brim" {
+                if q.brimType != "auto_brim" {
+                    HStack {
+                        Text(lz(en: "Brim width", de: "Randbreite", fr: "Largeur", es: "Ancho", pt: "Largura", it: "Larghezza", zh: "宽度"))
+                        Spacer()
+                        TextField("5", text: $q.brimWidth).keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 60)
+                        Text("mm").foregroundStyle(.secondary)
+                    }
+                }
+                HStack {
+                    Text(lz(en: "Brim-object gap", de: "Abstand zum Objekt", fr: "Écart objet", es: "Separación", pt: "Distância", it: "Distanza", zh: "与模型间距"))
+                    Spacer()
+                    TextField("0.1", text: $q.brimGap).keyboardType(.decimalPad).multilineTextAlignment(.trailing).frame(width: 60)
+                    Text("mm").foregroundStyle(.secondary)
+                }
+            }
+            if !perObject {
+                Stepper(value: $q.skirtLoops, in: 0...10) {
+                    HStack { Text(lz(en: "Skirt loops", de: "Skirt-Schleifen", fr: "Boucles de jupe", es: "Vueltas de falda", pt: "Voltas da saia", it: "Giri skirt", zh: "裙边圈数")); Spacer(); Text("\(q.skirtLoops)").foregroundStyle(.secondary) }
+                }
+            }
+        }
+    }
+}
+
+/// One object's own settings: off = the general ones apply.
+struct ObjectSettingsPage: View {
+    @ObservedObject var object: ModelPlacement
+    let general: QuickSettings
+    @AppStorage("app_language") private var appLanguage: String = "en"
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle(lz(en: "Own settings for this object", de: "Eigene Einstellungen für dieses Objekt", fr: "Réglages propres à cet objet", es: "Ajustes propios para este objeto", pt: "Ajustes próprios para este objeto", it: "Impostazioni proprie per questo oggetto", zh: "此对象使用自定义设置"),
+                       isOn: Binding(get: { object.settings != nil }, set: { on in object.settings = on ? (object.settings ?? general) : nil }))
+            } footer: {
+                Text(object.settings == nil
+                     ? lz(en: "The object uses the general settings.", de: "Das Objekt nutzt die allgemeinen Einstellungen.", fr: "L'objet utilise les réglages généraux.", es: "El objeto usa los ajustes generales.", pt: "O objeto usa os ajustes gerais.", it: "L'oggetto usa le impostazioni generali.", zh: "该对象使用通用设置。")
+                     : lz(en: "Starts from the general values; only this object is affected.", de: "Startet mit den allgemeinen Werten; betrifft nur dieses Objekt.", fr: "Part des valeurs générales ; ne concerne que cet objet.", es: "Parte de los valores generales; solo afecta a este objeto.", pt: "Parte dos valores gerais; afeta só este objeto.", it: "Parte dai valori generali; riguarda solo questo oggetto.", zh: "以通用值为起点；仅影响此对象。"))
+            }
+            if object.settings != nil {
+                ProcessFields(q: Binding(get: { object.settings ?? general }, set: { object.settings = $0 }), perObject: true)
+            }
+        }
+        .keyboardDismissable()
+        .navigationTitle(object.name)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}

@@ -1,0 +1,21 @@
+name                 = "paxxmaker-push"
+main                 = "worker.ts"
+compatibility_date   = "2024-09-23"
+
+# Workers Logs: persistiert jeden Aufruf im Dashboard (Beobachtbarkeit).
+# Bei Bedarf (Traffic-Diagnose) auf true setzen und deployen — der
+# console.log("req ...") am Router-Anfang liefert dann Pfad + User-Agent.
+[observability]
+enabled = false
+
+[[kv_namespaces]]
+binding = "TOKENS_KV"
+id      = "8bbec02b1a7742cf88cd8d2524b8a1de"
+
+[vars]
+APNS_KEY_ID    = "5FF37T444X"
+APNS_TEAM_ID   = "92F7TDYGQR"
+APNS_BUNDLE_ID = "HandyApp.Paxxmaker-U1"
+
+# Secrets — set with CLI, never store in this file:
+#   wrangler secret put APNS_PRIVATE_KEY    (paste full .p8 content)

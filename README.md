@@ -1,17 +1,19 @@
-<img width="125" height="125" alt="App Icon 125x125" src="https://github.com/user-attachments/assets/c59db58a-fa35-4a5b-be4c-801e5b788a23" />
 
-# PaxxMaker
+<h1 align="center">PaxxMaker</h1>
 
+<p align="center">
+  <img width="220" alt="PaxxMaker App Graphic" src="https://github.com/user-attachments/assets/9d5ab689-5444-4a74-9363-fa63ad2fd22a" />
+</p>
 
+<h3 align="center">PaxxMaker – your 3D prints, always under control.</h3>
 
-PaxxMaker – your 3D prints, always under control.
+----
 
 
 The ultimate control app for your Snapmaker U1 with paxx12 custom firmware and Klipper-based single-nozzle printers. Everything in view – from iPhone, iPad and Apple Watch.
 
 By default everything runs locally on your network – cloud features only if you want them.
 
-<!-- Add hero image / app dashboard screenshot here -->
 
 <img width="400" alt="01_dashboard" src="https://github.com/user-attachments/assets/f96e4fa8-743e-4f01-98cc-6e49711d7afd" />
 
@@ -43,21 +45,19 @@ By default everything runs locally on your network – cloud features only if yo
 - Per-nozzle tracking – assign a spool to each nozzle, and in multi-colour prints Spoolman deducts from the right spool the moment the nozzle changes
 - SpoolLink: the assignment follows the spool's RFID tag – even when moved to another nozzle
 
-<!-- Add Spoolman screenshot here -->
 
 ## PaxxMaker Slicer
 
 - Open the STL on your phone, place it on the build plate, scale it and paint faces for the individual heads. [PaxxMaker-Connect](https://github.com/DanielR1c/PaxxMaker-Connect) builds the bridge between the app and the slicer workflow.
 - Thingiverse is now built into the app: browse models and send them straight to your print bed with one tap.
 
-<!-- Add slicer screenshot here -->
 
 ## Multiple printers
 
 - Swipe between your printers
 - Own colour theme per printer
 - Automatic printer discovery on the network
-- Remote access via OctoEverywhere
+- Remote access via OctoEverywhere or VPN
 
 ## Widgets & Apple Watch
 
@@ -75,7 +75,7 @@ By default everything runs locally on your network – cloud features only if yo
 - Firmware configuration and calibration right from the app
 - 7 languages: German, English, French, Spanish, Italian, Portuguese, Chinese (Simplified)
 
-<!-- Add gallery / app screenshots here -->
+
 
 > Note: This app requires the paxx12 custom firmware for the U1 or a Klipper-based printer. Auto Shutdown and cost tracking require a smart plug. Use at your own risk.
 

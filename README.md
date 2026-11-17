@@ -5,7 +5,7 @@
   <img width="220" alt="PaxxMaker App Graphic" src="https://github.com/user-attachments/assets/9d5ab689-5444-4a74-9363-fa63ad2fd22a" />
 </p>
 
-<h3 align="center">PaxxMaker – your 3D prints, always under control.</h3>
+<h3 align="center">your 3D prints, always under control.</h3>
 
 ----
 
